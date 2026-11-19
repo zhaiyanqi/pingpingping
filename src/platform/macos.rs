@@ -27,14 +27,15 @@ use core_graphics::event::{
     CGEventTapProxy, CGEventType, EventField,
 };
 use foreign_types::ForeignType;
-use gpui_kit::{App, Pixels, Point, Window};
+use gpui_kit::{App, Pixels, Point, Size, Task, Window};
+use image::RgbaImage;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use objc2::{
     MainThreadMarker, MainThreadOnly, define_class, msg_send, rc::Retained, runtime::AnyObject,
 };
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSColor, NSFloatingWindowLevel, NSFont,
+    NSApplication, NSBackingStoreType, NSColor, NSEventType, NSFloatingWindowLevel, NSFont,
     NSFontWeightSemibold, NSLineBreakMode, NSNormalWindowLevel, NSPanel, NSScreen,
     NSStatusWindowLevel, NSTextField, NSView, NSWindow, NSWindowCollectionBehavior,
     NSWindowStyleMask, NSWorkspace,
@@ -370,18 +371,18 @@ pub(crate) fn set_palette_pinned(window: &Window, pinned: bool) -> bool {
     true
 }
 
-pub(crate) fn palette_drop(window: &Window, release: Point<Pixels>) -> Option<Position> {
+pub(crate) fn palette_outside(window: &Window, pointer: Point<Pixels>) -> Option<Position> {
     let panel = palette_panel(window)?;
     let viewport = window.viewport_size();
-    if gpui_kit::Bounds::new(gpui_kit::Point::default(), viewport).contains(&release) {
+    if gpui_kit::Bounds::new(gpui_kit::Point::default(), viewport).contains(&pointer) {
         return None;
     }
-    // GPUI reports the mouse-up event in top-left content coordinates. Convert that event
+    // GPUI reports pointer events in top-left content coordinates. Convert the event
     // through AppKit to the Quartz coordinate space consumed by the desktop overlays.
-    // GPUI 返回以内容区左上角为原点的松键坐标。经 AppKit 转为悬浮层使用的 Quartz 坐标。
+    // GPUI 返回以内容区左上角为原点的指针坐标。经 AppKit 转为悬浮层使用的 Quartz 坐标。
     let on_screen = panel.convertPointToScreen(NSPoint::new(
-        f64::from(release.x),
-        f64::from(viewport.height - release.y),
+        f64::from(pointer.x),
+        f64::from(viewport.height - pointer.y),
     ));
     let primary = NSScreen::screens(MainThreadMarker::new()?)
         .firstObject()?
@@ -390,6 +391,37 @@ pub(crate) fn palette_drop(window: &Window, release: Point<Pixels>) -> Option<Po
         x: on_screen.x,
         y: primary.origin.y + primary.size.height - on_screen.y,
     })
+}
+
+pub(crate) fn palette_left_released() -> bool {
+    // GPUI maps Control-click to a right click even if Control was pressed mid-drag.
+    // 即使在拖动途中才按下 Control，GPUI 也可能将松开左键映射为右键事件。
+    MainThreadMarker::new().is_some_and(|mtm| {
+        NSApplication::sharedApplication(mtm)
+            .currentEvent()
+            .is_some_and(|event| event.r#type() == NSEventType::LeftMouseUp)
+    })
+}
+
+pub(crate) fn resize_palette(window: &Window, size: Size<Pixels>, cx: &App) -> Option<Task<()>> {
+    let panel = palette_panel(window)?;
+    // Resize outside the GPUI update because AppKit invokes native resize callbacks synchronously.
+    // 在 GPUI 更新之外调整尺寸，因为 AppKit 会同步调用原生尺寸回调。
+    Some(cx.spawn(async move |_| {
+        if panel.isVisible() {
+            let frame = panel.frame();
+            let height = f64::from(size.height);
+            panel.setFrame_display(
+                rect(
+                    frame.origin.x,
+                    frame.origin.y + frame.size.height - height,
+                    f64::from(size.width),
+                    height,
+                ),
+                true,
+            );
+        }
+    }))
 }
 
 // Quartz and AppKit use opposite vertical origins. Convert through the primary display.
@@ -502,6 +534,39 @@ struct Effect {
 impl Drop for Effect {
     fn drop(&mut self) {
         self.panel.orderOut(None);
+    }
+}
+
+pub(crate) struct PalettePreview {
+    effect: Effect,
+    mtm: MainThreadMarker,
+}
+
+impl PalettePreview {
+    pub(crate) fn new(frame: RgbaImage) -> Option<Self> {
+        let mtm = MainThreadMarker::new()?;
+        let size = f64::from(super::PALETTE_PREVIEW_SIZE);
+        let (panel, art) = panel(NSSize::new(size, size), mtm, false);
+        panel.setLevel(ANIMATION_WINDOW_LEVEL);
+        panel.setAlphaValue(0.85);
+        update_layers(|| set_pixels(&art, frame.width(), frame.height(), frame.into_raw(), 3));
+        Some(Self {
+            effect: Effect { panel, art },
+            mtm,
+        })
+    }
+
+    pub(crate) fn show_at(&self, position: Option<Position>) {
+        let panel = &self.effect.panel;
+        let Some((center, _)) = position.and_then(|position| screen_for(position, self.mtm)) else {
+            panel.orderOut(None);
+            return;
+        };
+        let half = f64::from(super::PALETTE_PREVIEW_SIZE) / 2.0;
+        panel.setFrameOrigin(NSPoint::new(center.x - half, center.y - half));
+        if !panel.isVisible() {
+            panel.orderFrontRegardless();
+        }
     }
 }
 

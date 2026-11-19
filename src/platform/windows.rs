@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
 use async_channel::Sender;
-use gpui_kit::{App, Pixels, Point, Window};
+use gpui_kit::{App, Pixels, Point, Size, Window};
 use image::RgbaImage;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows_sys::Win32::{
@@ -49,17 +49,12 @@ pub(crate) fn init_dpi() {
 pub(crate) struct InputMonitor {
     thread: u32,
     worker: Option<JoinHandle<()>>,
-    palette_pointer: Arc<Mutex<Option<PalettePointerWatch>>>,
+    palette_pointer: Arc<Mutex<Option<Sender<PalettePointer>>>>,
 }
 
 pub(crate) struct PalettePointer {
     pub(crate) position: Position,
     pub(crate) released: bool,
-}
-
-struct PalettePointerWatch {
-    events: Sender<PalettePointer>,
-    track_moves: bool,
 }
 
 impl InputMonitor {
@@ -132,10 +127,7 @@ impl InputMonitor {
         })
     }
 
-    pub(crate) fn watch_palette_pointer(
-        &self,
-        track_moves: bool,
-    ) -> Option<async_channel::Receiver<PalettePointer>> {
+    pub(crate) fn watch_palette_pointer(&self) -> Option<async_channel::Receiver<PalettePointer>> {
         let mut pending = self.palette_pointer.lock().ok()?;
         // A nonactivating window cannot rely on ordinary capture outside its client area.
         // 不激活的浮窗无法依赖普通鼠标捕获来接收客户区外的事件。
@@ -143,10 +135,7 @@ impl InputMonitor {
             return None;
         }
         let (events, receiver) = async_channel::bounded(1);
-        *pending = Some(PalettePointerWatch {
-            events,
-            track_moves,
-        });
+        *pending = Some(events);
         Some(receiver)
     }
 }
@@ -171,7 +160,7 @@ struct Input {
     move_window: WheelMouseWindow,
     keys: u16,
     paused: std::sync::Arc<AtomicBool>,
-    palette_pointer: Arc<Mutex<Option<PalettePointerWatch>>>,
+    palette_pointer: Arc<Mutex<Option<Sender<PalettePointer>>>>,
 }
 
 const MODIFIERS: [u32; 8] = [
@@ -199,9 +188,9 @@ impl Input {
         match message {
             WM_MOUSEMOVE => {
                 if let Ok(pending) = self.palette_pointer.try_lock()
-                    && let Some(watch) = pending.as_ref().filter(|watch| watch.track_moves)
+                    && let Some(events) = pending.as_ref()
                 {
-                    let _ = watch.events.force_send(PalettePointer {
+                    let _ = events.force_send(PalettePointer {
                         position: position(point),
                         released: false,
                     });
@@ -209,11 +198,11 @@ impl Input {
             }
             WM_LBUTTONUP => {
                 if let Ok(mut pending) = self.palette_pointer.lock()
-                    && let Some(watch) = pending.take()
+                    && let Some(events) = pending.take()
                 {
                     // Replace any queued movement with the exact release point.
                     // 用精确的松键坐标替换队列中尚未处理的移动事件。
-                    let _ = watch.events.force_send(PalettePointer {
+                    let _ = events.force_send(PalettePointer {
                         position: position(point),
                         released: true,
                     });
@@ -465,10 +454,10 @@ impl PaletteMove {
         // 跨不同 DPI 的显示器时，保持鼠标抓住浮窗上的同一逻辑位置。
         let x = at.x - (f64::from(self.grab.x) * scale).round() as i32;
         let y = at.y - (f64::from(self.grab.y) * scale).round() as i32;
+        if event.released {
+            release_palette_capture(self.hwnd);
+        }
         unsafe {
-            if event.released && GetCapture() == self.hwnd {
-                ReleaseCapture();
-            }
             SetWindowPos(
                 self.hwnd,
                 null_mut(),
@@ -478,6 +467,73 @@ impl PaletteMove {
                 0,
                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
             ) != 0
+        }
+    }
+}
+
+pub(crate) struct PaletteResize {
+    hwnd: HWND,
+    frame: RECT,
+    press: POINT,
+    minimum: SIZE,
+}
+
+impl PaletteResize {
+    pub(crate) fn new(
+        window: &Window,
+        press: Point<Pixels>,
+        minimum: Size<Pixels>,
+    ) -> Option<Self> {
+        let hwnd = palette_hwnd(window)?;
+        let scale = f64::from(window.scale_factor());
+        let physical = |value: Pixels| (f64::from(value) * scale).round() as i32;
+        let mut press = POINT {
+            x: physical(press.x),
+            y: physical(press.y),
+        };
+        let mut frame = RECT::default();
+        if unsafe { GetWindowRect(hwnd, &mut frame) == 0 || ClientToScreen(hwnd, &mut press) == 0 }
+        {
+            return None;
+        }
+        Some(Self {
+            hwnd,
+            frame,
+            press,
+            minimum: SIZE {
+                cx: physical(minimum.width),
+                cy: physical(minimum.height),
+            },
+        })
+    }
+
+    pub(crate) fn update(&self, event: PalettePointer) -> bool {
+        let point = point(event.position);
+        let width =
+            (self.frame.right - self.frame.left + point.x - self.press.x).max(self.minimum.cx);
+        let height =
+            (self.frame.bottom - self.frame.top + point.y - self.press.y).max(self.minimum.cy);
+        if event.released {
+            release_palette_capture(self.hwnd);
+        }
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
+                null_mut(),
+                self.frame.left,
+                self.frame.top,
+                width,
+                height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            ) != 0
+        }
+    }
+}
+
+fn release_palette_capture(hwnd: HWND) {
+    unsafe {
+        if GetCapture() == hwnd {
+            ReleaseCapture();
         }
     }
 }
@@ -534,18 +590,20 @@ unsafe extern "system" fn palette_proc(
 }
 
 pub(crate) fn palette_drop(window: &Window, release: Position) -> Option<Position> {
+    release_palette_capture(palette_hwnd(window)?);
+    palette_outside(window, release)
+}
+
+pub(crate) fn palette_outside(window: &Window, pointer: Position) -> Option<Position> {
     let hwnd = palette_hwnd(window)?;
     let mut bounds = RECT::default();
-    let mut client_point = point(release);
+    let mut client_point = point(pointer);
     let outside = unsafe {
-        if GetCapture() == hwnd {
-            ReleaseCapture();
-        }
         GetClientRect(hwnd, &mut bounds) != 0
             && ScreenToClient(hwnd, &mut client_point) != 0
             && PtInRect(&bounds, client_point) == 0
     };
-    outside.then_some(release)
+    outside.then_some(pointer)
 }
 
 pub(crate) fn normalized(position: Position) -> Location {
@@ -897,6 +955,38 @@ impl Drop for Layer {
         self.release_focus();
         if !self.hwnd.is_null() {
             unsafe { DestroyWindow(self.hwnd) };
+        }
+    }
+}
+
+pub(crate) struct PalettePreview {
+    layer: Layer,
+    half: i32,
+}
+
+impl PalettePreview {
+    pub(crate) fn new(frame: RgbaImage) -> Option<Self> {
+        let mut layer = Layer::new(false);
+        layer.frame(&frame);
+        layer.surface.as_ref()?;
+        Some(Self {
+            layer,
+            half: frame.width() as i32 / 2,
+        })
+    }
+
+    pub(crate) fn show_at(&self, position: Option<Position>) {
+        if let Some(position) = position {
+            let center = point(position);
+            self.layer.present(
+                POINT {
+                    x: center.x - self.half,
+                    y: center.y - self.half,
+                },
+                217,
+            );
+        } else {
+            unsafe { ShowWindow(self.layer.hwnd, SW_HIDE) };
         }
     }
 }

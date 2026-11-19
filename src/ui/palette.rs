@@ -16,6 +16,10 @@ use crate::gesture::{Position, Wheel};
 use crate::model::{Body, TextEffect, WheelEmote};
 use crate::platform::{self, AnimationPosition};
 
+fn minimum_size() -> Size<Pixels> {
+    size(px(224.), px(168.))
+}
+
 struct OpenPalette(AnyWindowHandle);
 
 impl Global for OpenPalette {}
@@ -152,14 +156,36 @@ impl Item {
     }
 }
 
+struct ItemDrag {
+    item: Item,
+    outside: Option<Position>,
+    preview: Option<platform::PalettePreview>,
+    _load: Task<()>,
+}
+
+impl ItemDrag {
+    fn move_to(&mut self, position: Option<Position>) {
+        if self.outside != position {
+            self.outside = position;
+            if let Some(preview) = &self.preview {
+                preview.show_at(position);
+            }
+        }
+    }
+}
+
 struct Palette {
     library: Entity<LocalEmotes>,
     _library_subscription: Subscription,
     pinned: bool,
     category: Wheel,
-    dragging: Option<Item>,
+    dragging: Option<ItemDrag>,
     #[cfg(target_os = "windows")]
     pointer_task: Option<Task<()>>,
+    #[cfg(target_os = "macos")]
+    resize_start: Option<(Point<Pixels>, Size<Pixels>)>,
+    #[cfg(target_os = "macos")]
+    resize_task: Option<Task<()>>,
     error: Option<String>,
 }
 
@@ -175,33 +201,94 @@ impl Palette {
             dragging: None,
             #[cfg(target_os = "windows")]
             pointer_task: None,
+            #[cfg(target_os = "macos")]
+            resize_start: None,
+            #[cfg(target_os = "macos")]
+            resize_task: None,
             error: None,
         }
     }
 
     #[cfg(target_os = "windows")]
-    fn begin_move(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn watch_pointer(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<async_channel::Receiver<platform::PalettePointer>> {
         let Some((monitor, _)) = &cx.global::<Desktop>().monitor else {
             self.error = Some("鼠标监听不可用，请在设置中重试。".into());
             cx.notify();
+            return None;
+        };
+        monitor.watch_palette_pointer()
+    }
+
+    #[cfg(target_os = "windows")]
+    fn track_window(
+        &mut self,
+        update: impl Fn(platform::PalettePointer) -> bool + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(events) = self.watch_pointer(cx) else {
             return;
         };
-        let Some(drag) = platform::PaletteMove::new(window, event.position) else {
-            return;
-        };
-        let Some(events) = monitor.watch_palette_pointer(true) else {
-            return;
-        };
+        if self.dragging.take().is_some() {
+            cx.notify();
+        }
         // SetWindowPos can dispatch move and DPI callbacks synchronously.
         // SetWindowPos 可能同步触发窗口移动和 DPI 回调。
         self.pointer_task = Some(cx.spawn(async move |_, _| {
             while let Ok(event) = events.recv().await {
                 let released = event.released;
-                if !drag.update(event) || released {
+                if !update(event) || released {
                     break;
                 }
             }
         }));
+    }
+
+    #[cfg(target_os = "windows")]
+    fn begin_move(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(drag) = platform::PaletteMove::new(window, event.position) {
+            self.track_window(move |event| drag.update(event), cx);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn begin_resize(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(drag) = platform::PaletteResize::new(window, event.position, minimum_size()) {
+            self.track_window(move |event| drag.update(event), cx);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn begin_resize(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dragging.take().is_some() {
+            cx.notify();
+        }
+        self.resize_start = Some((event.position, window.viewport_size()));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn resize(&mut self, position: Point<Pixels>, window: &Window, cx: &App) {
+        if let Some((press, initial)) = self.resize_start {
+            let delta = position - press;
+            let minimum = minimum_size();
+            let target = size(
+                (initial.width + delta.x).max(minimum.width),
+                (initial.height + delta.y).max(minimum.height),
+            );
+            self.resize_task = platform::resize_palette(window, target, cx);
+        }
     }
 
     fn toggle_pin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -223,33 +310,68 @@ impl Palette {
         cx.notify();
     }
 
-    fn begin_drag(&mut self, item: Item, _window: &mut Window, cx: &mut Context<Self>) {
+    fn begin_drag(&mut self, item: Item, window: &mut Window, cx: &mut Context<Self>) {
         self.error = None;
+        #[cfg(target_os = "macos")]
+        {
+            self.resize_start = None;
+        }
         #[cfg(target_os = "windows")]
         {
-            let Some((monitor, _)) = &cx.global::<Desktop>().monitor else {
-                self.error = Some("鼠标监听不可用，请在设置中重试。".into());
-                cx.notify();
+            let Some(events) = self.watch_pointer(cx) else {
                 return;
             };
-            let Some(release) = monitor.watch_palette_pointer(false) else {
-                return;
-            };
-            self.pointer_task = Some(cx.spawn_in(_window, async move |owner, cx| {
-                let position = release.recv().await.ok().map(|event| event.position);
-                let _ = owner.update_in(cx, |this, window, cx| {
-                    let position =
-                        position.and_then(|position| platform::palette_drop(window, position));
-                    this.finish_drag(position, cx);
-                });
+            self.pointer_task = Some(cx.spawn_in(window, async move |owner, cx| {
+                while let Ok(event) = events.recv().await {
+                    if event.released {
+                        let _ = owner.update_in(cx, |this, window, cx| {
+                            this.finish_drag(platform::palette_drop(window, event.position), cx);
+                        });
+                        return;
+                    }
+                    if owner
+                        .update_in(cx, |this, window, _| {
+                            if let Some(drag) = &mut this.dragging {
+                                drag.move_to(platform::palette_outside(window, event.position));
+                            }
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                let _ = owner.update_in(cx, |this, _, cx| this.finish_drag(None, cx));
             }));
         }
-        self.dragging = Some(item);
+        let store = self.library.read(cx).store.clone();
+        let body = item.body();
+        let pixels = (platform::PALETTE_PREVIEW_SIZE as f32 * window.scale_factor()).round() as u32;
+        let load = cx.spawn(async move |owner, cx| {
+            let frame =
+                smol::unblock(move || platform::load_palette_preview(body, &store, pixels.max(1)))
+                    .await;
+            if let Some(frame) = frame {
+                let _ = owner.update(cx, |this, _| {
+                    if let Some(drag) = &mut this.dragging {
+                        drag.preview = platform::PalettePreview::new(frame);
+                        if let Some(preview) = &drag.preview {
+                            preview.show_at(drag.outside);
+                        }
+                    }
+                });
+            }
+        });
+        self.dragging = Some(ItemDrag {
+            item,
+            outside: None,
+            preview: None,
+            _load: load,
+        });
         cx.notify();
     }
 
     fn finish_drag(&mut self, position: Option<Position>, cx: &mut Context<Self>) {
-        let Some(item) = self.dragging.take() else {
+        let Some(item) = self.dragging.take().map(|drag| drag.item) else {
             return;
         };
         if let Some(position) = position {
@@ -283,14 +405,31 @@ impl Palette {
     }
 
     #[cfg(target_os = "macos")]
+    fn mouse_moved(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.pressed_button == Some(MouseButton::Left) {
+            if let Some(drag) = &mut self.dragging {
+                drag.move_to(platform::palette_outside(window, event.position));
+            } else {
+                self.resize(event.position, window, cx);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     fn mouse_released(
         &mut self,
         event: &MouseUpEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.dragging.is_some() {
-            let position = platform::palette_drop(window, event.position);
+        if event.button != MouseButton::Left && !platform::palette_left_released() {
+            return;
+        }
+        if self.resize_start.is_some() {
+            self.resize(event.position, window, cx);
+            self.resize_start = None;
+        } else if self.dragging.is_some() {
+            let position = platform::palette_outside(window, event.position);
             cx.defer_in(window, move |this, _, cx| this.finish_drag(position, cx));
         }
     }
@@ -309,7 +448,7 @@ impl Palette {
             .small()
             .compact()
             .size_9()
-            .selected(self.dragging == Some(item))
+            .selected(self.dragging.as_ref().is_some_and(|drag| drag.item == item))
             .cursor_grab()
             .accessibility_label(name.clone())
             .when(self.dragging.is_none(), |button| button.tooltip(name))
@@ -405,6 +544,17 @@ impl Render for Palette {
         let title =
             title.on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move());
 
+        let mut resize = Button::new("resize-palette")
+            .ghost()
+            .small()
+            .icon(IconName::MoveDiagonal2)
+            .cursor_nwse_resize()
+            .accessibility_label("调整浮窗宽高")
+            .tooltip("拖动调整浮窗宽高");
+        resize
+            .interactivity()
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_resize));
+
         let panel = div()
             .size_full()
             .flex()
@@ -475,29 +625,60 @@ impl Render for Palette {
             )
             .child(
                 div()
+                    .flex()
+                    .items_end()
                     .flex_shrink_0()
                     .border_t_1()
                     .border_color(theme.border)
-                    .px_3()
-                    .py_2()
-                    .text_xs()
-                    .text_color(if self.error.is_some() {
-                        theme.danger
-                    } else {
-                        theme.muted_foreground
-                    })
-                    .child(self.error.clone().unwrap_or_else(|| {
-                        if self.dragging.is_some() {
-                            "在浮窗外松手发送".into()
-                        } else {
-                            "按住图标，拖到桌面发送".into()
-                        }
-                    })),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .pl_3()
+                            .pr_1()
+                            .py_2()
+                            .text_xs()
+                            .text_color(if self.error.is_some() {
+                                theme.danger
+                            } else {
+                                theme.muted_foreground
+                            })
+                            .child(self.error.clone().unwrap_or_else(|| {
+                                if self.dragging.is_some() {
+                                    "在浮窗外松手发送".into()
+                                } else {
+                                    "按住图标，拖到桌面发送".into()
+                                }
+                            })),
+                    )
+                    .child(resize),
             );
         #[cfg(target_os = "macos")]
-        let panel = panel
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_released))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_released));
+        let panel = {
+            let moved = cx.listener(Self::mouse_moved);
+            let released = cx.listener(Self::mouse_released);
+            // AppKit sends drags beyond the window. Listen in capture phase without a hitbox.
+            // AppKit 会送达窗口外的拖动事件，在捕获阶段监听，无需命中区域。
+            panel.child(
+                canvas(
+                    |_, _, _| (),
+                    move |_, (), window, _| {
+                        window.on_mouse_event(move |event, phase, window, cx| {
+                            if phase == DispatchPhase::Capture {
+                                moved(event, window, cx);
+                            }
+                        });
+                        window.on_mouse_event(move |event, phase, window, cx| {
+                            if phase == DispatchPhase::Capture {
+                                released(event, window, cx);
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
+        };
         panel
     }
 }

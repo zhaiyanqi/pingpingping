@@ -351,7 +351,7 @@ impl TimedFrame {
     }
 }
 
-fn prepare(image: RgbaImage, size: Option<u32>) -> RgbaImage {
+pub(super) fn prepare(image: RgbaImage, size: Option<u32>) -> RgbaImage {
     let image = match size {
         Some(size) if image.width() != image.height() => {
             let fitted = image::DynamicImage::ImageRgba8(image)

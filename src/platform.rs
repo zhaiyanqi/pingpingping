@@ -6,6 +6,7 @@ use std::io::Cursor;
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::time::Duration;
 
+use image::RgbaImage;
 use rodio::{Decoder, DeviceSinkBuilder, Player};
 
 use crate::assets::{EMOTES, PINGS, WHEEL_TICK};
@@ -29,6 +30,19 @@ pub(crate) enum WheelContents {
 pub(crate) enum AnimationPosition {
     Local(Position),
     Relative(Location),
+}
+
+pub(crate) const PALETTE_PREVIEW_SIZE: u32 = 56;
+
+pub(crate) fn load_palette_preview(body: Body, store: &EmoteStore, size: u32) -> Option<RgbaImage> {
+    let image = match body {
+        Body::Ping { index, .. } => image::load_from_memory(PINGS.get(index)?.image),
+        Body::Emote { index, .. } => image::load_from_memory(EMOTES.get(index)?.image),
+        Body::CustomEmote(id) => image::open(store.poster(id)),
+        Body::Text(_) => return None,
+    }
+    .ok()?;
+    Some(playback::prepare(image.into_rgba8(), Some(size)))
 }
 
 impl WheelContents {
@@ -210,7 +224,37 @@ fn start_audio() -> SyncSender<AudioCue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::emotes::has_visible_pixels;
     use image::{AnimationDecoder, codecs::webp::WebPDecoder};
+
+    #[test]
+    fn palette_preview_preserves_custom_art_and_loads_distinct_presets() {
+        let directory = std::env::temp_dir().join(format!("ping-preview-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = EmoteStore::new(&directory);
+        let path = directory.join("tall.png");
+        RgbaImage::from_pixel(24, 48, image::Rgba([0, 255, 0, 255]))
+            .save(&path)
+            .unwrap();
+        let custom = store.import(&path).unwrap();
+        let edge = PALETTE_PREVIEW_SIZE;
+        let preview = |body| load_palette_preview(body, &store, edge).unwrap();
+        let ping = preview(Body::Ping {
+            index: 0,
+            location: None,
+        });
+        let emote = preview(Body::Emote {
+            index: 0,
+            location: None,
+        });
+        let custom = preview(Body::CustomEmote(custom.id()));
+        assert_ne!(ping, emote);
+        assert!(has_visible_pixels(&ping) && has_visible_pixels(&emote));
+        assert_eq!(custom.dimensions(), (edge, edge));
+        assert_eq!(custom.get_pixel(0, edge / 2)[3], 0);
+        assert_eq!(custom.get_pixel(edge / 2, edge / 2).0, [0, 255, 0, 255]);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn every_effect_has_audio_and_distinct_animation_frames() {
