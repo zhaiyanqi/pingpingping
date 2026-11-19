@@ -19,6 +19,7 @@ use super::{animation_presenter, system_reduces_motion, text_presenter};
 
 pub(super) const MAX_ACTIVE: usize = 16;
 const TRANSITION_DURATION: Duration = Duration::from_millis(180);
+const CUSTOM_EMOTE_FADE_DURATION: Duration = Duration::from_millis(320);
 const TRANSITION_FRAME: Duration = Duration::from_millis(16);
 pub(super) const TEXT_WIDTH: u32 = 360;
 pub(super) const TEXT_PADDING: u32 = 14;
@@ -48,7 +49,7 @@ pub(crate) struct Animation {
     source: AnimationSource,
     poster: Option<&'static [u8]>,
     timeout: Duration,
-    fade_out: bool,
+    fade_out: Option<Duration>,
 }
 
 enum AnimationSource {
@@ -65,7 +66,7 @@ impl Animation {
             source: AnimationSource::WebP(bytes.into()),
             poster: None,
             timeout,
-            fade_out: false,
+            fade_out: None,
         }
     }
 
@@ -75,7 +76,7 @@ impl Animation {
             source: AnimationSource::Custom(store, id),
             poster: None,
             timeout,
-            fade_out: true,
+            fade_out: Some(CUSTOM_EMOTE_FADE_DURATION),
         }
     }
 
@@ -85,7 +86,7 @@ impl Animation {
     }
 
     pub(super) fn with_fade_out(mut self) -> Self {
-        self.fade_out = true;
+        self.fade_out = Some(TRANSITION_DURATION);
         self
     }
 }
@@ -119,7 +120,8 @@ impl AnimationOverlay {
         // Tasks own their native windows. A weak registry allows owner teardown to cancel every stream.
         // 任务持有原生窗口，弱引用避免循环持有，播放器销毁时会取消所有播放。
         let registry = Rc::downgrade(&self.active);
-        let reduce_motion = animation.fade_out && (cx.reduce_motion() || system_reduces_motion());
+        let reduce_motion =
+            animation.fade_out.is_some() && (cx.reduce_motion() || system_reduces_motion());
         let task = cx.spawn(async move |_| {
             run(animation, output_pixels, reduce_motion, &mut present).await;
             if let Some(registry) = registry.upgrade()
@@ -242,7 +244,10 @@ async fn play_text_overlay(
     .await;
     smol::Timer::after(Duration::from_millis(u64::from(settings.timeout_ms))).await;
     if exit != TextMotion::None {
-        transition(|hidden| present(basic_text_frame(settings.position, exit, hidden))).await;
+        transition(TRANSITION_DURATION, |hidden| {
+            present(basic_text_frame(settings.position, exit, hidden))
+        })
+        .await;
     }
 }
 
@@ -286,8 +291,8 @@ fn basic_text_frame(position: TextPosition, motion: TextMotion, hidden: f32) -> 
     }
 }
 
-async fn transition(mut present: impl FnMut(f32)) {
-    animate(TRANSITION_DURATION, |progress| present(progress.powi(2))).await;
+async fn transition(duration: Duration, mut present: impl FnMut(f32)) {
+    animate(duration, |progress| present(progress.powi(2))).await;
 }
 
 async fn animate(duration: Duration, mut present: impl FnMut(f32)) {
@@ -304,7 +309,21 @@ async fn animate(duration: Duration, mut present: impl FnMut(f32)) {
     }
 }
 
-type TimedFrame = (RgbaImage, Duration);
+struct TimedFrame {
+    image: RgbaImage,
+    delay: Duration,
+    visible: bool,
+}
+
+impl TimedFrame {
+    fn new(image: RgbaImage, delay: Duration) -> Self {
+        Self {
+            visible: has_visible_pixels(&image),
+            image,
+            delay,
+        }
+    }
+}
 
 fn prepare(image: RgbaImage, size: Option<u32>) -> RgbaImage {
     let image = match size {
@@ -361,7 +380,12 @@ fn decode(animation: &Animation, size: Option<u32>, send: async_channel::Sender<
             (Cow::Owned(bytes), true)
         }
     };
+    let send_frame = |mut frame: TimedFrame| {
+        frame.image = prepare(frame.image, size);
+        send.send_blocking(frame).is_ok()
+    };
     let mut sent = false;
+    let mut pending_blank: Option<TimedFrame> = None;
     'cycles: while !send.is_closed() {
         let source = if custom {
             emotes::decode(&bytes)
@@ -370,7 +394,7 @@ fn decode(animation: &Animation, size: Option<u32>, send: async_channel::Sender<
         };
         let frames = match source {
             Ok(EmoteImage::Still(image)) => {
-                let _ = send.send_blocking((prepare(image, size), animation.timeout));
+                send_frame(TimedFrame::new(image, animation.timeout));
                 return;
             }
             Ok(EmoteImage::Animated(frames)) => frames,
@@ -378,7 +402,6 @@ fn decode(animation: &Animation, size: Option<u32>, send: async_channel::Sender<
         };
 
         let mut visible = false;
-        let mut pending_blank: Option<TimedFrame> = None;
         for frame in frames {
             let Ok(frame) = frame else { break 'cycles };
             if send.is_closed() {
@@ -390,23 +413,23 @@ fn decode(animation: &Animation, size: Option<u32>, send: async_channel::Sender<
             } else {
                 Duration::from_secs_f64(f64::from(n) / f64::from(d.max(1)) / 1000.0)
             };
-            let image = frame.into_buffer();
-            // Keep transparent frames inside a cycle, and skip the transparent padding at its edges.
-            // 保留一轮动画中间的透明帧，跳过首尾用于填充的透明帧。
-            if !custom && !has_visible_pixels(&image) {
-                if let Some((_, total)) = &mut pending_blank {
-                    *total += delay;
-                } else if visible {
-                    pending_blank = Some((image, delay));
+            let frame = TimedFrame::new(frame.into_buffer(), delay);
+            // Merge adjacent blanks, including across loops for custom images that keep their source timing.
+            // 合并相邻透明帧，自定义图片保留原始时长，可以跨循环合并。
+            if !frame.visible {
+                if let Some(blank) = &mut pending_blank {
+                    blank.delay += frame.delay;
+                } else if custom || visible {
+                    pending_blank = Some(frame);
                 }
                 continue;
             }
-            if let Some((blank, delay)) = pending_blank.take()
-                && send.send_blocking((prepare(blank, size), delay)).is_err()
+            if let Some(blank) = pending_blank.take()
+                && !send_frame(blank)
             {
                 return;
             }
-            if send.send_blocking((prepare(image, size), delay)).is_err() {
+            if !send_frame(frame) {
                 return;
             }
             visible = true;
@@ -415,13 +438,16 @@ fn decode(animation: &Animation, size: Option<u32>, send: async_channel::Sender<
         if !visible {
             break;
         }
+        if !custom {
+            pending_blank = None;
+        }
     }
     if !sent
         && !send.is_closed()
         && let Some(poster) = animation.poster
         && let Ok(image) = image::load_from_memory_with_format(poster, image::ImageFormat::Png)
     {
-        let _ = send.send_blocking((prepare(image.into_rgba8(), size), animation.timeout));
+        send_frame(TimedFrame::new(image.into_rgba8(), animation.timeout));
     }
 }
 
@@ -432,29 +458,37 @@ async fn run(
     mut present: impl FnMut(FrameUpdate),
 ) {
     let expires = Instant::now() + animation.timeout;
-    let fade_out = animation.fade_out && !reduce_motion;
+    let fade_out = animation.fade_out.filter(|_| !reduce_motion);
+    let keep_visible_at_exit =
+        fade_out.is_some() && matches!(animation.source, AnimationSource::Custom(..));
     let (send, receive) = async_channel::bounded(2);
     let worker = smol::unblock(move || decode(&animation, size, send));
-    let mut shown = false;
+    let mut visible = false;
     let frames = async {
         let Ok(mut current) = receive.recv().await else {
             return;
         };
         let mut deadline = Instant::now();
         loop {
-            deadline += current.1;
+            deadline += current.delay;
             // Coalesce late frames while preserving the source clock across loop boundaries.
             // 合并过期帧，循环衔接时仍沿用素材的时间轴。
             while deadline <= Instant::now() {
                 let Ok(next) = receive.try_recv() else { break };
                 current = next;
-                deadline += current.1;
+                deadline += current.delay;
             }
             if Instant::now() >= expires {
                 return;
             }
-            present(FrameUpdate::Image(current.0));
-            shown = true;
+            // Keep the picture on screen if a blank run would otherwise hide it through the exit.
+            // 如果透明帧会一直持续到退场，就保留屏幕上当前的画面。
+            let blank_at_exit =
+                keep_visible_at_exit && visible && !current.visible && deadline >= expires;
+            if !blank_at_exit {
+                visible = current.visible;
+                present(FrameUpdate::Image(current.image));
+            }
             smol::Timer::at(deadline.min(expires)).await;
             let Ok(next) = receive.recv().await else {
                 return;
@@ -468,10 +502,13 @@ async fn run(
     .await;
     drop(receive);
     drop(worker);
-    if shown && fade_out {
+    if let Some(duration) = fade_out.filter(|_| visible) {
         // Keep the last bitmap in the native window and change only its opacity.
         // 保留原生浮窗中的最后一帧，只更新透明度。
-        transition(|hidden| present(FrameUpdate::Opacity(1.0 - hidden))).await;
+        transition(duration, |hidden| {
+            present(FrameUpdate::Opacity(1.0 - hidden))
+        })
+        .await;
     }
 }
 
@@ -592,18 +629,22 @@ mod tests {
     #[test]
     fn still_emote_preserves_aspect_and_fades_the_same_frame() {
         let source = RgbaImage::from_pixel(8, 4, image::Rgba([255, 128, 0, 255]));
-        let mut bytes = Cursor::new(Vec::new());
-        source
-            .write_to(&mut bytes, image::ImageFormat::WebP)
-            .unwrap();
-        let animation =
-            Animation::webp(bytes.into_inner(), 16, Duration::from_millis(100)).with_fade_out();
+        let folder =
+            std::env::temp_dir().join(format!("pingpingping-png-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("test.png");
+        source.save(&path).unwrap();
+        let store = EmoteStore::new(&folder);
+        let emote = store.import(&path).unwrap();
+        let timeout = Duration::from_millis(100);
+        let animation = Animation::custom(store, emote.id(), 16, timeout);
         let owner = Rc::new(());
         let presenter = owner.clone();
         let mut frames = 0;
         let mut opacities = Vec::new();
         let count = &mut frames;
         let opacity_values = &mut opacities;
+        let start = Instant::now();
         smol::block_on(run(animation, Some(16), false, move |update| {
             let _keep_alive = &presenter;
             match update {
@@ -614,11 +655,20 @@ mod tests {
                     assert_eq!(image.get_pixel(8, 8)[3], 255);
                     *count += 1;
                 }
-                FrameUpdate::Opacity(opacity) => opacity_values.push(opacity),
+                FrameUpdate::Opacity(opacity) => {
+                    assert!(start.elapsed() >= timeout);
+                    opacity_values.push(opacity);
+                }
             }
         }));
+        std::fs::remove_dir_all(folder).unwrap();
         assert_eq!(frames, 1);
         assert!(opacities.first().unwrap() > &0.9);
+        assert!(
+            opacities
+                .iter()
+                .any(|&opacity| opacity > 0.0 && opacity < 0.9)
+        );
         assert_eq!(opacities.last(), Some(&0.0));
         assert!(opacities.windows(2).all(|pair| pair[0] >= pair[1]));
         assert_eq!(Rc::strong_count(&owner), 1);
@@ -638,7 +688,7 @@ mod tests {
                         .map(Result::unwrap)
                         .filter(|frame| has_visible_pixels(frame.buffer()));
                     for frame in frames {
-                        let (image, delay) = receive.recv().await.unwrap();
+                        let TimedFrame { image, delay, .. } = receive.recv().await.unwrap();
                         let (n, d) = frame.delay().numer_denom_ms();
                         assert_eq!(image, prepare(frame.buffer().clone(), None));
                         assert_eq!(
@@ -697,13 +747,57 @@ mod tests {
             let (send, receive) = async_channel::bounded(2);
             let worker = smol::unblock(move || decode(&animation, None, send));
             for image in [first.clone(), second, first] {
-                let (frame, delay) = receive.recv().await.unwrap();
-                assert_eq!(frame, prepare(image, None));
-                assert_eq!(delay, Duration::from_millis(50));
+                let frame = receive.recv().await.unwrap();
+                assert_eq!(frame.image, prepare(image, None));
+                assert_eq!(frame.delay, Duration::from_millis(50));
             }
             receive.close();
             worker.await;
         });
         std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn imported_gif_fades_the_visible_frame_when_a_blank_run_spans_the_timeout() {
+        use image::{Delay, Frame, Rgba, codecs::gif::GifEncoder};
+
+        let folder =
+            std::env::temp_dir().join(format!("pingpingping-gif-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("transparent-tail.gif");
+        let visible = RgbaImage::from_pixel(4, 4, Rgba([255, 0, 0, 255]));
+        let blank = RgbaImage::new(4, 4);
+        GifEncoder::new(std::fs::File::create(&path).unwrap())
+            .encode_frames(
+                [(visible.clone(), 150), (blank.clone(), 80), (blank, 400)].map(
+                    |(image, delay)| {
+                        Frame::from_parts(image, 0, 0, Delay::from_numer_denom_ms(delay, 1))
+                    },
+                ),
+            )
+            .unwrap();
+
+        let store = EmoteStore::new(&folder);
+        let emote = store.import(&path).unwrap();
+        let timeout = Duration::from_millis(350);
+        let animation = Animation::custom(store, emote.id(), 4, timeout);
+        let start = Instant::now();
+        let mut last_image = None;
+        let mut opacities = Vec::new();
+        smol::block_on(run(animation, Some(4), false, |update| match update {
+            FrameUpdate::Image(image) => last_image = Some(image),
+            FrameUpdate::Opacity(opacity) => {
+                assert!(start.elapsed() >= timeout);
+                opacities.push(opacity);
+            }
+        }));
+        std::fs::remove_dir_all(folder).unwrap();
+        assert_eq!(last_image, Some(prepare(visible, None)));
+        assert!(
+            opacities
+                .iter()
+                .any(|&opacity| opacity > 0.0 && opacity < 0.9)
+        );
+        assert_eq!(opacities.last(), Some(&0.0));
     }
 }

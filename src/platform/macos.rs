@@ -585,18 +585,22 @@ pub(super) fn animation_presenter(
             art.setContentsGravity(unsafe { objc2_quartz_core::kCAGravityResizeAspect });
             Effect { panel, art }
         });
-        update_layers(|| match update {
-            FrameUpdate::Image(frame) => set_pixels(
-                &window.art,
-                frame.width(),
-                frame.height(),
-                frame.into_raw(),
-                3,
-            ),
-            FrameUpdate::Opacity(opacity) => window.art.setOpacity(opacity),
-        });
-        if !window.panel.isVisible() {
-            place(&window.panel, point, size, screen);
+        match update {
+            FrameUpdate::Image(frame) => {
+                update_layers(|| {
+                    set_pixels(
+                        &window.art,
+                        frame.width(),
+                        frame.height(),
+                        frame.into_raw(),
+                        3,
+                    );
+                });
+                if !window.panel.isVisible() {
+                    place(&window.panel, point, size, screen);
+                }
+            }
+            FrameUpdate::Opacity(opacity) => window.panel.setAlphaValue(f64::from(opacity)),
         }
     }))
 }
