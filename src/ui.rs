@@ -153,9 +153,7 @@ pub(crate) fn start(cx: &mut App) {
     let desktop = cx.global::<Desktop>();
     let model = desktop.model.clone();
     let incoming = desktop.incoming.clone();
-    model.update(cx, |model, cx| {
-        model.reconnect_room_on_startup(incoming, cx)
-    });
+    model.update(cx, |model, cx| model.restore_room_on_startup(incoming, cx));
     register_window_actions(cx);
     let (sender, commands) = async_channel::unbounded();
     let muted = cx
@@ -1388,8 +1386,8 @@ impl Render for Conversation {
                                         },
                                         connection.address()
                                     )
-                                } else if model.is_connecting() {
-                                    "正在连接房间…".into()
+                                } else if let Some(config) = model.pending_room() {
+                                    pending_room_label(config).into()
                                 } else {
                                     "本机 · 未加入房间".into()
                                 },
@@ -2251,7 +2249,11 @@ impl Settings {
             ..
         } = model.read(cx).profile.clone();
         let name = cx.new(|cx| InputState::new(window, cx).default_value(name));
-        let address = endpoint.map(RoomConfig::address);
+        let address = model
+            .read(cx)
+            .pending_room()
+            .or(endpoint)
+            .map(RoomConfig::address);
         let ip = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("192.168.1.20")
@@ -2537,7 +2539,7 @@ impl Settings {
 
     fn connect(&mut self, host: bool, cx: &mut Context<Self>) {
         let model = self.model.read(cx);
-        if model.is_connecting() || model.joined() {
+        if model.pending_room().is_some() || model.joined() {
             return;
         }
         let config =
@@ -2636,11 +2638,19 @@ fn slider_field(label: &'static str, value: String, slider: Slider) -> Div {
         .child(slider)
 }
 
+fn pending_room_label(config: RoomConfig) -> &'static str {
+    match config {
+        RoomConfig::Host(_) => "正在创建房间…",
+        RoomConfig::Join(_) => "正在连接房间…",
+    }
+}
+
 impl Settings {
     fn room_settings(&self, cx: &Context<Self>) -> Div {
         let model = self.model.read(cx);
         let connection = model.connection();
-        let busy = model.is_connecting();
+        let pending = model.pending_room();
+        let busy = pending.is_some();
         let room_error = self
             .connection_error
             .clone()
@@ -2663,8 +2673,8 @@ impl Settings {
                     .when(connection.is_none() && !busy, |row| row
                         .child(Button::new("join-room").primary().label("连接").on_click(cx.listener(|this, _, _, cx| this.connect(false, cx))))
                         .child(Button::new("host-room").label("创建房间").on_click(cx.listener(|this, _, _, cx| this.connect(true, cx)))))
-                    .when(busy, |row| row
-                        .child(Button::new("pending-room").label("正在建立连接…").disabled(true))
+                    .when_some(pending, |row, config| row
+                        .child(Button::new("pending-room").label(pending_room_label(config)).disabled(true))
                         .child(Button::new("cancel-room").ghost().label("取消").on_click(cx.listener(|this, _, _, cx| this.disconnect(cx)))))
                     .when_some(connection, |row, config| row
                         .child(Button::new("copy-address").label("复制地址").on_click(move |_, _, cx| {

@@ -316,8 +316,8 @@ pub(crate) struct Profile {
     pub(crate) name: String,
     #[serde(default)]
     pub(crate) endpoint: Option<RoomConfig>,
-    #[serde(default)]
-    skip_room_reconnect: bool,
+    #[serde(default, rename = "skip_room_reconnect")]
+    skip_room_restore: bool,
     pub(crate) sound: bool,
     pub(crate) gestures: bool,
     #[serde(default)]
@@ -363,7 +363,7 @@ impl Default for Profile {
             id: Uuid::new_v4(),
             name: "桌面好友".into(),
             endpoint: None,
-            skip_room_reconnect: false,
+            skip_room_restore: false,
             sound: true,
             gestures: true,
             triggers: Default::default(),
@@ -383,13 +383,18 @@ struct Entry {
     message: Message,
 }
 
+struct PendingRoom {
+    config: RoomConfig,
+    _task: Task<()>,
+}
+
 pub(crate) struct Model {
     pub(crate) profile: Profile,
     pub(crate) room_error: Option<String>,
     pub(crate) input_ready: bool,
     data_dir: PathBuf,
     room: Option<Room>,
-    connecting: Option<Task<()>>,
+    pending_room: Option<PendingRoom>,
     room_key: String,
     history: VecDeque<Arc<Entry>>,
     history_revision: u64,
@@ -479,7 +484,7 @@ impl Model {
         Ok(Self {
             data_dir,
             room: None,
-            connecting: None,
+            pending_room: None,
             room_key: String::new(),
             room_error: None,
             input_ready: false,
@@ -510,8 +515,8 @@ impl Model {
         self.room.as_ref().map(Room::config)
     }
 
-    pub(crate) fn is_connecting(&self) -> bool {
-        self.connecting.is_some()
+    pub(crate) fn pending_room(&self) -> Option<RoomConfig> {
+        self.pending_room.as_ref().map(|pending| pending.config)
     }
 
     pub(crate) fn room_members(&self) -> Option<(Uuid, &[RoomMember])> {
@@ -588,12 +593,12 @@ impl Model {
     }
 
     fn startup_room(&self) -> Option<RoomConfig> {
-        self.profile.endpoint.filter(|config| {
-            !self.profile.skip_room_reconnect && matches!(config, RoomConfig::Join(_))
-        })
+        self.profile
+            .endpoint
+            .filter(|_| !self.profile.skip_room_restore)
     }
 
-    pub(crate) fn reconnect_room_on_startup(
+    pub(crate) fn restore_room_on_startup(
         &mut self,
         incoming: Sender<RoomEvent>,
         cx: &mut Context<Self>,
@@ -609,30 +614,34 @@ impl Model {
         incoming: Sender<RoomEvent>,
         cx: &mut Context<Self>,
     ) {
-        if self.joined() || self.is_connecting() {
+        if self.joined() || self.pending_room.is_some() {
             return;
         }
         let name = self.profile.name.clone();
         let emotes = self.emotes();
         self.room_error = None;
-        self.connecting = Some(cx.spawn(async move |model, cx| {
+        let task = cx.spawn(async move |model, cx| {
             let room = Room::open(config, name, incoming, emotes).await;
             let _ = model.update(cx, |model, cx| {
-                model.connecting.take();
+                model.pending_room.take();
                 let result = room.and_then(|room| model.connect(room));
                 model.room_error = result.err().map(|error| format!("{error:#}"));
                 cx.notify();
             });
-        }));
+        });
+        self.pending_room = Some(PendingRoom {
+            config,
+            _task: task,
+        });
         cx.notify();
     }
 
     fn connect(&mut self, mut room: Room) -> Result<()> {
         let config = room.config();
-        if self.profile.endpoint != Some(config) || self.profile.skip_room_reconnect {
+        if self.profile.endpoint != Some(config) || self.profile.skip_room_restore {
             let mut profile = self.profile.clone();
             profile.endpoint = Some(config);
-            profile.skip_room_reconnect = false;
+            profile.skip_room_restore = false;
             self.apply(profile)?;
         }
         self.room_key = config.address().to_string();
@@ -643,15 +652,15 @@ impl Model {
     }
 
     pub(crate) fn disconnect(&mut self) {
-        self.connecting.take();
+        self.pending_room.take();
         self.leave_room();
         self.room_error = None;
         if self.startup_room().is_some() {
             let mut profile = self.profile.clone();
-            profile.skip_room_reconnect = true;
+            profile.skip_room_restore = true;
             self.room_error = self
                 .apply(profile)
-                .context("已断开连接，但无法停用启动时重连")
+                .context("无法保存启动时恢复房间的设置")
                 .err()
                 .map(|error| format!("{error:#}"));
         }
@@ -666,8 +675,8 @@ impl Model {
         if self.room.as_ref().map(Room::id) != Some(id) {
             return false;
         }
-        // An unexpected closure leaves the saved guest endpoint eligible for the next launch.
-        // 意外断开后保留客户端房间地址，下次启动时仍可重连。
+        // An unexpected closure still allows restoring the saved room on the next launch.
+        // 房间意外关闭时保留恢复设置，下次启动仍可恢复房间。
         self.leave_room();
         self.room_error = Some(reason);
         true
@@ -724,7 +733,7 @@ mod tests {
 
     #[gpui_kit::test]
     #[ignore = "requires TCP loopback access"]
-    async fn guest_reconnects_on_launch_and_respects_manual_disconnect(
+    async fn launch_restores_host_and_guest_until_manually_disconnected(
         cx: &mut gpui_kit::TestAppContext,
     ) {
         use gpui_kit::AppContext as _;
@@ -755,24 +764,38 @@ mod tests {
             .remove("skip_room_reconnect");
         save_json(&data.join("settings.json"), &legacy).unwrap();
 
+        let host_data = data.join("host");
+        let host_config = RoomConfig::Host(address);
+        let mut previous_host = Model::load(host_data.clone()).unwrap();
+        previous_host
+            .apply(Profile {
+                endpoint: Some(host_config),
+                ..previous_host.profile.clone()
+            })
+            .unwrap();
+        previous_host.finish_writes().unwrap().join().unwrap();
+        drop(previous_host);
+
         let (host_events, _host_inbox) = async_channel::bounded(8);
-        let mut host = Room::open(
-            RoomConfig::Host(address),
-            "主机".into(),
-            host_events,
-            EmoteStore::new(&data.join("host")),
-        )
-        .await
-        .unwrap();
-        host.activate();
+        let host = cx.new(|_| Model::load(host_data.clone()).unwrap());
+        host.update(cx, |model, cx| {
+            model.restore_room_on_startup(host_events, cx);
+            assert_eq!(model.pending_room(), Some(host_config));
+        });
+        cx.condition(&host, |model, _| model.pending_room().is_none())
+            .await;
+        assert_eq!(
+            cx.read_entity(&host, |model, _| model.connection()),
+            Some(host_config)
+        );
 
         let (events, inbox) = async_channel::bounded(8);
         let guest = cx.new(|_| Model::load(data.clone()).unwrap());
         guest.update(cx, |model, cx| {
-            model.reconnect_room_on_startup(events.clone(), cx);
-            assert!(model.is_connecting());
+            model.restore_room_on_startup(events.clone(), cx);
+            assert_eq!(model.pending_room(), Some(config));
         });
-        cx.condition(&guest, |model, _| !model.is_connecting())
+        cx.condition(&guest, |model, _| model.pending_room().is_none())
             .await;
         guest.update(cx, |model, _| {
             assert_eq!(model.connection(), Some(config));
@@ -784,13 +807,22 @@ mod tests {
         let guest = cx.new(|_| Model::load(data.clone()).unwrap());
         guest.update(cx, |model, cx| {
             assert_eq!(model.profile.endpoint, Some(config));
-            model.reconnect_room_on_startup(events.clone(), cx);
-            assert!(!model.is_connecting());
+            model.restore_room_on_startup(events.clone(), cx);
+            assert!(model.pending_room().is_none());
             model.open_room(config, events.clone(), cx);
         });
-        cx.condition(&guest, |model, _| !model.is_connecting())
+        cx.condition(&guest, |model, _| model.pending_room().is_none())
             .await;
-        drop(host);
+        host.update(cx, |model, _| {
+            model.disconnect();
+            assert!(model.room_error.is_none());
+            model.finish_writes().unwrap().join().unwrap();
+        });
+        let mut stopped_host = Model::load(host_data).unwrap();
+        assert_eq!(stopped_host.profile.endpoint, Some(host_config));
+        assert!(stopped_host.startup_room().is_none());
+        stopped_host.finish_writes().unwrap().join().unwrap();
+
         let id = cx.read_entity(&guest, |model, _| model.room.as_ref().unwrap().id());
         let reason = smol::future::race(
             async {
@@ -817,10 +849,10 @@ mod tests {
 
         let guest = cx.new(|_| Model::load(data.clone()).unwrap());
         guest.update(cx, |model, cx| {
-            model.reconnect_room_on_startup(events, cx);
-            assert!(model.is_connecting());
+            model.restore_room_on_startup(events, cx);
+            assert_eq!(model.pending_room(), Some(config));
         });
-        cx.condition(&guest, |model, _| !model.is_connecting())
+        cx.condition(&guest, |model, _| model.pending_room().is_none())
             .await;
         guest.update(cx, |model, _| {
             assert!(!model.joined());
