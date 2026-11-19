@@ -4,7 +4,9 @@ param(
     [ValidateSet('Both', 'Setup', 'Portable')]
     [string]$Package = 'Both',
     [switch]$StandardRelease,
-    [string]$IsccPath
+    [string]$IsccPath,
+    [ValidatePattern('\A[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\z')]
+    [string]$Version
 )
 
 $ErrorActionPreference = 'Stop'
@@ -54,13 +56,16 @@ if ($StandardRelease) {
 & $buildScript @buildArguments
 if ($LASTEXITCODE -ne 0) { throw "Windows build failed (exit code $LASTEXITCODE)." }
 
-$manifest = Join-Path $root 'Cargo.toml'
-$metadata = & rustup run "stable-$target" cargo metadata --locked --no-deps --format-version 1 --manifest-path $manifest
-if ($LASTEXITCODE -ne 0) { throw "Cargo metadata failed (exit code $LASTEXITCODE)." }
-$app = ($metadata | ConvertFrom-Json).packages | Where-Object { $_.name -eq 'pingpingping' }
-if (-not $app.version) { throw 'Could not find the PingPingPing version in Cargo metadata.' }
+if (-not $Version) {
+    $manifest = Join-Path $root 'Cargo.toml'
+    $metadata = & rustup run "stable-$target" cargo metadata --locked --no-deps --format-version 1 --manifest-path $manifest
+    if ($LASTEXITCODE -ne 0) { throw "Cargo metadata failed (exit code $LASTEXITCODE)." }
+    $app = ($metadata | ConvertFrom-Json).packages | Where-Object { $_.name -eq 'pingpingping' }
+    $Version = $app.version
+    if (-not $Version) { throw 'Could not find the PingPingPing version in Cargo metadata.' }
+}
 
-$name = "PingPingPing-$($app.version)-$artifactSuffix"
+$name = "PingPingPing-$Version-$artifactSuffix"
 $exe = Join-Path $root "target\$target\$buildProfile\pingpingping.exe"
 $packaging = Join-Path $root 'packaging'
 $dist = Join-Path $root 'dist\windows'
@@ -77,7 +82,7 @@ try {
     if ($Package -ne 'Portable') {
         $spec = Join-Path $packaging 'windows-setup.iss'
         $binary = Join-Path $payload 'pingpingping.exe'
-        & $IsccPath "/DAppVersion=$($app.version)" "/DAppBinary=$binary" "/O$staging" "/F$name-setup" $spec
+        & $IsccPath "/DAppVersion=$Version" "/DAppBinary=$binary" "/O$staging" "/F$name-setup" $spec
         if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed (exit code $LASTEXITCODE)." }
         $artifacts += "$name-setup.exe"
     }

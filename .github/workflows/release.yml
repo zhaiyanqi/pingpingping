@@ -1,0 +1,131 @@
+name: Build and publish release
+
+on:
+  push:
+    tags: ['**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+
+jobs:
+  version:
+    if: ${{ !github.event.deleted }}
+    runs-on: ubuntu-24.04
+    outputs:
+      package: ${{ steps.version.outputs.package }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Resolve package version
+        id: version
+        shell: bash
+        run: |
+          number='(0|[1-9][0-9]*)'
+          prerelease_id="($number|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+          build_id='[0-9A-Za-z-]+'
+          semver="^$number\.$number\.$number(-$prerelease_id(\.$prerelease_id)*)?(\+$build_id(\.$build_id)*)?$"
+          version=${GITHUB_REF_NAME#v}
+          # A non-version tag still gets a release with the manifest's package version.
+          # 非版本号 tag 也会发布，安装包沿用清单中的版本号。
+          if [[ ! $version =~ $semver ]]; then
+            version=$(cargo metadata --locked --no-deps --format-version 1 |
+              jq -er '.packages[] | select(.name == "pingpingping") | .version')
+          fi
+          base_version=${version%%+*}
+          prerelease=false
+          if [[ $base_version == *-* ]]; then
+            prerelease=true
+          fi
+          {
+            printf 'package=%s\n' "$version"
+            printf 'prerelease=%s\n' "$prerelease"
+          } >> "$GITHUB_OUTPUT"
+
+  windows:
+    name: Windows x64
+    needs: version
+    runs-on: windows-2025
+    timeout-minutes: 60
+    env:
+      RELEASE_VERSION: ${{ needs.version.outputs.package }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install Rust MSVC toolchain
+        shell: powershell
+        run: rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
+      - name: Build size-optimized installer and portable ZIP
+        shell: powershell
+        run: .\script\package-windows.ps1 -Version $env:RELEASE_VERSION
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-x64
+          path: |
+            dist/windows/PingPingPing-${{ env.RELEASE_VERSION }}-windows-x64-setup.exe
+            dist/windows/PingPingPing-${{ env.RELEASE_VERSION }}-windows-x64-portable.zip
+          if-no-files-found: error
+          compression-level: 0
+
+  macos:
+    name: macOS Apple Silicon
+    needs: version
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      PINGPINGPING_RELEASE_VERSION: ${{ needs.version.outputs.package }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Build size-optimized app ZIP
+        run: |
+          ./script/build-macos-release.sh --size
+          ditto -c -k --sequesterRsrc --keepParent dist/PingPingPing.app \
+            "dist/PingPingPing-$PINGPINGPING_RELEASE_VERSION-macos-arm64.zip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-arm64
+          path: dist/PingPingPing-${{ env.PINGPINGPING_RELEASE_VERSION }}-macos-arm64.zip
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: Publish GitHub Release
+    needs: [version, windows, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: '*'
+          path: release-assets
+      - name: Verify packages and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.version.outputs.package }}
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
+        shell: bash
+        run: |
+          assets=(
+            "release-assets/windows-x64/PingPingPing-$RELEASE_VERSION-windows-x64-setup.exe"
+            "release-assets/windows-x64/PingPingPing-$RELEASE_VERSION-windows-x64-portable.zip"
+            "release-assets/macos-arm64/PingPingPing-$RELEASE_VERSION-macos-arm64.zip"
+          )
+          for asset in "${assets[@]}"; do
+            if [[ ! -s $asset ]]; then
+              printf 'Missing or empty release asset: %s\n' "$asset" >&2
+              exit 1
+            fi
+          done
+          options=(--repo "$GITHUB_REPOSITORY" --verify-tag --title "$GITHUB_REF_NAME" --generate-notes)
+          if [[ $PRERELEASE == true ]]; then
+            options+=(--prerelease)
+          fi
+          gh release create "${options[@]}" -- "$GITHUB_REF_NAME" "${assets[@]}"

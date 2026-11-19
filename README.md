@@ -43,7 +43,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\script\package-windows
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\script\package-windows.ps1 -Package Setup -StandardRelease
 ```
 
-产物位于 `dist/windows/`，文件名包含 `Cargo.toml` 中的版本号。使用 `-StandardRelease` 时，文件名会多一个 `-release`，方便同时保留两种构建的包。
+产物位于 `dist/windows/`，文件名默认包含 `Cargo.toml` 中的版本号，也可用 `-Version` 指定。使用 `-StandardRelease` 时，文件名会多一个 `-release`，方便同时保留两种构建的包。
 
 安装包 `*-setup.exe` 无需管理员权限，为当前用户安装并添加开始菜单入口和卸载项。便携包 `*-portable.zip` 解压后双击 `Launch-PingPingPing.bat`，设置、历史和自定义表情会保存在同目录的 `data` 文件夹中。
 
@@ -58,12 +58,28 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\script\package-windows
 ./script/build-macos-release.sh
 open dist/PingPingPing.app
 
+# 体积优化版
+./script/build-macos-release.sh --size
+
 # Debug
 ./script/build-macos-debug.sh
 open dist/debug/PingPingPing.app
 ```
 
 访达和 Dock 使用金色问号图标，菜单栏使用随系统外观着色的单色问号。也可以用 `cargo run --release --locked` 直接运行。首次使用全局轮盘时，在应用设置中请求输入监控权限。启用任一轮盘时，还需在「隐私与安全性 → 辅助功能」中允许 PingPingPing 拦截轮盘手势的鼠标事件。若授权后轮盘仍不可用，退出并重新打开应用。
+
+## 发布版本
+
+在包含发布流水线的提交上打 tag，并把 tag 推送到 GitHub。
+
+```sh
+git tag -a v0.1.0 -m "PingPingPing v0.1.0"
+git push origin refs/tags/v0.1.0
+```
+
+GitHub Actions 会使用 `release-small` 构建 Windows x64 安装包和便携 ZIP，以及 macOS Apple Silicon 应用 ZIP。三份产物全部就绪后，流水线会在 [GitHub Releases](https://github.com/zhaiyanqi/pingpingping/releases) 发布并附上自动生成的发布说明。macOS 应用使用临时签名。
+
+`v0.1.0` 或 `0.1.0` 这类版本 tag 会决定包的版本号。`v0.1.0-rc.1` 这类 tag 会发布为预发行版。其他 tag 使用 `Cargo.toml` 中的包版本号。
 
 ## 局域网连接
 

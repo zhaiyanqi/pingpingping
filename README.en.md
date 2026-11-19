@@ -43,7 +43,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\script\package-windows
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\script\package-windows.ps1 -Package Setup -StandardRelease
 ```
 
-Packages appear under `dist/windows/` with the version from `Cargo.toml` in their names. With `-StandardRelease`, the filenames include `-release` so you can keep both builds.
+Packages appear under `dist/windows/` with the version from `Cargo.toml` in their names by default. Pass `-Version` to set a different version. With `-StandardRelease`, the filenames include `-release` so you can keep both builds.
 
 The `*-setup.exe` installer adds Start menu and uninstall entries for the current user without requiring admin rights. To use the `*-portable.zip` package, extract it and double-click `Launch-PingPingPing.bat`. Settings, history, and custom emotes go in the `data` folder next to the launcher.
 
@@ -58,12 +58,28 @@ Install stable Rust and Xcode Command Line Tools, then run:
 ./script/build-macos-release.sh
 open dist/PingPingPing.app
 
+# Size-optimized release
+./script/build-macos-release.sh --size
+
 # Debug
 ./script/build-macos-debug.sh
 open dist/debug/PingPingPing.app
 ```
 
 Finder and the Dock use the gold question mark. The menu bar uses a monochrome question mark that adapts to the system appearance. You can also run `cargo run --release --locked`. Request Input Monitoring through Settings for global gestures. When either wheel is enabled, also grant PingPingPing Accessibility access in Privacy & Security so it can intercept mouse events during a wheel gesture. Restart the app if gestures remain unavailable after granting access.
+
+## Publish a release
+
+Tag a commit that contains the release workflow and push the tag to GitHub.
+
+```sh
+git tag -a v0.1.0 -m "PingPingPing v0.1.0"
+git push origin refs/tags/v0.1.0
+```
+
+GitHub Actions builds the Windows x64 installer and portable ZIP and the Apple Silicon macOS app ZIP with `release-small`. Once all three packages are ready, the workflow publishes them with generated notes on [GitHub Releases](https://github.com/zhaiyanqi/pingpingping/releases). The macOS app is ad-hoc signed.
+
+Version tags such as `v0.1.0` and `0.1.0` set the package version. A tag such as `v0.1.0-rc.1` publishes a prerelease. Other tags use the package version in `Cargo.toml`.
 
 ## Connect on a LAN
 
