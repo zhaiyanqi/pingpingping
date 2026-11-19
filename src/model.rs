@@ -13,7 +13,8 @@ use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
-use crate::assets::{Clip, EMOTES, PINGS};
+use crate::assets::{EMOTES, PINGS};
+use crate::emotes::{EmoteId, EmoteStore};
 use crate::room::{Room, RoomConfig};
 
 const HISTORY_LIMIT: usize = 600;
@@ -27,31 +28,40 @@ pub(crate) struct Location {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum Body {
     Text(String),
+    CustomEmote(EmoteId),
     Emote {
         index: usize,
         location: Option<Location>,
     },
     Ping {
         index: usize,
-        location: Location,
+        location: Option<Location>,
     },
 }
 
 impl Body {
-    pub(crate) fn clip(&self) -> Option<&'static Clip> {
-        match *self {
-            Self::Emote { index, .. } => EMOTES.get(index),
-            Self::Ping { index, .. } => PINGS.get(index),
-            Self::Text(_) => None,
-        }
+    pub(crate) fn is_emote(&self) -> bool {
+        matches!(self, Self::Emote { .. } | Self::CustomEmote(_))
     }
 
     pub(crate) fn location(&self) -> Option<Location> {
         match *self {
-            Self::Emote { location, .. } => location,
-            Self::Ping { location, .. } => Some(location),
-            Self::Text(_) => None,
+            Self::Emote { location, .. } | Self::Ping { location, .. } => location,
+            Self::Text(_) | Self::CustomEmote(_) => None,
         }
+    }
+
+    fn valid(&self) -> bool {
+        let valid_content = match self {
+            Self::Text(text) => !text.trim().is_empty() && text.len() <= 600,
+            Self::CustomEmote(_) => true,
+            Self::Emote { index, .. } => *index < EMOTES.len(),
+            Self::Ping { index, .. } => *index < PINGS.len(),
+        };
+        valid_content
+            && self.location().is_none_or(|location| {
+                (0.0..=1.0).contains(&location.x) && (0.0..=1.0).contains(&location.y)
+            })
     }
 }
 
@@ -80,15 +90,7 @@ impl Message {
             && !self.name.is_empty()
             && self.name.len() <= 64
             && self.name.chars().all(|character| !character.is_control())
-            && match &self.body {
-                Body::Text(text) => !text.trim().is_empty() && text.len() <= 600,
-                _ => {
-                    self.body.clip().is_some()
-                        && self.body.location().is_none_or(|location| {
-                            (0.0..=1.0).contains(&location.x) && (0.0..=1.0).contains(&location.y)
-                        })
-                }
-            }
+            && self.body.valid()
     }
 }
 
@@ -278,9 +280,7 @@ impl Model {
         let mut history: VecDeque<Entry> = load_json(&history_path)
             .context("无法读取历史记录")?
             .unwrap_or_default();
-        history.retain(|entry| {
-            matches!(&entry.message.body, Body::Text(_)) || entry.message.body.clip().is_some()
-        });
+        history.retain(|entry| entry.message.body.valid());
         while history.len() > HISTORY_LIMIT {
             history.pop_front();
         }
@@ -323,6 +323,10 @@ impl Model {
 
     pub(crate) fn joined(&self) -> bool {
         self.room.is_some()
+    }
+
+    pub(crate) fn emotes(&self) -> EmoteStore {
+        EmoteStore::new(&self.data_dir)
     }
 
     pub(crate) fn connection(&self) -> Option<RoomConfig> {
@@ -413,11 +417,6 @@ impl Model {
         ensure!(message.valid(), "请发送非空消息，最多 600 字节");
         if let Some(room) = &self.room {
             room.send(message.clone()).context("未能发送到局域网")?;
-        } else {
-            ensure!(
-                !matches!(message.body, Body::Text(_)),
-                "请先创建房间或连接主机"
-            );
         }
         self.record(message);
         Ok(())
@@ -451,6 +450,22 @@ impl Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn historical_pings_keep_their_location() {
+        let body: Body =
+            serde_json::from_str(r#"{"Ping":{"index":0,"location":{"x":0.1,"y":0.2}}}"#).unwrap();
+        assert!(body.valid());
+        let location = body.location().unwrap();
+        assert_eq!((location.x, location.y), (0.1, 0.2));
+        assert!(
+            Body::Ping {
+                index: 0,
+                location: None
+            }
+            .valid()
+        );
+    }
 
     #[test]
     fn legacy_profiles_use_defaults_for_playback_settings() {
@@ -512,20 +527,25 @@ mod tests {
     }
 
     #[test]
-    fn emote_history_and_identity_survive_reopening() {
+    fn local_messages_and_identity_survive_reopening() {
         let folder = std::env::temp_dir().join(format!("pingpingping-history-{}", Uuid::new_v4()));
         let mut original = Model::load(folder.clone()).unwrap();
+        let text = "你好\n第二行";
+        original.send(Body::Text(text.into())).unwrap();
         original
             .send(Body::Emote {
                 index: 3,
                 location: None,
             })
             .unwrap();
-        let message = original.messages().next().unwrap().clone();
+        let message = original.messages().next_back().unwrap().clone();
         original.finish_writes().unwrap().join().unwrap();
         let mut restored = Model::load(folder.clone()).unwrap();
         assert_eq!(restored.profile.id, message.sender);
-        assert_eq!(restored.messages().next().unwrap().id, message.id);
+        assert!(
+            matches!(&restored.messages().next().unwrap().body, Body::Text(saved) if saved == text)
+        );
+        assert_eq!(restored.messages().next_back().unwrap().id, message.id);
         restored.finish_writes().unwrap().join().unwrap();
         fs::remove_dir_all(folder).unwrap();
     }

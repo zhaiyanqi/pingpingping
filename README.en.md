@@ -48,7 +48,9 @@ Finder and the Dock use the gold question mark. The menu bar uses a monochrome q
 
 1. The **host** finds their active adapter's IPv4 address. On Windows, use `ipconfig`. Enter that address and the TCP port (default `49378`) in **Settings → LAN room**, then create the room. If prompted, allow the app through Windows Firewall on private networks.
 2. **Guests** on the same LAN enter the host's IP and port and connect. The host keeps the app running and can accept up to 16 guests.
-3. **Chat** supports text and emotes. Room pings and emotes can play on the desktop. History can show all conversations or filter to emotes.
+3. In **Chat**, press Enter to send text and Shift+Enter to start a new line. Choose an item from **Emotes** or **Pings** above the input to send it. While outside a room, messages stay on this device. History can show all conversations or filter to emotes.
+
+Use **Emotes → Import image…** to add a GIF, PNG (including APNG), JPEG, or WebP. Images can be up to 8 MiB and 2048 pixels on either side. Select the thumbnail to send it. Room members automatically download missing images and play them according to their desktop animation settings. They reuse any cached copy and can click the thumbnail in chat or history to replay it. The host and all guests need a version that supports custom emotes.
 
 The app accepts private, link-local, and loopback IPv4 addresses. LAN traffic is unauthenticated and unencrypted. Use it on a trusted LAN. For a same-machine test, use `127.0.0.1` and assign each instance a different `PINGPINGPING_DATA_DIR` to keep their identities and histories separate.
 
@@ -71,7 +73,7 @@ In **Settings → Desktop wheel**, turn each wheel on or off independently. Clic
 
 For a keyboard binding, hold the key and left-drag. Releasing the key first cancels. For a side-button binding, hold that button, drag, then release it to confirm. Returning to the center cancels either gesture. A plain side-button click goes to the current app on release. Once the wheel opens, the drag consumes the click, including when you return to the center to cancel. If quick ping is enabled, a click of the ping wheel’s bound side button sends a marker.
 
-The latest 600 text messages, pings, and emotes are stored locally as JSON in `%LOCALAPPDATA%\PingPingPing` on Windows or `~/Library/Application Support/PingPingPing` on macOS.
+The latest 600 text messages, pings, and emotes are stored locally as JSON. Custom emotes are stored in the `emotes` subdirectory. The app data directory is `%LOCALAPPDATA%\PingPingPing` on Windows or `~/Library/Application Support/PingPingPing` on macOS.
 
 ## Development
 

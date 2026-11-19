@@ -8,6 +8,7 @@ use std::time::Duration;
 use rodio::{Decoder, DeviceSinkBuilder, Player};
 
 use crate::assets::{EMOTES, PINGS, WHEEL_TICK};
+use crate::emotes::{EmoteId, EmoteStore};
 use crate::gesture::Wheel;
 use crate::model::OverlaySettings;
 
@@ -30,6 +31,18 @@ mod windows;
 pub(crate) use windows::*;
 
 impl Overlay {
+    pub(crate) fn play_custom(
+        &mut self,
+        store: EmoteStore,
+        id: EmoteId,
+        settings: OverlaySettings,
+        cx: &gpui_kit::App,
+    ) {
+        let timeout = Duration::from_millis(u64::from(settings.emote_timeout_ms));
+        let animation = Animation::custom(store, id, settings.emote_size, timeout);
+        self.animations.play(animation, None, None, cx);
+    }
+
     pub(crate) fn play(
         &mut self,
         kind: Wheel,

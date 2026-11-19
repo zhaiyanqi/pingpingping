@@ -9,8 +9,9 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::{App, Task};
-use image::{AnimationDecoder, RgbaImage, codecs::webp::WebPDecoder};
+use image::{AnimationDecoder, DynamicImage, ImageResult, RgbaImage, codecs::webp::WebPDecoder};
 
+use crate::emotes::{self, EmoteId, EmoteImage, EmoteStore, has_visible_pixels};
 use crate::gesture::Position;
 use crate::model::Location;
 
@@ -20,9 +21,14 @@ pub(super) const MAX_ACTIVE: usize = 16;
 
 pub(crate) struct Animation {
     size: u32,
-    webp: Cow<'static, [u8]>,
+    source: AnimationSource,
     poster: Option<&'static [u8]>,
     timeout: Duration,
+}
+
+enum AnimationSource {
+    WebP(Cow<'static, [u8]>),
+    Custom(EmoteStore, EmoteId),
 }
 
 impl Animation {
@@ -31,7 +37,16 @@ impl Animation {
     pub(crate) fn webp(bytes: impl Into<Cow<'static, [u8]>>, size: u32, timeout: Duration) -> Self {
         Self {
             size: size.clamp(1, 1024),
-            webp: bytes.into(),
+            source: AnimationSource::WebP(bytes.into()),
+            poster: None,
+            timeout,
+        }
+    }
+
+    pub(super) fn custom(store: EmoteStore, id: EmoteId, size: u32, timeout: Duration) -> Self {
+        Self {
+            size: size.clamp(1, 1024),
+            source: AnimationSource::Custom(store, id),
             poster: None,
             timeout,
         }
@@ -120,32 +135,44 @@ fn prepare(image: RgbaImage, size: Option<u32>) -> RgbaImage {
     image
 }
 
-fn has_visible_pixels(image: &RgbaImage) -> bool {
-    image
-        .as_raw()
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .any(|pixel| pixel[3] != 0)
+fn webp(bytes: &[u8]) -> ImageResult<EmoteImage<'_>> {
+    let decoder = WebPDecoder::new(Cursor::new(bytes))?;
+    if decoder.has_animation() {
+        Ok(EmoteImage::Animated(decoder.into_frames()))
+    } else {
+        Ok(EmoteImage::Still(
+            DynamicImage::from_decoder(decoder)?.into_rgba8(),
+        ))
+    }
 }
 
 fn decode(animation: &Animation, size: Option<u32>, send: async_channel::Sender<TimedFrame>) {
+    let (bytes, custom) = match &animation.source {
+        AnimationSource::WebP(bytes) => (Cow::Borrowed(bytes.as_ref()), false),
+        AnimationSource::Custom(store, id) => {
+            let Ok(bytes) = store.read(*id) else { return };
+            (Cow::Owned(bytes), true)
+        }
+    };
     let mut sent = false;
     'cycles: while !send.is_closed() {
-        let Ok(decoder) = WebPDecoder::new(Cursor::new(animation.webp.as_ref())) else {
-            break;
+        let source = if custom {
+            emotes::decode(&bytes)
+        } else {
+            webp(&bytes).map_err(Into::into)
         };
-        if !decoder.has_animation() {
-            if let Ok(image) = image::DynamicImage::from_decoder(decoder) {
-                let _ = send.send_blocking((prepare(image.into_rgba8(), size), animation.timeout));
+        let frames = match source {
+            Ok(EmoteImage::Still(image)) => {
+                let _ = send.send_blocking((prepare(image, size), animation.timeout));
                 return;
             }
-            break;
-        }
+            Ok(EmoteImage::Animated(frames)) => frames,
+            Err(_) => break,
+        };
 
         let mut visible = false;
         let mut pending_blank: Option<TimedFrame> = None;
-        for frame in decoder.into_frames() {
+        for frame in frames {
             let Ok(frame) = frame else { break 'cycles };
             if send.is_closed() {
                 return;
@@ -159,7 +186,7 @@ fn decode(animation: &Animation, size: Option<u32>, send: async_channel::Sender<
             let image = frame.into_buffer();
             // Keep transparent frames inside a cycle, and skip the transparent padding at its edges.
             // 保留一轮动画中间的透明帧，跳过首尾用于填充的透明帧。
-            if !has_visible_pixels(&image) {
+            if !custom && !has_visible_pixels(&image) {
                 if let Some((_, total)) = &mut pending_blank {
                     *total += delay;
                 } else if visible {
@@ -322,5 +349,46 @@ mod tests {
             frames += 1;
         }));
         assert_eq!(frames, 1);
+    }
+
+    #[test]
+    fn imported_gif_plays_both_frames_and_loops_from_the_cache() {
+        use image::{Delay, Frame, Rgba, codecs::gif::GifEncoder};
+
+        let folder =
+            std::env::temp_dir().join(format!("pingpingping-gif-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("test.gif");
+        let first = RgbaImage::from_pixel(4, 4, Rgba([255, 0, 0, 255]));
+        let second = RgbaImage::from_pixel(4, 4, Rgba([0, 255, 0, 255]));
+        {
+            let mut encoder = GifEncoder::new(std::fs::File::create(&path).unwrap());
+            for image in [first.clone(), second.clone()] {
+                encoder
+                    .encode_frame(Frame::from_parts(
+                        image,
+                        0,
+                        0,
+                        Delay::from_numer_denom_ms(50, 1),
+                    ))
+                    .unwrap();
+            }
+        }
+        let store = EmoteStore::new(&folder);
+        let emote = store.import(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let animation = Animation::custom(store, emote.id(), 4, Duration::from_secs(1));
+        smol::block_on(async {
+            let (send, receive) = async_channel::bounded(2);
+            let worker = smol::unblock(move || decode(&animation, None, send));
+            for image in [first.clone(), second, first] {
+                let (frame, delay) = receive.recv().await.unwrap();
+                assert_eq!(frame, prepare(image, None));
+                assert_eq!(delay, Duration::from_millis(50));
+            }
+            receive.close();
+            worker.await;
+        });
+        std::fs::remove_dir_all(folder).unwrap();
     }
 }

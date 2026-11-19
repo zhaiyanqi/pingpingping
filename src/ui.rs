@@ -9,10 +9,12 @@ use uuid::Uuid;
 
 use async_channel::Sender;
 use chrono::{DateTime, Local};
+use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme, Disableable,
+    ActiveTheme, Disableable, Sizable,
     button::{Button, ButtonVariants},
-    input::{Input, InputEvent, InputState},
+    input::{Input, InputEvent, InputState, Textarea, TextareaState},
+    popover::{Popover, PopoverState},
     slider::{Slider, SliderState},
     switch::Switch,
 };
@@ -20,6 +22,7 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
 use crate::assets::{EMOTE_WHEEL, EMOTES, PINGS};
+use crate::emotes::LibraryEmote;
 use crate::gesture::{GestureEvent, TriggerKey, Triggers, Wheel};
 use crate::model::{
     ANIMATION_TIMEOUT, Body, EMOTE_SIZE, Message, Model, OverlaySettings, PING_SIZE, Profile,
@@ -43,7 +46,7 @@ struct Desktop {
     history: Option<AnyWindowHandle>,
     settings: Option<AnyWindowHandle>,
     emotes: [Arc<Image>; EMOTES.len()],
-    pings: [Arc<Image>; 9],
+    pings: [Arc<Image>; PINGS.len()],
 }
 
 impl Global for Desktop {}
@@ -245,17 +248,26 @@ impl Render for StartupError {
 }
 
 fn play(body: &Body, cx: &mut App) {
-    let (kind, index) = match body {
-        Body::Emote { index, .. } => (Wheel::Emote, *index),
-        Body::Ping { index, .. } => (Wheel::Ping, *index),
-        Body::Text(_) => return,
-    };
-    let profile = &cx.global::<Desktop>().model.read(cx).profile;
-    let settings = profile.overlay.with_sound(profile.sound);
     cx.update_global::<Desktop, _>(|desktop, cx| {
-        desktop
-            .overlay
-            .play(kind, index, None, body.location(), settings, cx);
+        let model = desktop.model.read(cx);
+        let settings = model.profile.overlay.with_sound(model.profile.sound);
+        let location = body.location();
+        match *body {
+            Body::Emote { index, .. } => {
+                desktop
+                    .overlay
+                    .play(Wheel::Emote, index, None, location, settings, cx)
+            }
+            Body::Ping { index, .. } => {
+                desktop
+                    .overlay
+                    .play(Wheel::Ping, index, None, location, settings, cx)
+            }
+            Body::CustomEmote(id) => desktop
+                .overlay
+                .play_custom(model.emotes(), id, settings, cx),
+            Body::Text(_) => {}
+        }
     });
 }
 
@@ -300,7 +312,10 @@ fn handle_gesture(event: GestureEvent, cx: &mut App) {
                 };
                 let location = platform::normalized(origin);
                 let body = match kind {
-                    Wheel::Ping => Body::Ping { index, location },
+                    Wheel::Ping => Body::Ping {
+                        index,
+                        location: Some(location),
+                    },
                     Wheel::Emote => Body::Emote {
                         index,
                         location: Some(location),
@@ -402,12 +417,14 @@ enum Filter {
 
 struct Conversation {
     model: Entity<Model>,
-    input: Option<Entity<InputState>>,
+    input: Option<Entity<TextareaState>>,
     history: bool,
     all_rooms: bool,
     room_key: String,
     filter: Filter,
-    palette: bool,
+    library: Vec<LibraryEmote>,
+    library_task: Option<Task<()>>,
+    import_error: Option<String>,
     messages: ListState,
     rows: Vec<(usize, Uuid)>,
     error: Option<String>,
@@ -417,9 +434,29 @@ struct Conversation {
 impl Conversation {
     fn new(history: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         close_to_tray(window, cx);
-        let input =
-            (!history).then(|| cx.new(|cx| InputState::new(window, cx).placeholder("输入消息")));
+        let input = (!history).then(|| {
+            cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .placeholder("输入消息")
+                    .auto_grow(2, 4)
+                    .submit_on_enter(true)
+            })
+        });
         let model = cx.global::<Desktop>().model.clone();
+        let library_task = (!history).then(|| {
+            let store = model.read(cx).emotes();
+            cx.spawn(async move |weak: WeakEntity<Self>, cx| {
+                let result = smol::unblock(move || store.library()).await;
+                let _ = weak.update(cx, |this, cx| {
+                    this.library_task.take();
+                    match result {
+                        Ok(library) => this.library = library,
+                        Err(error) => this.import_error = Some(format!("{error:#}")),
+                    }
+                    cx.notify();
+                });
+            })
+        });
         let messages = ListState::new(0, ListAlignment::Bottom, px(180.));
         messages.set_follow_mode(FollowMode::Tail);
         let room_key = model.read(cx).room_key().to_owned();
@@ -428,7 +465,6 @@ impl Conversation {
             if this.room_key != room_key {
                 this.room_key = room_key.to_owned();
                 this.error = None;
-                this.palette = false;
                 if let Some(input) = &this.input {
                     input.update(cx, |input, cx| input.set_value("", window, cx));
                 }
@@ -455,7 +491,9 @@ impl Conversation {
             all_rooms: false,
             room_key,
             filter: Filter::All,
-            palette: false,
+            library: Vec::new(),
+            library_task,
+            import_error: None,
             messages,
             rows: Vec::new(),
             error: None,
@@ -474,7 +512,7 @@ impl Conversation {
             .enumerate()
             .filter(|(_, (key, message))| {
                 (self.all_rooms || *key == model.room_key())
-                    && (self.filter == Filter::All || matches!(message.body, Body::Emote { .. }))
+                    && (self.filter == Filter::All || message.body.is_emote())
             })
             .map(|(index, (_, message))| (index, message.id))
             .collect();
@@ -511,7 +549,10 @@ impl Conversation {
             return;
         }
         if self.send(Body::Text(value), cx) {
-            input.update(cx, |input, cx| input.set_value("", window, cx));
+            input.update(cx, |input, cx| {
+                input.set_value("", window, cx);
+                input.focus(window, cx);
+            });
         }
     }
 
@@ -527,11 +568,174 @@ impl Conversation {
         self.error = result.err().map(|error| format!("{error:#}"));
         if sent {
             self.messages.set_follow_mode(FollowMode::Tail);
-            self.palette = false;
-            play(&body, cx);
+            if !matches!(body, Body::Text(_)) {
+                play(&body, cx);
+            }
         }
         cx.notify();
         sent
+    }
+
+    fn import_emote(&mut self, cx: &mut Context<Self>) {
+        if self.library_task.is_some() {
+            return;
+        }
+        self.import_error = None;
+        let prompt = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("选择 GIF、PNG、JPEG 或 WebP 图片".into()),
+        });
+        let store = self.model.read(cx).emotes();
+        self.library_task = Some(cx.spawn(async move |weak, cx| {
+            let result = async {
+                let paths = prompt.await??;
+                let Some(path) = paths.and_then(|paths| paths.into_iter().next()) else {
+                    return Ok(None);
+                };
+                smol::unblock(move || store.import(&path)).await.map(Some)
+            }
+            .await;
+            let _ = weak.update(cx, |this, cx| {
+                this.library_task.take();
+                match result {
+                    Ok(Some(emote)) => {
+                        this.library.retain(|known| known.id() != emote.id());
+                        this.library.insert(0, emote);
+                    }
+                    Ok(None) => {}
+                    Err(error) => this.import_error = Some(format!("{error:#}")),
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn picker(wheel: Wheel, cx: &Context<Self>) -> Popover {
+        let (id, label, icon) = match wheel {
+            Wheel::Emote => ("emote-picker", "表情", IconName::ThumbsUp),
+            Wheel::Ping => ("ping-picker", "信号", IconName::Bell),
+        };
+        let owner = cx.weak_entity();
+        Popover::new(id)
+            .anchor(Anchor::BottomLeft)
+            .trigger(Button::new(id).ghost().small().label(label).icon(icon))
+            .content(move |_, _, cx| {
+                div().children(
+                    owner
+                        .upgrade()
+                        .map(|entity| entity.read(cx).picker_content(wheel, &owner, cx)),
+                )
+            })
+    }
+
+    fn picker_content(
+        &self,
+        wheel: Wheel,
+        owner: &WeakEntity<Self>,
+        cx: &Context<PopoverState>,
+    ) -> impl IntoElement + use<> {
+        let popup = cx.weak_entity();
+        let choose = |body: Body| {
+            let owner = owner.clone();
+            let popup = popup.clone();
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                if owner
+                    .update(cx, |this, cx| this.send(body.clone(), cx))
+                    .unwrap_or(false)
+                {
+                    let _ = popup.update(cx, |state, cx| state.dismiss(window, cx));
+                }
+            }
+        };
+        let desktop = cx.global::<Desktop>();
+        let (clips, images): (&[_], &[_]) = match wheel {
+            Wheel::Emote => (&EMOTES, &desktop.emotes),
+            Wheel::Ping => (&PINGS, &desktop.pings),
+        };
+        let mut panel =
+            div().w_72().flex().flex_col().gap_2().child(
+                div().flex().flex_wrap().gap_1().children(
+                    clips
+                        .iter()
+                        .zip(images)
+                        .enumerate()
+                        .map(|(index, (clip, image))| {
+                            let body = match wheel {
+                                Wheel::Emote => Body::Emote {
+                                    index,
+                                    location: None,
+                                },
+                                Wheel::Ping => Body::Ping {
+                                    index,
+                                    location: None,
+                                },
+                            };
+                            Button::new(("preset", index))
+                                .ghost()
+                                .accessibility_label(clip.name)
+                                .tooltip(clip.name)
+                                .child(img(image.clone()).size_6())
+                                .on_click(choose(body))
+                        }),
+                ),
+            );
+        if wheel == Wheel::Emote {
+            let store = self.model.read(cx).emotes();
+            let import = owner.clone();
+            let theme = cx.theme();
+            panel = panel.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .pt_2()
+                    .when(!self.library.is_empty(), |section| {
+                        section.child(
+                            div()
+                                .id("imported-emotes")
+                                .max_h(rems(7.))
+                                .overflow_y_scroll()
+                                .p_1()
+                                .child(div().flex().flex_wrap().gap_1().children(
+                                    self.library.iter().map(|emote| {
+                                        Button::new(SharedString::from(emote.id().to_string()))
+                                            .ghost()
+                                            .accessibility_label(emote.name().to_owned())
+                                            .tooltip(emote.name().to_owned())
+                                            .child(
+                                                img(store.poster(emote.id()))
+                                                    .size_6()
+                                                    .object_fit(ObjectFit::Contain),
+                                            )
+                                            .on_click(choose(Body::CustomEmote(emote.id())))
+                                    }),
+                                )),
+                        )
+                    })
+                    .when_some(self.import_error.clone(), |section, error| {
+                        section.child(div().text_sm().text_color(theme.danger).child(error))
+                    })
+                    .child(
+                        div().child(
+                            Button::new("import-emote")
+                                .small()
+                                .ghost()
+                                .icon(IconName::Plus)
+                                .label("导入图片…")
+                                .loading(self.library_task.is_some())
+                                .on_click(move |_, _, cx| {
+                                    let _ = import.update(cx, |this, cx| this.import_emote(cx));
+                                }),
+                        ),
+                    ),
+            );
+        }
+        panel
     }
 }
 
@@ -558,6 +762,23 @@ fn bubble(message: &Message, mine: bool, cx: &App) -> impl IntoElement {
             .child(img(desktop.pings[*index].clone()).size_6())
             .child(PINGS[*index].name)
             .into_any_element(),
+        Body::CustomEmote(id) => {
+            let id = *id;
+            let store = desktop.model.read(cx).emotes();
+            Button::new("play-custom")
+                .ghost()
+                .h_auto()
+                .accessibility_label("播放自定义表情")
+                .tooltip("播放自定义表情")
+                .child(
+                    img(store.poster(id))
+                        .size_20()
+                        .object_fit(ObjectFit::Contain)
+                        .with_fallback(|| div().text_xs().child("图片不可用").into_any_element()),
+                )
+                .on_click(move |_, _, cx| play(&Body::CustomEmote(id), cx))
+                .into_any_element()
+        }
     };
     let initial = message.name.chars().next().unwrap_or('·').to_string();
     div()
@@ -645,7 +866,7 @@ impl Render for Conversation {
                         } else if joined {
                             "同一局域网的好友连接主机的 IP 和端口后，即可聊天。"
                         } else {
-                            "在设置中创建房间，或输入主机的 IP 和端口连接。"
+                            "消息保存在本机。加入房间后即可和好友聊天。"
                         },
                     ))
                     .into_any_element()
@@ -736,7 +957,7 @@ impl Render for Conversation {
                                         connection.address()
                                     )
                                 } else {
-                                    "未加入房间".into()
+                                    "本机 · 未加入房间".into()
                                 },
                             )),
                     )
@@ -808,7 +1029,6 @@ impl Render for Conversation {
         }
         view = view.child(feed);
         if let Some(input) = &self.input {
-            let emote_images = cx.global::<Desktop>().emotes.clone();
             view = view.child(
                 div()
                     .flex()
@@ -819,55 +1039,29 @@ impl Render for Conversation {
                     .py_3()
                     .border_t_1()
                     .border_color(theme.border)
-                    .when_some(error, |footer, error| {
-                        footer.child(div().text_sm().text_color(theme.danger).child(error))
-                    })
-                    .when(self.palette, |footer| {
-                        footer.child(div().flex().flex_wrap().gap_1().children(
-                            emote_images.into_iter().enumerate().map(|(index, image)| {
-                                Button::new(("emote", index))
-                                    .ghost()
-                                    .tooltip(EMOTES[index].name)
-                                    .child(img(image).size_6())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.send(
-                                            Body::Emote {
-                                                index,
-                                                location: None,
-                                            },
-                                            cx,
-                                        );
-                                    }))
-                            }),
-                        ))
-                    })
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap_2()
-                            .child(Button::new("toggle-emotes").label("表情").ghost().on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.palette = !this.palette;
-                                    cx.notify();
-                                }),
-                            ))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(Input::new(input).disabled(!joined)),
-                            )
-                            .child(if joined {
-                                Button::new("send").primary().label("发送").on_click(
+                            .gap_1()
+                            .child(Self::picker(Wheel::Emote, cx))
+                            .child(Self::picker(Wheel::Ping, cx)),
+                    )
+                    .child(Textarea::new(input).aria_label("输入消息"))
+                    .when_some(error, |footer, error| {
+                        footer.child(div().text_sm().text_color(theme.danger).child(error))
+                    })
+                    .child(
+                        div().flex().justify_end().child(
+                            Button::new("send")
+                                .primary()
+                                .label("发送")
+                                .tooltip("Enter 发送 · Shift+Enter 换行")
+                                .disabled(input.read(cx).value().trim().is_empty())
+                                .on_click(
                                     cx.listener(|this, _, window, cx| this.send_text(window, cx)),
-                                )
-                            } else {
-                                Button::new("join")
-                                    .primary()
-                                    .label("连接房间…")
-                                    .on_click(|_, _, cx| open_settings(cx))
-                            }),
+                                ),
+                        ),
                     ),
             );
         }
@@ -1143,8 +1337,9 @@ impl Settings {
             };
         self.connection_error = None;
         let incoming = cx.global::<Desktop>().incoming.clone();
+        let emotes = self.model.read(cx).emotes();
         self.connecting = Some(cx.spawn(async move |weak, cx| {
-            let room = Room::open(config, incoming).await;
+            let room = Room::open(config, incoming, emotes).await;
             let _ = weak.update(cx, |this, cx| {
                 this.connecting.take();
                 let result = room.and_then(|room| {

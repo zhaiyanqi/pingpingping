@@ -10,6 +10,7 @@
 compile_error!("The native input and overlay backend supports Windows and macOS.");
 
 mod assets;
+mod emotes;
 mod gesture;
 mod model;
 mod platform;
