@@ -19,12 +19,16 @@ use windows_sys::Win32::{
     UI::{HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
 
+use super::playback::{
+    FrameUpdate, TEXT_FONT_SIZE, TEXT_MARGIN, TEXT_MAX_LINES, TEXT_PADDING, TEXT_RADIUS,
+    TEXT_WIDTH, TextColors, text_anchor,
+};
 use super::{AnimationOverlay, AudioCue, WheelContents, start_audio, wheel::WheelView};
 use crate::gesture::{
     ALT, CTRL, GestureEvent, InputEvent, MouseDelivery, Position, SHIFT, SUPER, Triggers,
     WHEEL_SIZE, WheelInput,
 };
-use crate::model::Location;
+use crate::model::{Location, TextPosition};
 
 pub(crate) fn init_dpi() {
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
@@ -319,6 +323,11 @@ unsafe extern "system" fn mouse_hook(code: i32, message: WPARAM, data: LPARAM) -
 }
 
 fn screen(point: POINT, primary: bool) -> (RECT, u32) {
+    let (info, dpi) = monitor_info(point, primary);
+    (info.rcMonitor, dpi)
+}
+
+fn monitor_info(point: POINT, primary: bool) -> (MONITORINFO, u32) {
     let monitor = unsafe {
         MonitorFromPoint(
             point,
@@ -339,7 +348,7 @@ fn screen(point: POINT, primary: bool) -> (RECT, u32) {
         GetMonitorInfoW(monitor, &mut info);
         let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut vertical);
     }
-    (info.rcMonitor, dpi.clamp(96, 384))
+    (info, dpi.clamp(96, 384))
 }
 
 fn pixels(value: u32, dpi: u32) -> u32 {
@@ -477,16 +486,17 @@ struct Surface {
     bitmap: HBITMAP,
     original: HGDIOBJ,
     bits: *mut u8,
-    size: u32,
+    width: u32,
+    height: u32,
 }
 
 impl Surface {
-    fn new(size: u32) -> Option<Self> {
+    fn new(width: u32, height: u32) -> Option<Self> {
         let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: size as i32,
-                biHeight: -(size as i32),
+                biWidth: width as i32,
+                biHeight: -(height as i32),
                 biPlanes: 1,
                 biBitCount: 32,
                 biCompression: BI_RGB,
@@ -516,8 +526,18 @@ impl Surface {
                 bitmap,
                 original,
                 bits: bits.cast(),
-                size,
+                width,
+                height,
             })
+        }
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.bits,
+                self.width as usize * self.height as usize * 4,
+            )
         }
     }
 }
@@ -613,29 +633,27 @@ impl Layer {
     }
 
     fn warm(&mut self, size: u32) {
-        if !self.hwnd.is_null() && self.surface.as_ref().map(|surface| surface.size) != Some(size) {
-            self.surface = Surface::new(size);
+        if !self.hwnd.is_null()
+            && !self
+                .surface
+                .as_ref()
+                .is_some_and(|s| (s.width, s.height) == (size, size))
+        {
+            self.surface = Surface::new(size, size);
         }
     }
 
-    fn frame(&mut self, image: &RgbaImage, origin: POINT) {
+    fn frame(&mut self, image: &RgbaImage) {
         self.warm(image.width());
         if let Some(surface) = &mut self.surface {
-            let bytes = unsafe {
-                std::slice::from_raw_parts_mut(
-                    surface.bits,
-                    surface.size as usize * surface.size as usize * 4,
-                )
-            };
-            bytes.copy_from_slice(image.as_raw());
-            self.present(origin, 255);
+            surface.bytes_mut().copy_from_slice(image.as_raw());
         }
     }
 
     fn wheel_frame(&mut self, image: &tiny_skia::Pixmap, origin: POINT) {
         self.warm(image.width());
         if let Some(surface) = &mut self.surface {
-            let bytes = unsafe { std::slice::from_raw_parts_mut(surface.bits, image.data().len()) };
+            let bytes = surface.bytes_mut();
             for (dest, [red, green, blue, alpha]) in bytes
                 .as_chunks_mut::<4>()
                 .0
@@ -651,8 +669,8 @@ impl Layer {
     fn present(&self, origin: POINT, opacity: u8) {
         let Some(surface) = &self.surface else { return };
         let size = SIZE {
-            cx: surface.size as i32,
-            cy: surface.size as i32,
+            cx: surface.width as i32,
+            cy: surface.height as i32,
         };
         let source = POINT::default();
         let blend = BLENDFUNCTION {
@@ -777,7 +795,7 @@ pub(super) fn animation_presenter(
     size: u32,
     local: Option<Position>,
     location: Option<Location>,
-) -> Option<(Option<u32>, impl FnMut(image::RgbaImage))> {
+) -> Option<(Option<u32>, impl FnMut(FrameUpdate))> {
     let (point, bounds, dpi) = if let Some(local) = local {
         let point = point(local);
         let (bounds, dpi) = screen(point, false);
@@ -794,9 +812,198 @@ pub(super) fn animation_presenter(
     let size = pixels(size, dpi);
     let origin = fit(point, bounds, size);
     let mut layer = None;
-    Some((Some(size), move |frame: RgbaImage| {
-        layer
-            .get_or_insert_with(|| Layer::new(false))
-            .frame(&frame, origin);
+    Some((Some(size), move |update| {
+        let layer = layer.get_or_insert_with(|| Layer::new(false));
+        match update {
+            FrameUpdate::Image(frame) => {
+                layer.frame(&frame);
+                layer.present(origin, 255);
+            }
+            FrameUpdate::Opacity(opacity) => layer.present(origin, alpha_byte(opacity)),
+        }
     }))
+}
+
+fn alpha_byte(opacity: f32) -> u8 {
+    (opacity * 255.0).round() as u8
+}
+
+pub(super) fn system_reduces_motion() -> bool {
+    let mut enabled = 1_i32;
+    unsafe {
+        SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, (&raw mut enabled).cast(), 0) != 0
+            && enabled == 0
+    }
+}
+
+pub(super) fn text_presenter(
+    text: &str,
+    position: TextPosition,
+    colors: TextColors,
+) -> Option<impl FnMut(f32, f64) + use<>> {
+    let (info, dpi) = monitor_info(POINT::default(), true);
+    let work = info.rcWork;
+    let work_width = (work.right - work.left).max(0) as u32;
+    let work_height = (work.bottom - work.top).max(0) as u32;
+    let width = pixels(TEXT_WIDTH, dpi).min(work_width);
+    let surface = text_surface(text, colors, width, work_height, dpi)?;
+    let free_y = f64::from(work_height - surface.height);
+    let (x, y) = text_anchor(
+        position,
+        f64::from(work_width - surface.width),
+        free_y,
+        f64::from(pixels(TEXT_MARGIN, dpi)),
+    );
+    let mut layer = Layer::new(false);
+    if layer.hwnd.is_null() {
+        return None;
+    }
+    layer.surface = Some(surface);
+    Some(move |opacity, offset: f64| {
+        layer.present(
+            POINT {
+                x: work.left + x.round() as i32,
+                y: work.top
+                    + (y + offset * f64::from(dpi) / 96.0)
+                        .clamp(0.0, free_y)
+                        .round() as i32,
+            },
+            alpha_byte(opacity),
+        );
+    })
+}
+
+fn text_surface(
+    text: &str,
+    colors: TextColors,
+    width: u32,
+    max_height: u32,
+    dpi: u32,
+) -> Option<Surface> {
+    let padding = pixels(TEXT_PADDING, dpi) as i32;
+    let inner_width = width as i32 - 2 * padding;
+    let inner_height = max_height as i32 - 2 * padding;
+    if inner_width <= 0 || inner_height <= 0 {
+        return None;
+    }
+    let measure = Surface::new(1, 1)?;
+    let text: Vec<u16> = text.replace('\0', "�").encode_utf16().collect();
+    let font = unsafe {
+        CreateFontW(
+            -(pixels(TEXT_FONT_SIZE, dpi) as i32),
+            0,
+            0,
+            0,
+            FW_NORMAL as i32,
+            0,
+            0,
+            0,
+            u32::from(DEFAULT_CHARSET),
+            0,
+            0,
+            u32::from(ANTIALIASED_QUALITY),
+            0,
+            windows_sys::w!("Segoe UI"),
+        )
+    };
+    if font.is_null() {
+        return None;
+    }
+    let result = (|| {
+        let mut bounds = RECT {
+            right: inner_width,
+            ..Default::default()
+        };
+        let mut metrics = TEXTMETRICW::default();
+        let flags = DT_NOPREFIX | DT_WORDBREAK | DT_EDITCONTROL | DT_END_ELLIPSIS;
+        let height = unsafe {
+            let old_font = SelectObject(measure.dc, font);
+            let measured = DrawTextW(
+                measure.dc,
+                text.as_ptr(),
+                text.len() as i32,
+                &mut bounds,
+                flags | DT_CALCRECT,
+            );
+            GetTextMetricsW(measure.dc, &mut metrics);
+            SelectObject(measure.dc, old_font);
+            measured
+        };
+        let height = height
+            .min(metrics.tmHeight * TEXT_MAX_LINES as i32)
+            .min(inner_height);
+        if height <= 0 {
+            return None;
+        }
+        let mut card = Surface::new(width, (height + 2 * padding) as u32)?;
+        fill_text_card(&mut card, pixels(TEXT_RADIUS, dpi), colors.background);
+        let mut bounds = RECT {
+            left: padding,
+            top: padding,
+            right: width as i32 - padding,
+            bottom: padding + height,
+        };
+        let color = colors.foreground;
+        let rgb = u32::from(alpha_byte(color.r))
+            | (u32::from(alpha_byte(color.g)) << 8)
+            | (u32::from(alpha_byte(color.b)) << 16);
+        unsafe {
+            let old_font = SelectObject(card.dc, font);
+            SetTextColor(card.dc, rgb);
+            SetBkMode(card.dc, TRANSPARENT as i32);
+            DrawTextW(
+                card.dc,
+                text.as_ptr(),
+                text.len() as i32,
+                &mut bounds,
+                flags,
+            );
+            SelectObject(card.dc, old_font);
+            GdiFlush();
+        }
+        // GDI writes RGB only. Restore alpha in the opaque text area before layered composition.
+        // GDI 只写入 RGB，分层合成前恢复不透明文字区域的 alpha。
+        for row in card
+            .bytes_mut()
+            .chunks_exact_mut(width as usize * 4)
+            .skip(padding as usize)
+            .take(height as usize)
+        {
+            for pixel in row
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .skip(padding as usize)
+                .take(inner_width as usize)
+            {
+                pixel[3] = 255;
+            }
+        }
+        Some(card)
+    })();
+    unsafe { DeleteObject(font) };
+    result
+}
+
+fn fill_text_card(surface: &mut Surface, radius: u32, color: gpui_kit::Rgba) {
+    let width = surface.width as usize;
+    let height = surface.height as usize;
+    let radius = radius as f32;
+    for (y, row) in surface.bytes_mut().chunks_exact_mut(width * 4).enumerate() {
+        let dy = (radius - (y.min(height - 1 - y) as f32 + 0.5)).max(0.0);
+        for (x, pixel) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let dx = (radius - (x.min(width - 1 - x) as f32 + 0.5)).max(0.0);
+            let alpha = if dx > 0.0 && dy > 0.0 {
+                (radius + 0.5 - dx.hypot(dy)).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            *pixel = [
+                alpha_byte(color.b * alpha),
+                alpha_byte(color.g * alpha),
+                alpha_byte(color.r * alpha),
+                alpha_byte(alpha),
+            ];
+        }
+    }
 }

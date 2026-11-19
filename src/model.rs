@@ -106,6 +106,33 @@ pub(crate) const EMOTE_SIZE: RangeInclusive<u32> = 80..=300;
 pub(crate) const ANIMATION_TIMEOUT: RangeInclusive<u32> = 1000..=8000;
 pub(crate) const SOUND_VOLUME: RangeInclusive<u32> = 0..=100;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TextPosition {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    #[default]
+    BottomRight,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TextMotion {
+    None,
+    #[default]
+    Fade,
+    Slide,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct TextOverlaySettings {
+    pub(crate) position: TextPosition,
+    pub(crate) enter: TextMotion,
+    pub(crate) exit: TextMotion,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 #[non_exhaustive]
@@ -117,6 +144,7 @@ pub(crate) struct OverlaySettings {
     pub(crate) volume: u32,
     pub(crate) emote_sound: bool,
     pub(crate) wheel_sound: bool,
+    pub(crate) text: TextOverlaySettings,
 }
 
 impl Default for OverlaySettings {
@@ -129,6 +157,7 @@ impl Default for OverlaySettings {
             volume: 70,
             emote_sound: true,
             wheel_sound: true,
+            text: TextOverlaySettings::default(),
         }
     }
 }
@@ -492,6 +521,25 @@ mod tests {
             }
             .valid()
         );
+    }
+
+    #[test]
+    fn overlay_profiles_default_to_bottom_right_and_store_each_transition() {
+        let mut settings: OverlaySettings = serde_json::from_str(r#"{"emote_size":160}"#).unwrap();
+        assert_eq!(settings.emote_size, 160);
+        assert_eq!(settings.text.position, TextPosition::BottomRight);
+        assert_eq!(settings.text.enter, TextMotion::Fade);
+        assert_eq!(settings.text.exit, TextMotion::Fade);
+
+        settings.text = TextOverlaySettings {
+            position: TextPosition::TopLeft,
+            enter: TextMotion::Slide,
+            exit: TextMotion::None,
+        };
+        let restored =
+            serde_json::from_str::<OverlaySettings>(&serde_json::to_string(&settings).unwrap())
+                .unwrap();
+        assert_eq!(restored, settings);
     }
 
     #[test]

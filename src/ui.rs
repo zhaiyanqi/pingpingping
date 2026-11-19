@@ -14,11 +14,12 @@ use chrono::{DateTime, Local};
 use gpui_kit::assets::IconName;
 use gpui_kit::base::Button as BaseButton;
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Selectable, Sizable,
+    ActiveTheme, Disableable, IndexPath, Selectable, Sizable,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
     popover::{Popover, PopoverState},
     scroll::ScrollableElement,
+    select::{Select, SelectItem, SelectState},
     slider::{Slider, SliderState},
     switch::Switch,
     tooltip::Tooltip,
@@ -31,7 +32,7 @@ use crate::emotes::{EmoteId, EmoteStore, LibraryEmote};
 use crate::gesture::{GestureEvent, TriggerKey, Triggers, Wheel};
 use crate::model::{
     ANIMATION_TIMEOUT, Body, EMOTE_SIZE, EmotePage, Message, Model, OverlaySettings, PING_SIZE,
-    Profile, SOUND_VOLUME, WheelEmote,
+    Profile, SOUND_VOLUME, TextMotion, TextOverlaySettings, TextPosition, WheelEmote,
 };
 use crate::platform::{self, InputMonitor, Overlay, WheelContents, WheelFrame, WheelPreview};
 use crate::room::{DEFAULT_PORT, Room, RoomConfig, RoomEvent};
@@ -279,7 +280,7 @@ fn play(body: &Body, cx: &mut App) {
                     .overlay
                     .play_custom(model.emotes(), id, None, settings, cx)
             }
-            Body::Text(_) => {}
+            Body::Text(ref text) => desktop.overlay.play_text(text, settings.text, cx),
         }
     });
 }
@@ -704,9 +705,7 @@ impl Conversation {
         self.error = result.err().map(|error| format!("{error:#}"));
         if sent {
             self.messages.set_follow_mode(FollowMode::Tail);
-            if !matches!(body, Body::Text(_)) {
-                play(&body, cx);
-            }
+            play(&body, cx);
         }
         cx.notify();
         sent
@@ -1268,6 +1267,71 @@ impl SettingsCategory {
     }
 }
 
+const TEXT_POSITIONS: [(TextPosition, &str); 4] = [
+    (TextPosition::TopLeft, "左上角"),
+    (TextPosition::TopRight, "右上角"),
+    (TextPosition::BottomLeft, "左下角"),
+    (TextPosition::BottomRight, "右下角"),
+];
+const TEXT_ENTRANCE_MOTIONS: [(TextMotion, &str); 3] = [
+    (TextMotion::None, "无动效"),
+    (TextMotion::Fade, "淡入"),
+    (TextMotion::Slide, "滑入"),
+];
+const TEXT_EXIT_MOTIONS: [(TextMotion, &str); 3] = [
+    (TextMotion::None, "无动效"),
+    (TextMotion::Fade, "淡出"),
+    (TextMotion::Slide, "滑出"),
+];
+
+#[derive(Clone)]
+struct OverlayChoice<T>(T, &'static str);
+
+impl<T: Copy + PartialEq> SelectItem for OverlayChoice<T> {
+    type Value = T;
+
+    fn title(&self) -> SharedString {
+        self.1.into()
+    }
+
+    fn value(&self) -> &T {
+        &self.0
+    }
+}
+
+type OverlaySelect<T> = SelectState<Vec<OverlayChoice<T>>>;
+
+fn overlay_select<T: Copy + PartialEq + 'static>(
+    choices: &[(T, &'static str)],
+    value: T,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<OverlaySelect<T>> {
+    let selected = choices
+        .iter()
+        .position(|(choice, _)| *choice == value)
+        .map(IndexPath::new);
+    let choices = choices
+        .iter()
+        .map(|&(value, title)| OverlayChoice(value, title))
+        .collect();
+    cx.new(|cx| SelectState::new(choices, selected, window, cx))
+}
+
+fn overlay_select_field<T: Copy + PartialEq + 'static>(
+    label: &'static str,
+    state: &Entity<OverlaySelect<T>>,
+) -> Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(div().text_sm().child(label))
+        .child(Select::new(state).accessibility_label(label).w_full())
+}
+
 struct Settings {
     model: Entity<Model>,
     category: SettingsCategory,
@@ -1291,6 +1355,9 @@ struct Settings {
     emote_size: Entity<SliderState>,
     ping_timeout: Entity<SliderState>,
     emote_timeout: Entity<SliderState>,
+    text_position: Entity<OverlaySelect<TextPosition>>,
+    text_enter: Entity<OverlaySelect<TextMotion>>,
+    text_exit: Entity<OverlaySelect<TextMotion>>,
     volume: Entity<SliderState>,
     emote_sound: bool,
     wheel_sound: bool,
@@ -1776,6 +1843,9 @@ impl Settings {
             cx.new(|_| setting_slider(ANIMATION_TIMEOUT, 100, overlay.ping_timeout_ms));
         let emote_timeout =
             cx.new(|_| setting_slider(ANIMATION_TIMEOUT, 100, overlay.emote_timeout_ms));
+        let text_position = overlay_select(&TEXT_POSITIONS, overlay.text.position, window, cx);
+        let text_enter = overlay_select(&TEXT_ENTRANCE_MOTIONS, overlay.text.enter, window, cx);
+        let text_exit = overlay_select(&TEXT_EXIT_MOTIONS, overlay.text.exit, window, cx);
         let volume = cx.new(|_| setting_slider(SOUND_VOLUME, 1, overlay.volume));
         let capture_focus = cx.focus_handle();
         let library = cx.global::<Desktop>().library.clone();
@@ -1840,6 +1910,9 @@ impl Settings {
             emote_size,
             ping_timeout,
             emote_timeout,
+            text_position,
+            text_enter,
+            text_exit,
             volume,
             emote_sound: overlay.emote_sound,
             wheel_sound: overlay.wheel_sound,
@@ -1923,6 +1996,30 @@ impl Settings {
             volume: self.volume.read(cx).value().start().round() as u32,
             emote_sound: self.emote_sound,
             wheel_sound: self.wheel_sound,
+            text: self.text_overlay_settings(cx),
+        }
+    }
+
+    fn text_overlay_settings(&self, cx: &App) -> TextOverlaySettings {
+        TextOverlaySettings {
+            position: self
+                .text_position
+                .read(cx)
+                .selected_value()
+                .copied()
+                .unwrap_or_default(),
+            enter: self
+                .text_enter
+                .read(cx)
+                .selected_value()
+                .copied()
+                .unwrap_or_default(),
+            exit: self
+                .text_exit
+                .read(cx)
+                .selected_value()
+                .copied()
+                .unwrap_or_default(),
         }
     }
 
@@ -2233,8 +2330,38 @@ impl Settings {
                     )),
             )
             .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("文字浮层"))
+                    .child(
+                        Button::new("preview-text-overlay")
+                            .label("预览文字")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let settings = this.text_overlay_settings(cx);
+                                cx.update_global::<Desktop, _>(|desktop, cx| {
+                                    desktop.overlay.play_text(
+                                        "这是一条文字消息预览。",
+                                        settings,
+                                        cx,
+                                    );
+                                });
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .child(overlay_select_field("显示位置", &self.text_position))
+                    .child(overlay_select_field("入场动效", &self.text_enter))
+                    .child(overlay_select_field("退场动效", &self.text_exit)),
+            )
+            .child(
                 Switch::new("room-overlay")
-                    .label("在桌面播放房间信号和表情")
+                    .label("在桌面显示收到的房间消息")
                     .checked(self.remote_overlay)
                     .on_change(cx.listener(|this, value, _, cx| {
                         this.remote_overlay = *value;

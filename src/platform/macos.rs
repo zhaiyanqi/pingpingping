@@ -8,6 +8,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use super::playback::{
+    FrameUpdate, TEXT_FONT_SIZE, TEXT_MARGIN, TEXT_MAX_LINES, TEXT_PADDING, TEXT_RADIUS,
+    TEXT_WIDTH, TextColors, text_anchor,
+};
 use super::{AnimationOverlay, AudioCue, WheelContents, start_audio, wheel::WheelView};
 use async_channel::Sender;
 use core_foundation::base::TCFType;
@@ -26,18 +30,18 @@ use objc2::{
     MainThreadMarker, MainThreadOnly, define_class, msg_send, rc::Retained, runtime::AnyObject,
 };
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSColor, NSFloatingWindowLevel, NSPanel, NSScreen, NSWindow,
-    NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSApplication, NSBackingStoreType, NSColor, NSFloatingWindowLevel, NSFont, NSPanel, NSScreen,
+    NSTextField, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_core_graphics::CGImage;
-use objc2_foundation::{NSPoint, NSRect, NSSize};
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use objc2_quartz_core::{CALayer, CATransaction};
 
 use crate::gesture::{
     ALT, CTRL, GestureEvent, InputEvent, MouseDelivery, Position, SCROLL_STEP, SHIFT, SUPER,
     Triggers, WHEEL_SIZE, WheelInput,
 };
-use crate::model::Location;
+use crate::model::{Location, TextPosition};
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -356,8 +360,12 @@ define_class!(
     }
 );
 
-fn panel(size: f64, mtm: MainThreadMarker, wheel: bool) -> (Retained<NSPanel>, Retained<CALayer>) {
-    let bounds = rect(0.0, 0.0, size, size);
+fn panel(
+    size: NSSize,
+    mtm: MainThreadMarker,
+    wheel: bool,
+) -> (Retained<NSPanel>, Retained<CALayer>) {
+    let bounds = NSRect::new(NSPoint::ZERO, size);
     // A nonactivating key panel borrows keyboard focus without bringing chat or settings forward.
     // 非激活面板可临时取得键盘焦点，同时保持聊天、设置窗口原有的前后顺序。
     let style = NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel;
@@ -389,7 +397,7 @@ fn panel(size: f64, mtm: MainThreadMarker, wheel: bool) -> (Retained<NSPanel>, R
     );
     let layer = CALayer::layer();
     if let Some(view) = panel.contentView() {
-        layer.setFrame(rect(0.0, 0.0, size, size));
+        layer.setFrame(bounds);
         view.setLayer(Some(&layer));
         view.setWantsLayer(true);
     }
@@ -448,7 +456,8 @@ pub(crate) struct Overlay {
 impl Overlay {
     pub(crate) fn new() -> Self {
         let mtm = MainThreadMarker::new().expect("GUI must use the main thread");
-        let (wheel, wheel_art) = panel(f64::from(WHEEL_SIZE), mtm, true);
+        let size = f64::from(WHEEL_SIZE);
+        let (wheel, wheel_art) = panel(NSSize::new(size, size), mtm, true);
         let scale = NSScreen::screens(mtm)
             .firstObject()
             .map_or(1.0, |screen| screen.backingScaleFactor());
@@ -555,7 +564,7 @@ pub(super) fn animation_presenter(
     size: u32,
     local: Option<Position>,
     location: Option<Location>,
-) -> Option<(Option<u32>, impl FnMut(image::RgbaImage))> {
+) -> Option<(Option<u32>, impl FnMut(FrameUpdate))> {
     let mtm = MainThreadMarker::new()?;
     let (point, screen) = local.and_then(|point| screen_for(point, mtm)).or_else(|| {
         let screen = NSScreen::screens(mtm).firstObject()?.frame();
@@ -570,25 +579,89 @@ pub(super) fn animation_presenter(
     })?;
     let size = f64::from(size);
     let mut effect = None;
-    Some((None, move |frame: image::RgbaImage| {
+    Some((None, move |update| {
         let window = effect.get_or_insert_with(|| {
-            let (panel, art) = panel(size, mtm, false);
+            let (panel, art) = panel(NSSize::new(size, size), mtm, false);
             art.setContentsGravity(unsafe { objc2_quartz_core::kCAGravityResizeAspect });
             Effect { panel, art }
         });
-        update_layers(|| {
-            set_pixels(
+        update_layers(|| match update {
+            FrameUpdate::Image(frame) => set_pixels(
                 &window.art,
                 frame.width(),
                 frame.height(),
                 frame.into_raw(),
                 3,
-            )
+            ),
+            FrameUpdate::Opacity(opacity) => window.art.setOpacity(opacity),
         });
         if !window.panel.isVisible() {
             place(&window.panel, point, size, screen);
         }
     }))
+}
+
+pub(super) fn system_reduces_motion() -> bool {
+    NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+}
+
+pub(super) fn text_presenter(
+    text: &str,
+    position: TextPosition,
+    colors: TextColors,
+) -> Option<impl FnMut(f32, f64) + use<>> {
+    let mtm = MainThreadMarker::new()?;
+    let work = NSScreen::screens(mtm).firstObject()?.visibleFrame();
+    let width = f64::from(TEXT_WIDTH).min(work.size.width);
+    let padding = f64::from(TEXT_PADDING);
+    let inner_width = width - 2.0 * padding;
+    let inner_height = work.size.height - 2.0 * padding;
+    if inner_width <= 0.0 || inner_height <= 0.0 {
+        return None;
+    }
+    let label = NSTextField::wrappingLabelWithString(&NSString::from_str(text), mtm);
+    label.setSelectable(false);
+    label.setFont(Some(&NSFont::systemFontOfSize(f64::from(TEXT_FONT_SIZE))));
+    label.setTextColor(Some(&text_color(colors.foreground)));
+    label.setMaximumNumberOfLines(TEXT_MAX_LINES as isize);
+    label.setPreferredMaxLayoutWidth(inner_width);
+    label.cell()?.setTruncatesLastVisibleLine(true);
+    let text_height = label.fittingSize().height.ceil().min(inner_height);
+    let size = NSSize::new(width, text_height + 2.0 * padding);
+    let (panel, art) = panel(size, mtm, false);
+    let view = panel.contentView()?;
+    art.setCornerRadius(f64::from(TEXT_RADIUS));
+    art.setBackgroundColor(Some(&text_color(colors.background).CGColor()));
+    label.setFrame(rect(padding, padding, inner_width, text_height));
+    view.addSubview(&label);
+
+    let free_y = work.size.height - size.height;
+    let (x, y) = text_anchor(
+        position,
+        work.size.width - size.width,
+        free_y,
+        f64::from(TEXT_MARGIN),
+    );
+    let window = Effect { panel, art };
+    Some(move |opacity, offset: f64| {
+        window.panel.setAlphaValue(f64::from(opacity));
+        window.panel.setFrameOrigin(NSPoint::new(
+            work.origin.x + x,
+            work.origin.y + free_y - (y + offset).clamp(0.0, free_y),
+        ));
+        if !window.panel.isVisible() {
+            window.panel.orderFrontRegardless();
+        }
+    })
+}
+
+fn text_color(color: gpui_kit::Rgba) -> Retained<NSColor> {
+    NSColor::colorWithSRGBRed_green_blue_alpha(
+        f64::from(color.r),
+        f64::from(color.g),
+        f64::from(color.b),
+        1.0,
+    )
 }
 
 fn set_pixels(layer: &CALayer, width: u32, height: u32, bytes: Vec<u8>, alpha: u32) {
