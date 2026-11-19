@@ -4,7 +4,7 @@
 
 PingPingPing is a Rust desktop app for pings, emotes, and LAN chat on Windows and macOS. It uses GPUI Kit for settings, chat, and history, with Win32 or AppKit rendering for desktop overlays.
 
-PingPingPing starts in the background. Click its icon in the Windows notification area or macOS menu bar to open chat, history, or settings. Closing a window hides it without losing your draft or disconnecting from the room. Select **退出** (Quit) in the tray menu to exit.
+PingPingPing starts in the background. Click its icon in the Windows notification area or macOS menu bar to open chat, history, or settings. Closing a window hides it and preserves your draft and room connection. Settings also has a **关闭** (Close) button at the bottom. Select **退出** (Quit) in the tray menu to exit.
 
 ## Build on Windows
 
@@ -117,6 +117,7 @@ Right-click the Windows system tray or macOS menu bar icon and select **Mute**. 
 | Emote wheel | Hold Ctrl and left-drag | Hold Control and left-drag |
 | Quick ping (off by default) | Alt-click | Option-click |
 | Chat / History / Settings | Ctrl+1 / Ctrl+2 / Ctrl+, | ⌘1 / ⌘2 / ⌘, |
+| Close the active window | Ctrl+W | ⌘W |
 
 In **Settings → Desktop wheel**, turn each wheel on or off independently. Click the current binding, press a keyboard key or mouse button 4 (Back) or 5 (Forward), then save. Esc cancels recording. Enabled wheels must use different bindings.
 

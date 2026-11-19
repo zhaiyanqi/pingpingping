@@ -1,7 +1,7 @@
 //! GPUI Kit chat, history, and settings windows.
 //! 使用 GPUI Kit 实现的聊天、历史和设置窗口。
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, LazyCell, RefCell};
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -12,7 +12,7 @@ use uuid::Uuid;
 use async_channel::Sender;
 use chrono::{DateTime, Local};
 use gpui_kit::assets::IconName;
-use gpui_kit::base::Button as BaseButton;
+use gpui_kit::base::{Button as BaseButton, Root};
 use gpui_kit::component::{
     ActiveTheme, Disableable, IndexPath, Selectable, Sizable,
     button::{Button, ButtonVariants},
@@ -40,7 +40,7 @@ use crate::platform::{
 };
 use crate::room::{DEFAULT_PORT, Room, RoomConfig, RoomEvent};
 
-gpui_kit::actions!([OpenChat, OpenHistory, OpenSettings, Quit]);
+gpui_kit::actions!([OpenChat, OpenHistory, OpenSettings, CloseWindow, Quit]);
 
 struct WheelEmoteAdded(WheelEmote);
 
@@ -55,7 +55,7 @@ struct Desktop {
     incoming: Sender<RoomEvent>,
     capture_paused: Arc<AtomicBool>,
     monitor: Option<(InputMonitor, Task<()>)>,
-    overlay: Overlay,
+    overlay: LazyCell<Overlay>,
     wheel_posters: Option<Task<()>>,
     chat: Option<AnyWindowHandle>,
     history: Option<AnyWindowHandle>,
@@ -88,24 +88,8 @@ pub(crate) fn start(cx: &mut App) {
     let capture_paused = Arc::new(AtomicBool::new(false));
     let monitor = start_input(&model.profile, capture_paused.clone(), cx);
     model.input_ready = monitor.is_some();
-    let library = cx.new(|cx| LocalEmotes::new(model.emotes(), cx));
-    let model = cx.new(|_| model);
-    let desktop = Desktop {
-        tray: None,
-        model,
-        library,
-        incoming,
-        monitor,
-        capture_paused,
-        overlay: Overlay::new(),
-        wheel_posters: None,
-        chat: None,
-        history: None,
-        settings: None,
-        emotes: EMOTES
-            .map(|clip| Arc::new(Image::from_bytes(ImageFormat::Png, clip.image.to_vec()))),
-        pings: PINGS.map(|clip| Arc::new(Image::from_bytes(ImageFormat::Png, clip.image.to_vec()))),
-    };
+    let mut desktop = Desktop::new(model, incoming, capture_paused, cx);
+    desktop.monitor = monitor;
     cx.set_global(desktop);
     refresh_wheel_posters(cx);
     cx.on_app_quit(|cx| {
@@ -156,28 +140,7 @@ pub(crate) fn start(cx: &mut App) {
         }
     })
     .detach();
-    cx.on_action(|_: &OpenChat, cx| open_chat(cx));
-    cx.on_action(|_: &OpenHistory, cx| open_history(cx));
-    cx.on_action(|_: &OpenSettings, cx| open_settings(cx));
-    cx.on_action(|_: &Quit, cx| cx.quit());
-    cx.bind_keys([
-        KeyBinding::new(shortcut("1").as_str(), OpenChat, None),
-        KeyBinding::new(shortcut("2").as_str(), OpenHistory, None),
-        KeyBinding::new(shortcut(",").as_str(), OpenSettings, None),
-        KeyBinding::new(shortcut("q").as_str(), Quit, None),
-    ]);
-    #[cfg(target_os = "macos")]
-    cx.set_menus([Menu {
-        name: "PingPingPing".into(),
-        disabled: false,
-        items: vec![
-            MenuItem::action("聊天", OpenChat),
-            MenuItem::action("历史记录…", OpenHistory),
-            MenuItem::action("设置…", OpenSettings),
-            MenuItem::separator(),
-            MenuItem::action("退出", Quit),
-        ],
-    }]);
+    register_window_actions(cx);
     let (sender, commands) = async_channel::unbounded();
     let muted = cx
         .global::<Desktop>()
@@ -219,6 +182,34 @@ pub(crate) fn start(cx: &mut App) {
             open_chat(cx);
         }
     }
+}
+
+fn register_window_actions(cx: &mut App) {
+    cx.on_action(|_: &OpenChat, cx| open_chat(cx));
+    cx.on_action(|_: &OpenHistory, cx| open_history(cx));
+    cx.on_action(|_: &OpenSettings, cx| open_settings(cx));
+    cx.on_action(|_: &CloseWindow, cx| close_active_window(cx));
+    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.bind_keys([
+        KeyBinding::new(shortcut("1").as_str(), OpenChat, None),
+        KeyBinding::new(shortcut("2").as_str(), OpenHistory, None),
+        KeyBinding::new(shortcut(",").as_str(), OpenSettings, None),
+        KeyBinding::new(shortcut("w").as_str(), CloseWindow, None),
+        KeyBinding::new(shortcut("q").as_str(), Quit, None),
+    ]);
+    #[cfg(target_os = "macos")]
+    cx.set_menus([Menu {
+        name: "PingPingPing".into(),
+        disabled: false,
+        items: vec![
+            MenuItem::action("聊天", OpenChat),
+            MenuItem::action("历史记录…", OpenHistory),
+            MenuItem::action("设置…", OpenSettings),
+            MenuItem::action("关闭窗口", CloseWindow),
+            MenuItem::separator(),
+            MenuItem::action("退出", Quit),
+        ],
+    }]);
 }
 
 fn set_incoming_muted(muted: bool, cx: &mut App) -> anyhow::Result<()> {
@@ -290,6 +281,32 @@ fn play(
 }
 
 impl Desktop {
+    fn new(
+        model: Model,
+        incoming: Sender<RoomEvent>,
+        capture_paused: Arc<AtomicBool>,
+        cx: &mut App,
+    ) -> Self {
+        let library = cx.new(|cx| LocalEmotes::new(model.emotes(), cx));
+        Self {
+            tray: None,
+            model: cx.new(|_| model),
+            library,
+            incoming,
+            capture_paused,
+            monitor: None,
+            overlay: LazyCell::new(Overlay::new),
+            wheel_posters: None,
+            chat: None,
+            history: None,
+            settings: None,
+            emotes: EMOTES
+                .map(|clip| Arc::new(Image::from_bytes(ImageFormat::Png, clip.image.to_vec()))),
+            pings: PINGS
+                .map(|clip| Arc::new(Image::from_bytes(ImageFormat::Png, clip.image.to_vec()))),
+        }
+    }
+
     fn play(
         &mut self,
         body: &Body,
@@ -422,10 +439,42 @@ fn options(title: &str, width: f32, height: f32, cx: &App) -> WindowOptions {
     }
 }
 
-fn close_to_tray(window: &Window, cx: &App) {
-    if cx.global::<Desktop>().tray.is_some() {
-        window.on_window_should_close(cx, |window, _| !crate::tray::hide_window(window));
+fn should_close_window(window: &Window, cx: &mut App) -> bool {
+    let desktop = cx.global::<Desktop>();
+    let has_tray = desktop.tray.is_some();
+    if desktop.settings == Some(window.window_handle())
+        && let Ok(settings) = Root::read(window, cx).view().clone().downcast::<Settings>()
+    {
+        // A quick reopen can happen before the visibility observer sees the hide.
+        // 快速重新打开时，窗口可见性监听可能还未收到隐藏事件。
+        settings.update(cx, Settings::end_capture);
     }
+    !has_tray || !crate::tray::hide_window(window)
+}
+
+fn close_to_tray(window: &Window, cx: &App) {
+    window.on_window_should_close(cx, |window, cx| should_close_window(window, cx));
+}
+
+fn close_window(window: &mut Window, cx: &mut App) {
+    if should_close_window(window, cx) {
+        window.remove_window();
+    }
+}
+
+fn close_active_window(cx: &mut App) {
+    let desktop = cx.global::<Desktop>();
+    let Some(handle) = cx.active_window().filter(|handle| {
+        [desktop.chat, desktop.history, desktop.settings].contains(&Some(*handle))
+    }) else {
+        cx.propagate();
+        return;
+    };
+    // A key action may already be updating this window.
+    // 快捷键触发时，当前窗口可能仍处于更新过程中。
+    cx.defer(move |cx| {
+        let _ = handle.update(cx, |_, window, cx| close_window(window, cx));
+    });
 }
 
 fn focus_window(handle: Option<AnyWindowHandle>, cx: &mut App) -> bool {
@@ -2821,7 +2870,7 @@ impl Render for Settings {
                 .flex_col()
                 .gap_2()
                 .child(div().text_sm().child("昵称"))
-                .child(Input::new(&self.name)),
+                .child(Input::new(&self.name).id("settings-name")),
             SettingsCategory::Room => self.room_settings(cx),
             SettingsCategory::Wheel => div()
                 .flex()
@@ -2942,6 +2991,12 @@ impl Render for Settings {
                         ),
                     )
                     .child(
+                        Button::new("close-settings")
+                            .outline()
+                            .label("关闭")
+                            .on_click(|_, window, cx| close_window(window, cx)),
+                    )
+                    .child(
                         Button::new("save")
                             .primary()
                             .label("保存设置")
@@ -2954,7 +3009,142 @@ impl Render for Settings {
 
 #[cfg(test)]
 mod tests {
-    use super::{ANIMATION_TIMEOUT, WheelSlot, setting_slider};
+    use std::fs;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use gpui_kit::base::Root;
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{
+        AnyWindowHandle, AppContext, QuitMode, TestAppContext, WindowVisibility, px, size,
+    };
+    use uuid::Uuid;
+
+    use super::{
+        ANIMATION_TIMEOUT, Desktop, Settings, SettingsCategory, WheelSlot, open_chat,
+        open_settings, register_window_actions, setting_slider, shortcut,
+    };
+    use crate::model::Model;
+
+    fn settings_desktop(cx: &mut TestAppContext) -> (AnyWindowHandle, AnyWindowHandle) {
+        // The production emote library and wheel previews finish on smol workers.
+        // 实际的表情库与轮盘预览由 smol 工作线程加载。
+        cx.dispatcher.allow_parking();
+        let data = std::env::temp_dir().join(format!("pingpingping-settings-{}", Uuid::new_v4()));
+        let model = Model::load(data.clone()).unwrap();
+        cx.on_quit(move || fs::remove_dir_all(data).unwrap());
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_quit_mode(QuitMode::Explicit);
+            let desktop = Desktop::new(
+                model,
+                async_channel::bounded(8).0,
+                Arc::new(AtomicBool::new(false)),
+                cx,
+            );
+            cx.set_global(desktop);
+            register_window_actions(cx);
+            open_chat(cx);
+            open_settings(cx);
+            let desktop = cx.global::<Desktop>();
+            let chat = desktop.chat.unwrap();
+            let settings = desktop.settings.unwrap();
+            settings
+                .update(cx, |_, window, _| window.activate_window())
+                .unwrap();
+            (chat, settings)
+        })
+    }
+
+    fn start_shortcut_recording(
+        handle: AnyWindowHandle,
+        cx: &mut TestAppContext,
+    ) -> Arc<AtomicBool> {
+        cx.simulate_window_resize(handle, size(px(800.), px(1500.)));
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click(("settings-category", SettingsCategory::Wheel as usize), cx);
+            window.click("ping-trigger-record", cx);
+            let paused = cx.global::<Desktop>().capture_paused.clone();
+            assert!(paused.load(Ordering::Relaxed));
+            paused
+        })
+        .unwrap()
+    }
+
+    #[gpui_kit::test]
+    fn close_shortcut_dismisses_settings_during_shortcut_recording(cx: &mut TestAppContext) {
+        let (chat, settings) = settings_desktop(cx);
+        let paused = start_shortcut_recording(settings, cx);
+        cx.simulate_keystrokes(settings, &shortcut("w"));
+
+        assert_eq!(cx.windows(), vec![chat]);
+        assert!(!paused.load(Ordering::Relaxed));
+    }
+
+    #[gpui_kit::test]
+    fn settings_close_button_allows_reopening_when_the_tray_is_unavailable(
+        cx: &mut TestAppContext,
+    ) {
+        let (chat, settings) = settings_desktop(cx);
+        cx.update_window(settings, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("settings-name", cx);
+            window.press(&shortcut("a"), cx);
+            window.input("未保存的昵称", cx);
+            assert_eq!(window.find("settings-name").value(), Some("未保存的昵称"));
+            window.click("close-settings", cx);
+        })
+        .unwrap();
+        assert_eq!(cx.windows(), vec![chat]);
+
+        cx.update_window(chat, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("settings", cx);
+        })
+        .unwrap();
+        let reopened = cx.update(|cx| cx.global::<Desktop>().settings.unwrap());
+        assert_ne!(reopened, settings);
+        cx.update_window(reopened, |_, window, cx| {
+            window.render_frame(cx);
+            let saved_name = &cx.global::<Desktop>().model.read(cx).profile.name;
+            assert_ne!(saved_name, "未保存的昵称");
+            assert_eq!(
+                window.find("settings-name").value(),
+                Some(saved_name.as_str())
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn hiding_settings_cancels_shortcut_recording_and_reopening_keeps_the_view(
+        cx: &mut TestAppContext,
+    ) {
+        let (_, settings) = settings_desktop(cx);
+        let paused = start_shortcut_recording(settings, cx);
+        cx.simulate_window_visibility_change(settings, WindowVisibility::Hidden);
+        assert!(!paused.load(Ordering::Relaxed));
+
+        cx.update(open_settings);
+        assert_eq!(
+            cx.update(|cx| cx.global::<Desktop>().settings),
+            Some(settings)
+        );
+        cx.update_window(settings, |_, window, cx| {
+            let settings = Root::read(window, cx)
+                .view()
+                .clone()
+                .downcast::<Settings>()
+                .unwrap();
+            let settings = settings.read(cx);
+            assert!(settings.category == SettingsCategory::Wheel);
+            assert!(settings.recording.is_none());
+        })
+        .unwrap();
+    }
 
     #[test]
     fn deleting_a_page_preserves_the_target_of_a_pending_wheel_drop() {
