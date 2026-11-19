@@ -38,7 +38,7 @@ use crate::model::{
 use crate::platform::{
     self, AnimationPosition, InputMonitor, Overlay, WheelContents, WheelFrame, WheelPreview,
 };
-use crate::room::{DEFAULT_PORT, Room, RoomConfig, RoomEvent};
+use crate::room::{DEFAULT_PORT, RoomConfig, RoomEvent};
 
 mod emote_library;
 mod palette;
@@ -150,6 +150,12 @@ pub(crate) fn start(cx: &mut App) {
         }
     })
     .detach();
+    let desktop = cx.global::<Desktop>();
+    let model = desktop.model.clone();
+    let incoming = desktop.incoming.clone();
+    model.update(cx, |model, cx| {
+        model.reconnect_room_on_startup(incoming, cx)
+    });
     register_window_actions(cx);
     let (sender, commands) = async_channel::unbounded();
     let muted = cx
@@ -1382,6 +1388,8 @@ impl Render for Conversation {
                                         },
                                         connection.address()
                                     )
+                                } else if model.is_connecting() {
+                                    "正在连接房间…".into()
                                 } else {
                                     "本机 · 未加入房间".into()
                                 },
@@ -1743,7 +1751,6 @@ struct Settings {
     wheel_sound: bool,
     feedback: Option<(bool, String)>,
     connection_error: Option<String>,
-    connecting: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -2357,7 +2364,6 @@ impl Settings {
             wheel_sound: overlay.wheel_sound,
             feedback: None,
             connection_error: None,
-            connecting: None,
             _subscriptions: subscriptions,
         }
     }
@@ -2530,7 +2536,8 @@ impl Settings {
     }
 
     fn connect(&mut self, host: bool, cx: &mut Context<Self>) {
-        if self.connecting.is_some() || self.model.read(cx).joined() {
+        let model = self.model.read(cx);
+        if model.is_connecting() || model.joined() {
             return;
         }
         let config =
@@ -2544,35 +2551,16 @@ impl Settings {
             };
         self.connection_error = None;
         let incoming = cx.global::<Desktop>().incoming.clone();
-        let model = self.model.read(cx);
-        let name = model.profile.name.clone();
-        let emotes = model.emotes();
-        self.connecting = Some(cx.spawn(async move |weak, cx| {
-            let room = Room::open(config, name, incoming, emotes).await;
-            let _ = weak.update(cx, |this, cx| {
-                this.connecting.take();
-                let result = room.and_then(|room| {
-                    this.model.update(cx, |model, cx| {
-                        model.connect(room)?;
-                        cx.notify();
-                        Ok(())
-                    })
-                });
-                this.connection_error = result.err().map(|error| format!("{error:#}"));
-                cx.notify();
-            });
-        }));
-        cx.notify();
+        self.model
+            .update(cx, |model, cx| model.open_room(config, incoming, cx));
     }
 
     fn disconnect(&mut self, cx: &mut Context<Self>) {
-        self.connecting.take();
+        self.connection_error = None;
         self.model.update(cx, |model, cx| {
             model.disconnect();
             cx.notify();
         });
-        self.connection_error = None;
-        cx.notify();
     }
 
     fn retry_input(&mut self, cx: &mut Context<Self>) {
@@ -2652,11 +2640,11 @@ impl Settings {
     fn room_settings(&self, cx: &Context<Self>) -> Div {
         let model = self.model.read(cx);
         let connection = model.connection();
-        let busy = self.connecting.is_some();
+        let busy = model.is_connecting();
         let room_error = self
             .connection_error
             .clone()
-            .or_else(|| (!busy).then(|| model.room_error.clone()).flatten());
+            .or_else(|| model.room_error.clone());
         let theme = cx.theme();
         div().flex().flex_col().gap_2()
                 .child(div().text_sm().text_color(theme.muted_foreground).child(if cfg!(target_os = "windows") {

@@ -10,12 +10,14 @@ use std::sync::{Arc, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, ensure};
+use async_channel::Sender;
+use gpui_kit::{Context, Task};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
 use crate::assets::{DEFAULT_EMOTE_SLOTS, EMOTES, PINGS};
 use crate::emotes::{EmoteId, EmoteStore};
-use crate::room::{Room, RoomConfig, RoomMember};
+use crate::room::{Room, RoomConfig, RoomEvent, RoomMember};
 
 const HISTORY_LIMIT: usize = 600;
 
@@ -314,6 +316,8 @@ pub(crate) struct Profile {
     pub(crate) name: String,
     #[serde(default)]
     pub(crate) endpoint: Option<RoomConfig>,
+    #[serde(default)]
+    skip_room_reconnect: bool,
     pub(crate) sound: bool,
     pub(crate) gestures: bool,
     #[serde(default)]
@@ -359,6 +363,7 @@ impl Default for Profile {
             id: Uuid::new_v4(),
             name: "桌面好友".into(),
             endpoint: None,
+            skip_room_reconnect: false,
             sound: true,
             gestures: true,
             triggers: Default::default(),
@@ -384,6 +389,7 @@ pub(crate) struct Model {
     pub(crate) input_ready: bool,
     data_dir: PathBuf,
     room: Option<Room>,
+    connecting: Option<Task<()>>,
     room_key: String,
     history: VecDeque<Arc<Entry>>,
     history_revision: u64,
@@ -473,6 +479,7 @@ impl Model {
         Ok(Self {
             data_dir,
             room: None,
+            connecting: None,
             room_key: String::new(),
             room_error: None,
             input_ready: false,
@@ -501,6 +508,10 @@ impl Model {
 
     pub(crate) fn connection(&self) -> Option<RoomConfig> {
         self.room.as_ref().map(Room::config)
+    }
+
+    pub(crate) fn is_connecting(&self) -> bool {
+        self.connecting.is_some()
     }
 
     pub(crate) fn room_members(&self) -> Option<(Uuid, &[RoomMember])> {
@@ -576,13 +587,55 @@ impl Model {
         Ok(())
     }
 
-    pub(crate) fn connect(&mut self, mut room: Room) -> Result<()> {
-        let mut profile = self.profile.clone();
-        let config = room.config();
-        profile.endpoint = Some(config);
-        self.apply(profile)?;
-        self.room_key = config.address().to_string();
+    fn startup_room(&self) -> Option<RoomConfig> {
+        self.profile.endpoint.filter(|config| {
+            !self.profile.skip_room_reconnect && matches!(config, RoomConfig::Join(_))
+        })
+    }
+
+    pub(crate) fn reconnect_room_on_startup(
+        &mut self,
+        incoming: Sender<RoomEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(config) = self.startup_room() {
+            self.open_room(config, incoming, cx);
+        }
+    }
+
+    pub(crate) fn open_room(
+        &mut self,
+        config: RoomConfig,
+        incoming: Sender<RoomEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.joined() || self.is_connecting() {
+            return;
+        }
+        let name = self.profile.name.clone();
+        let emotes = self.emotes();
         self.room_error = None;
+        self.connecting = Some(cx.spawn(async move |model, cx| {
+            let room = Room::open(config, name, incoming, emotes).await;
+            let _ = model.update(cx, |model, cx| {
+                model.connecting.take();
+                let result = room.and_then(|room| model.connect(room));
+                model.room_error = result.err().map(|error| format!("{error:#}"));
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn connect(&mut self, mut room: Room) -> Result<()> {
+        let config = room.config();
+        if self.profile.endpoint != Some(config) || self.profile.skip_room_reconnect {
+            let mut profile = self.profile.clone();
+            profile.endpoint = Some(config);
+            profile.skip_room_reconnect = false;
+            self.apply(profile)?;
+        }
+        self.room_key = config.address().to_string();
         room.set_name(self.profile.name.clone());
         room.activate();
         self.room = Some(room);
@@ -590,16 +643,32 @@ impl Model {
     }
 
     pub(crate) fn disconnect(&mut self) {
+        self.connecting.take();
+        self.leave_room();
+        self.room_error = None;
+        if self.startup_room().is_some() {
+            let mut profile = self.profile.clone();
+            profile.skip_room_reconnect = true;
+            self.room_error = self
+                .apply(profile)
+                .context("已断开连接，但无法停用启动时重连")
+                .err()
+                .map(|error| format!("{error:#}"));
+        }
+    }
+
+    fn leave_room(&mut self) {
         self.room = None;
         self.room_key.clear();
-        self.room_error = None;
     }
 
     pub(crate) fn closed(&mut self, id: Uuid, reason: String) -> bool {
         if self.room.as_ref().map(Room::id) != Some(id) {
             return false;
         }
-        self.disconnect();
+        // An unexpected closure leaves the saved guest endpoint eligible for the next launch.
+        // 意外断开后保留客户端房间地址，下次启动时仍可重连。
+        self.leave_room();
         self.room_error = Some(reason);
         true
     }
@@ -652,6 +721,114 @@ impl Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui_kit::test]
+    #[ignore = "requires TCP loopback access"]
+    async fn guest_reconnects_on_launch_and_respects_manual_disconnect(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::AppContext as _;
+        use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+        use std::time::Duration;
+
+        cx.dispatcher.allow_parking();
+        let data = std::env::temp_dir().join(format!("pingpingping-reconnect-{}", Uuid::new_v4()));
+        fs::create_dir_all(&data).unwrap();
+        cx.on_quit({
+            let data = data.clone();
+            move || fs::remove_dir_all(data).unwrap()
+        });
+        let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let SocketAddr::V4(address) = reservation.local_addr().unwrap() else {
+            unreachable!()
+        };
+        drop(reservation);
+        let config = RoomConfig::Join(address);
+        let profile = Profile {
+            endpoint: Some(config),
+            ..Profile::default()
+        };
+        let mut legacy = serde_json::to_value(profile).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("skip_room_reconnect");
+        save_json(&data.join("settings.json"), &legacy).unwrap();
+
+        let (host_events, _host_inbox) = async_channel::bounded(8);
+        let mut host = Room::open(
+            RoomConfig::Host(address),
+            "主机".into(),
+            host_events,
+            EmoteStore::new(&data.join("host")),
+        )
+        .await
+        .unwrap();
+        host.activate();
+
+        let (events, inbox) = async_channel::bounded(8);
+        let guest = cx.new(|_| Model::load(data.clone()).unwrap());
+        guest.update(cx, |model, cx| {
+            model.reconnect_room_on_startup(events.clone(), cx);
+            assert!(model.is_connecting());
+        });
+        cx.condition(&guest, |model, _| !model.is_connecting())
+            .await;
+        guest.update(cx, |model, _| {
+            assert_eq!(model.connection(), Some(config));
+            model.disconnect();
+            assert!(model.room_error.is_none());
+            model.finish_writes().unwrap().join().unwrap();
+        });
+
+        let guest = cx.new(|_| Model::load(data.clone()).unwrap());
+        guest.update(cx, |model, cx| {
+            assert_eq!(model.profile.endpoint, Some(config));
+            model.reconnect_room_on_startup(events.clone(), cx);
+            assert!(!model.is_connecting());
+            model.open_room(config, events.clone(), cx);
+        });
+        cx.condition(&guest, |model, _| !model.is_connecting())
+            .await;
+        drop(host);
+        let id = cx.read_entity(&guest, |model, _| model.room.as_ref().unwrap().id());
+        let reason = smol::future::race(
+            async {
+                loop {
+                    if let RoomEvent::Closed(closed, reason) = inbox.recv().await.unwrap()
+                        && closed == id
+                    {
+                        break reason;
+                    }
+                }
+            },
+            async {
+                smol::Timer::after(Duration::from_secs(5)).await;
+                panic!("guest did not detect host closure");
+            },
+        )
+        .await;
+        guest.update(cx, |model, _| {
+            assert!(model.closed(id, reason));
+            assert!(!model.joined());
+            assert!(model.room_key().is_empty());
+            model.finish_writes().unwrap().join().unwrap();
+        });
+
+        let guest = cx.new(|_| Model::load(data.clone()).unwrap());
+        guest.update(cx, |model, cx| {
+            model.reconnect_room_on_startup(events, cx);
+            assert!(model.is_connecting());
+        });
+        cx.condition(&guest, |model, _| !model.is_connecting())
+            .await;
+        guest.update(cx, |model, _| {
+            assert!(!model.joined());
+            assert!(model.room_error.is_some());
+            assert_eq!(model.startup_room(), Some(config));
+            model.finish_writes().unwrap().join().unwrap();
+        });
+    }
 
     #[derive(Deserialize, Serialize)]
     struct LegacyMessage {
