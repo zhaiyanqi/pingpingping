@@ -19,10 +19,10 @@ use windows_sys::Win32::{
     UI::{HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
 
-use super::{AnimationOverlay, AudioCue, start_audio, wheel::WheelView};
+use super::{AnimationOverlay, AudioCue, WheelContents, start_audio, wheel::WheelView};
 use crate::gesture::{
     ALT, CTRL, GestureEvent, InputEvent, MouseDelivery, Position, SHIFT, SUPER, Triggers,
-    WHEEL_SIZE, Wheel, WheelInput,
+    WHEEL_SIZE, WheelInput,
 };
 use crate::model::Location;
 
@@ -283,7 +283,8 @@ unsafe extern "system" fn mouse_hook(code: i32, message: WPARAM, data: LPARAM) -
                 WM_MBUTTONDOWN | WM_MBUTTONUP => {
                     InputEvent::OtherButton(2, message as u32 == WM_MBUTTONDOWN)
                 }
-                WM_MOUSEWHEEL | WM_MOUSEHWHEEL => InputEvent::Interrupt,
+                WM_MOUSEWHEEL => InputEvent::Scroll(-i32::from((event.mouseData >> 16) as i16)),
+                WM_MOUSEHWHEEL => InputEvent::Scroll(0),
                 _ => return MouseDelivery::Pass,
             };
             input.dispatch(event.pt, kind)
@@ -651,7 +652,7 @@ impl Drop for Layer {
 
 pub(crate) struct Overlay {
     wheel: Rc<RefCell<Layer>>,
-    wheel_view: WheelView,
+    pub(super) wheel_view: WheelView,
     pub(super) animations: AnimationOverlay,
     pub(super) audio: std::sync::mpsc::SyncSender<AudioCue>,
 }
@@ -670,7 +671,7 @@ impl Overlay {
 
     pub(crate) fn open(
         &mut self,
-        wheel: Wheel,
+        contents: WheelContents,
         position: Position,
         selected: Option<usize>,
         tick_volume: Option<f32>,
@@ -691,8 +692,9 @@ impl Overlay {
                 layer.borrow_mut().hide();
             }
         });
-        self.wheel_view.open(wheel, size, selected, present, cx);
-        if let Some(volume) = tick_volume.filter(|_| selected.is_some()) {
+        if self.wheel_view.open(contents, size, selected, present, cx)
+            && let Some(volume) = tick_volume
+        {
             let _ = self.audio.try_send(AudioCue::Tick(volume));
         }
     }

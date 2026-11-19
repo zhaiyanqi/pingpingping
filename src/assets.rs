@@ -65,6 +65,6 @@ pub(crate) const EMOTES: [Clip; 13] = [
 
 // Wheel slots map to stable catalog IDs rather than changing the wire format.
 // 轮盘槽位映射到稳定的素材 ID，不改变网络协议。
-pub(crate) const EMOTE_WHEEL: [usize; 8] = [8, 7, 9, 10, 11, 2, 12, 0];
+pub(crate) const DEFAULT_EMOTE_SLOTS: [usize; 8] = [8, 7, 9, 10, 11, 2, 12, 0];
 pub(crate) const EMOTE_HUB: usize = 3;
 pub(crate) const WHEEL_TICK: &[u8] = include_bytes!("../assets/sounds/button.wav");

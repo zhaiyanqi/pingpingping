@@ -11,24 +11,25 @@ use async_channel::Sender;
 use chrono::{DateTime, Local};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Sizable,
+    ActiveTheme, Disableable, Selectable, Sizable,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
     popover::{Popover, PopoverState},
+    scroll::ScrollableElement,
     slider::{Slider, SliderState},
     switch::Switch,
 };
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
-use crate::assets::{EMOTE_WHEEL, EMOTES, PINGS};
-use crate::emotes::LibraryEmote;
+use crate::assets::{EMOTES, PINGS};
+use crate::emotes::{EmoteStore, LibraryEmote};
 use crate::gesture::{GestureEvent, TriggerKey, Triggers, Wheel};
 use crate::model::{
-    ANIMATION_TIMEOUT, Body, EMOTE_SIZE, Message, Model, OverlaySettings, PING_SIZE, Profile,
-    SOUND_VOLUME,
+    ANIMATION_TIMEOUT, Body, EMOTE_SIZE, EmotePage, Message, Model, OverlaySettings, PING_SIZE,
+    Profile, SOUND_VOLUME, WheelEmote,
 };
-use crate::platform::{self, InputMonitor, Overlay};
+use crate::platform::{self, InputMonitor, Overlay, WheelContents};
 use crate::room::{DEFAULT_PORT, Room, RoomConfig, RoomEvent};
 
 gpui_kit::actions!([OpenChat, OpenHistory, OpenSettings, Quit]);
@@ -38,10 +39,12 @@ gpui_kit::actions!([OpenChat, OpenHistory, OpenSettings, Quit]);
 struct Desktop {
     tray: Option<crate::tray::Tray>,
     model: Entity<Model>,
+    library: Entity<LocalEmotes>,
     incoming: Sender<RoomEvent>,
     capture_paused: Arc<AtomicBool>,
     monitor: Option<(InputMonitor, Task<()>)>,
     overlay: Overlay,
+    wheel_posters: Option<Task<()>>,
     chat: Option<AnyWindowHandle>,
     history: Option<AnyWindowHandle>,
     settings: Option<AnyWindowHandle>,
@@ -73,14 +76,17 @@ pub(crate) fn start(cx: &mut App) {
     let capture_paused = Arc::new(AtomicBool::new(false));
     let monitor = start_input(&model.profile, capture_paused.clone(), cx);
     model.input_ready = monitor.is_some();
+    let library = cx.new(|cx| LocalEmotes::new(model.emotes(), cx));
     let model = cx.new(|_| model);
     let desktop = Desktop {
         tray: None,
         model,
+        library,
         incoming,
         monitor,
         capture_paused,
         overlay: Overlay::new(),
+        wheel_posters: None,
         chat: None,
         history: None,
         settings: None,
@@ -89,6 +95,7 @@ pub(crate) fn start(cx: &mut App) {
         pings: PINGS.map(|clip| Arc::new(Image::from_bytes(ImageFormat::Png, clip.image.to_vec()))),
     };
     cx.set_global(desktop);
+    refresh_wheel_posters(cx);
     cx.on_app_quit(|cx| {
         let model = cx.global::<Desktop>().model.clone();
         let writer = model.update(cx, |model, _| model.finish_writes());
@@ -263,12 +270,29 @@ fn play(body: &Body, cx: &mut App) {
                     .overlay
                     .play(Wheel::Ping, index, None, location, settings, cx)
             }
-            Body::CustomEmote(id) => desktop
-                .overlay
-                .play_custom(model.emotes(), id, settings, cx),
+            Body::CustomEmote(id) => {
+                desktop
+                    .overlay
+                    .play_custom(model.emotes(), id, None, settings, cx)
+            }
             Body::Text(_) => {}
         }
     });
+}
+
+fn refresh_wheel_posters(cx: &mut App) {
+    let model = cx.global::<Desktop>().model.read(cx);
+    let store = model.emotes();
+    let pages = model.profile.emote_pages.clone();
+    let task = cx.spawn(async move |cx| {
+        let posters = smol::unblock(move || platform::load_wheel_posters(&store, &pages)).await;
+        cx.update(|cx| {
+            cx.update_global::<Desktop, _>(|desktop, cx| {
+                desktop.overlay.set_wheel_posters(posters, cx)
+            });
+        });
+    });
+    cx.global_mut::<Desktop>().wheel_posters = Some(task);
 }
 
 fn start_input(
@@ -295,35 +319,68 @@ fn handle_gesture(event: GestureEvent, cx: &mut App) {
     let enabled = profile.gestures;
     let settings = profile.overlay.with_sound(profile.sound);
     let tick_volume = settings.volume().filter(|_| settings.wheel_sound);
+    let contents = match event {
+        GestureEvent::Open(Wheel::Emote, ..) => WheelContents::Emote(profile.emote_pages.clone()),
+        _ => WheelContents::Ping,
+    };
     cx.update_global::<Desktop, _>(|desktop, cx| match event {
-        GestureEvent::Open(kind, origin, selected) if enabled => {
+        GestureEvent::Open(_, origin, selected) if enabled => {
             desktop
                 .overlay
-                .open(kind, origin, selected, tick_volume, cx)
+                .open(contents, origin, selected, tick_volume, cx)
         }
         GestureEvent::Select(index) if enabled => desktop.overlay.select(index, tick_volume, cx),
+        GestureEvent::Page(steps, selected) if enabled => {
+            desktop
+                .overlay
+                .turn_wheel_page(steps, selected, tick_volume, cx)
+        }
         GestureEvent::Finish(choice) => {
-            desktop.overlay.close(cx);
-            if let Some((kind, index, origin)) = choice.filter(|_| enabled) {
-                let index = if kind == Wheel::Emote {
-                    EMOTE_WHEEL[index]
-                } else {
-                    index
-                };
-                let location = platform::normalized(origin);
+            // Resolve the slot against the page shown by this gesture before closing it.
+            // 关闭轮盘前，按本次手势显示的当前页解析槽位。
+            let message = choice.filter(|_| enabled).and_then(|(kind, slot, origin)| {
+                let location = Some(platform::normalized(origin));
                 let body = match kind {
                     Wheel::Ping => Body::Ping {
-                        index,
-                        location: Some(location),
+                        index: slot,
+                        location,
                     },
-                    Wheel::Emote => Body::Emote {
-                        index,
-                        location: Some(location),
+                    Wheel::Emote => match desktop.overlay.wheel_emote(slot)? {
+                        WheelEmote::BuiltIn(index) => Body::Emote { index, location },
+                        WheelEmote::Custom(id) => Body::CustomEmote(id),
                     },
                 };
-                desktop
-                    .overlay
-                    .play(kind, index, Some(origin), Some(location), settings, cx);
+                Some((body, origin))
+            });
+            desktop.overlay.close(cx);
+            if let Some((body, origin)) = message {
+                let location = body.location();
+                match body {
+                    Body::Ping { index, .. } => desktop.overlay.play(
+                        Wheel::Ping,
+                        index,
+                        Some(origin),
+                        location,
+                        settings,
+                        cx,
+                    ),
+                    Body::Emote { index, .. } => desktop.overlay.play(
+                        Wheel::Emote,
+                        index,
+                        Some(origin),
+                        location,
+                        settings,
+                        cx,
+                    ),
+                    Body::CustomEmote(id) => desktop.overlay.play_custom(
+                        desktop.model.read(cx).emotes(),
+                        id,
+                        Some(origin),
+                        settings,
+                        cx,
+                    ),
+                    Body::Text(_) => {}
+                }
                 desktop
                     .model
                     .update(cx, |model, cx| match model.send(body) {
@@ -400,12 +457,82 @@ fn open_settings(cx: &mut App) {
         return;
     }
     if let Ok((handle, _)) = gpui_kit::open_window(
-        options("PingPingPing · 设置", 560., 655., cx),
+        WindowOptions {
+            window_min_size: Some(size(px(560.), px(400.))),
+            ..options("PingPingPing · 设置", 700., 655., cx)
+        },
         cx,
         |window, cx| cx.new(|cx| Settings::new(window, cx)),
     ) {
         cx.global_mut::<Desktop>().settings = Some(handle);
         cx.activate(true);
+    }
+}
+
+struct LocalEmotes {
+    store: EmoteStore,
+    entries: Vec<LibraryEmote>,
+    task: Option<Task<()>>,
+    error: Option<String>,
+}
+
+impl LocalEmotes {
+    fn new(store: EmoteStore, cx: &mut Context<Self>) -> Self {
+        let local = store.clone();
+        let task = cx.spawn(async move |weak: WeakEntity<Self>, cx| {
+            let result = smol::unblock(move || local.library()).await;
+            let _ = weak.update(cx, |this, cx| {
+                this.task.take();
+                match result {
+                    Ok(entries) => this.entries = entries,
+                    Err(error) => this.error = Some(format!("{error:#}")),
+                }
+                cx.notify();
+            });
+        });
+        Self {
+            store,
+            entries: Vec::new(),
+            task: Some(task),
+            error: None,
+        }
+    }
+
+    fn import(&mut self, cx: &mut Context<Self>) {
+        if self.task.is_some() {
+            return;
+        }
+        self.error = None;
+        let prompt = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("选择 GIF、PNG、JPEG 或 WebP 图片".into()),
+        });
+        let store = self.store.clone();
+        self.task = Some(cx.spawn(async move |weak, cx| {
+            let result = async {
+                let paths = prompt.await??;
+                let Some(path) = paths.and_then(|paths| paths.into_iter().next()) else {
+                    return Ok(None);
+                };
+                smol::unblock(move || store.import(&path)).await.map(Some)
+            }
+            .await;
+            let _ = weak.update(cx, |this, cx| {
+                this.task.take();
+                match result {
+                    Ok(Some(emote)) => {
+                        this.entries.retain(|known| known.id() != emote.id());
+                        this.entries.insert(0, emote);
+                    }
+                    Ok(None) => {}
+                    Err(error) => this.error = Some(format!("{error:#}")),
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
     }
 }
 
@@ -422,9 +549,6 @@ struct Conversation {
     all_rooms: bool,
     room_key: String,
     filter: Filter,
-    library: Vec<LibraryEmote>,
-    library_task: Option<Task<()>>,
-    import_error: Option<String>,
     messages: ListState,
     rows: Vec<(usize, Uuid)>,
     error: Option<String>,
@@ -443,20 +567,6 @@ impl Conversation {
             })
         });
         let model = cx.global::<Desktop>().model.clone();
-        let library_task = (!history).then(|| {
-            let store = model.read(cx).emotes();
-            cx.spawn(async move |weak: WeakEntity<Self>, cx| {
-                let result = smol::unblock(move || store.library()).await;
-                let _ = weak.update(cx, |this, cx| {
-                    this.library_task.take();
-                    match result {
-                        Ok(library) => this.library = library,
-                        Err(error) => this.import_error = Some(format!("{error:#}")),
-                    }
-                    cx.notify();
-                });
-            })
-        });
         let messages = ListState::new(0, ListAlignment::Bottom, px(180.));
         messages.set_follow_mode(FollowMode::Tail);
         let room_key = model.read(cx).room_key().to_owned();
@@ -472,6 +582,10 @@ impl Conversation {
             this.refresh_messages(cx);
             cx.notify();
         })];
+        if !history {
+            let library = cx.global::<Desktop>().library.clone();
+            subscriptions.push(cx.observe(&library, |_, _, cx| cx.notify()));
+        }
         if let Some(input) = &input {
             subscriptions.push(
                 cx.subscribe_in(input, window, |this, _, event, window, cx| match event {
@@ -491,9 +605,6 @@ impl Conversation {
             all_rooms: false,
             room_key,
             filter: Filter::All,
-            library: Vec::new(),
-            library_task,
-            import_error: None,
             messages,
             rows: Vec::new(),
             error: None,
@@ -576,43 +687,6 @@ impl Conversation {
         sent
     }
 
-    fn import_emote(&mut self, cx: &mut Context<Self>) {
-        if self.library_task.is_some() {
-            return;
-        }
-        self.import_error = None;
-        let prompt = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("选择 GIF、PNG、JPEG 或 WebP 图片".into()),
-        });
-        let store = self.model.read(cx).emotes();
-        self.library_task = Some(cx.spawn(async move |weak, cx| {
-            let result = async {
-                let paths = prompt.await??;
-                let Some(path) = paths.and_then(|paths| paths.into_iter().next()) else {
-                    return Ok(None);
-                };
-                smol::unblock(move || store.import(&path)).await.map(Some)
-            }
-            .await;
-            let _ = weak.update(cx, |this, cx| {
-                this.library_task.take();
-                match result {
-                    Ok(Some(emote)) => {
-                        this.library.retain(|known| known.id() != emote.id());
-                        this.library.insert(0, emote);
-                    }
-                    Ok(None) => {}
-                    Err(error) => this.import_error = Some(format!("{error:#}")),
-                }
-                cx.notify();
-            });
-        }));
-        cx.notify();
-    }
-
     fn picker(wheel: Wheel, cx: &Context<Self>) -> Popover {
         let (id, label, icon) = match wheel {
             Wheel::Emote => ("emote-picker", "表情", IconName::ThumbsUp),
@@ -683,8 +757,8 @@ impl Conversation {
                 ),
             );
         if wheel == Wheel::Emote {
-            let store = self.model.read(cx).emotes();
-            let import = owner.clone();
+            let library = desktop.library.read(cx);
+            let import = desktop.library.clone();
             let theme = cx.theme();
             panel = panel.child(
                 div()
@@ -694,7 +768,7 @@ impl Conversation {
                     .border_t_1()
                     .border_color(theme.border)
                     .pt_2()
-                    .when(!self.library.is_empty(), |section| {
+                    .when(!library.entries.is_empty(), |section| {
                         section.child(
                             div()
                                 .id("imported-emotes")
@@ -702,13 +776,13 @@ impl Conversation {
                                 .overflow_y_scroll()
                                 .p_1()
                                 .child(div().flex().flex_wrap().gap_1().children(
-                                    self.library.iter().map(|emote| {
+                                    library.entries.iter().map(|emote| {
                                         Button::new(SharedString::from(emote.id().to_string()))
                                             .ghost()
                                             .accessibility_label(emote.name().to_owned())
                                             .tooltip(emote.name().to_owned())
                                             .child(
-                                                img(store.poster(emote.id()))
+                                                img(library.store.poster(emote.id()))
                                                     .size_6()
                                                     .object_fit(ObjectFit::Contain),
                                             )
@@ -717,7 +791,7 @@ impl Conversation {
                                 )),
                         )
                     })
-                    .when_some(self.import_error.clone(), |section, error| {
+                    .when_some(library.error.clone(), |section, error| {
                         section.child(div().text_sm().text_color(theme.danger).child(error))
                     })
                     .child(
@@ -727,9 +801,9 @@ impl Conversation {
                                 .ghost()
                                 .icon(IconName::Plus)
                                 .label("导入图片…")
-                                .loading(self.library_task.is_some())
+                                .loading(library.task.is_some())
                                 .on_click(move |_, _, cx| {
-                                    let _ = import.update(cx, |this, cx| this.import_emote(cx));
+                                    import.update(cx, LocalEmotes::import);
                                 }),
                         ),
                     ),
@@ -1069,14 +1143,50 @@ impl Render for Conversation {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsCategory {
+    General,
+    Room,
+    Wheel,
+    Animation,
+    Sound,
+}
+
+const SLOT_DIRECTIONS: [&str; 8] = ["上", "右上", "右", "右下", "下", "左下", "左", "左上"];
+
+impl SettingsCategory {
+    const ALL: [Self; 5] = [
+        Self::General,
+        Self::Room,
+        Self::Wheel,
+        Self::Animation,
+        Self::Sound,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::General => "常规",
+            Self::Room => "局域网房间",
+            Self::Wheel => "桌面轮盘",
+            Self::Animation => "桌面动画",
+            Self::Sound => "音效",
+        }
+    }
+}
+
 struct Settings {
     model: Entity<Model>,
+    category: SettingsCategory,
     name: Entity<InputState>,
     ip: Entity<InputState>,
     port: Entity<InputState>,
     sound: bool,
     gestures: bool,
     triggers: Triggers,
+    emote_pages: Vec<EmotePage>,
+    wheel_page: usize,
+    wheel_slot: usize,
+    swap_source: Option<(usize, usize)>,
     recording: Option<Wheel>,
     capture_focus: FocusHandle,
     capture_paused: Arc<AtomicBool>,
@@ -1101,6 +1211,301 @@ impl Drop for Settings {
 }
 
 impl Settings {
+    fn show_wheel_page(&mut self, page: usize, cx: &mut Context<Self>) {
+        self.wheel_page = page;
+        cx.notify();
+    }
+
+    fn select_wheel_slot(&mut self, slot: usize, cx: &mut Context<Self>) {
+        if let Some((page, source)) = self.swap_source.take()
+            && (page, source) != (self.wheel_page, slot)
+        {
+            let emote = self.emote_pages[page][source].take();
+            let displaced = std::mem::replace(&mut self.emote_pages[self.wheel_page][slot], emote);
+            self.emote_pages[page][source] = displaced;
+            self.feedback = None;
+        }
+        self.wheel_slot = slot;
+        cx.notify();
+    }
+
+    fn set_wheel_slot(&mut self, emote: Option<WheelEmote>, cx: &mut Context<Self>) {
+        self.emote_pages[self.wheel_page][self.wheel_slot] = emote;
+        self.swap_source = None;
+        self.feedback = None;
+        cx.notify();
+    }
+
+    fn wheel_layout(&self, cx: &Context<Self>) -> Div {
+        let desktop = cx.global::<Desktop>();
+        let library = desktop.library.read(cx);
+        let theme = cx.theme();
+        let page = self.wheel_page;
+        let count = self.emote_pages.len();
+        let slots = &self.emote_pages[page];
+        let direction = SLOT_DIRECTIONS[self.wheel_slot];
+        let selected = slots[self.wheel_slot];
+        let (name, _) = wheel_emote_preview(selected, desktop, library);
+
+        // Match the overlay's clockwise sector order while keeping the center unassigned.
+        // 按悬浮轮盘的顺时针扇区顺序排列，中心不分配表情。
+        let grid = div().flex().flex_col().gap_2().max_w(rems(24.)).children(
+            [
+                [Some(7), Some(0), Some(1)],
+                [Some(6), None, Some(2)],
+                [Some(5), Some(4), Some(3)],
+            ]
+            .map(|row| {
+                div().flex().gap_2().children(row.map(|slot| {
+                    div().flex_1().min_w_0().when_some(slot, |cell, slot| {
+                        let (name, image) = wheel_emote_preview(slots[slot], desktop, library);
+                        let direction = SLOT_DIRECTIONS[slot];
+                        let label = format!("{direction} · {name}");
+                        cell.child(
+                            Button::new(("wheel-slot", slot))
+                                .outline()
+                                .w_full()
+                                .h(rems(3.5))
+                                .selected(self.wheel_slot == slot)
+                                .toggled(self.wheel_slot == slot)
+                                .accessibility_label(label.clone())
+                                .tooltip(label)
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(div().size_6().when_some(image, |preview, image| {
+                                            preview.child(
+                                                img(image).size_6().object_fit(ObjectFit::Contain),
+                                            )
+                                        }))
+                                        .child(div().text_xs().child(direction)),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.select_wheel_slot(slot, cx)
+                                })),
+                        )
+                    })
+                }))
+            }),
+        );
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("表情轮盘布局"),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child("打开表情轮盘后，向下滚动翻到下一页，向上滚动返回上一页。"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("previous-wheel-page")
+                            .small()
+                            .label("上一页")
+                            .disabled(page == 0)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_wheel_page(this.wheel_page - 1, cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .child(format!("第 {} / {} 页", page + 1, count)),
+                    )
+                    .child(
+                        Button::new("next-wheel-page")
+                            .small()
+                            .label("下一页")
+                            .disabled(page + 1 == count)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_wheel_page(this.wheel_page + 1, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("add-wheel-page")
+                            .small()
+                            .label("新增页")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.emote_pages.push([None; 8]);
+                                this.feedback = None;
+                                this.show_wheel_page(this.emote_pages.len() - 1, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("remove-wheel-page")
+                            .small()
+                            .ghost()
+                            .label("移除本页")
+                            .disabled(count == 1)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.emote_pages.remove(this.wheel_page);
+                                this.swap_source = None;
+                                this.feedback = None;
+                                this.show_wheel_page(
+                                    this.wheel_page.min(this.emote_pages.len() - 1),
+                                    cx,
+                                );
+                            })),
+                    ),
+            )
+            .child(grid)
+            .child(
+                div()
+                    .text_sm()
+                    .child(if let Some((page, slot)) = self.swap_source {
+                        format!(
+                            "已选中第 {} 页的「{}」，请选择目标槽位。",
+                            page + 1,
+                            SLOT_DIRECTIONS[slot]
+                        )
+                    } else {
+                        format!("{direction} · {name}")
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(self.wheel_emote_picker(selected, cx))
+                    .child(
+                        Button::new("swap-wheel-slots")
+                            .small()
+                            .ghost()
+                            .label(if self.swap_source.is_some() {
+                                "取消交换"
+                            } else {
+                                "交换位置"
+                            })
+                            .disabled(selected.is_none() && self.swap_source.is_none())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.swap_source.take().is_none() {
+                                    this.swap_source = Some((this.wheel_page, this.wheel_slot));
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("remove-wheel-emote")
+                            .small()
+                            .ghost()
+                            .label("移出此槽位")
+                            .disabled(selected.is_none())
+                            .on_click(cx.listener(|this, _, _, cx| this.set_wheel_slot(None, cx))),
+                    )
+                    .child(
+                        Button::new("import-wheel-emote")
+                            .small()
+                            .ghost()
+                            .label("导入图片…")
+                            .loading(library.task.is_some())
+                            .on_click({
+                                let library = desktop.library.clone();
+                                move |_, _, cx| library.update(cx, LocalEmotes::import)
+                            }),
+                    ),
+            )
+            .when_some(library.error.clone(), |panel, error| {
+                panel.child(div().text_sm().text_color(theme.danger).child(error))
+            })
+    }
+
+    fn wheel_emote_picker(&self, selected: Option<WheelEmote>, cx: &Context<Self>) -> Popover {
+        let owner = cx.weak_entity();
+        let page = self.wheel_page;
+        let slot = self.wheel_slot;
+        Popover::new("choose-wheel-emote")
+            .anchor(Anchor::BottomLeft)
+            .trigger(
+                Button::new("choose-wheel-emote")
+                    .small()
+                    .label(if selected.is_some() {
+                        "更换表情…"
+                    } else {
+                        "添加表情…"
+                    }),
+            )
+            .content(move |_, _, cx| {
+                let desktop = cx.global::<Desktop>();
+                let library = desktop.library.read(cx);
+                let popup = cx.weak_entity();
+                let button = |emote| {
+                    let (name, image) = wheel_emote_preview(Some(emote), desktop, library);
+                    let id: ElementId = match emote {
+                        WheelEmote::BuiltIn(index) => ("built-in", index).into(),
+                        WheelEmote::Custom(id) => SharedString::from(id.to_string()).into(),
+                    };
+                    let owner = owner.clone();
+                    let popup = popup.clone();
+                    Button::new(id)
+                        .ghost()
+                        .selected(selected == Some(emote))
+                        .accessibility_label(name.clone())
+                        .tooltip(name)
+                        .children(
+                            image.map(|image| img(image).size_6().object_fit(ObjectFit::Contain)),
+                        )
+                        .on_click(move |_, window, cx| {
+                            let _ = owner.update(cx, |this, cx| {
+                                if (this.wheel_page, this.wheel_slot) == (page, slot) {
+                                    this.set_wheel_slot(Some(emote), cx);
+                                }
+                            });
+                            let _ = popup.update(cx, |state, cx| state.dismiss(window, cx));
+                        })
+                };
+                div()
+                    .w_64()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(div().text_sm().child("内置表情"))
+                    .child(div().flex().flex_wrap().gap_1().children(
+                        (0..EMOTES.len()).map(|index| button(WheelEmote::BuiltIn(index))),
+                    ))
+                    .when(!library.entries.is_empty(), |panel| {
+                        panel
+                            .child(
+                                div()
+                                    .border_t_1()
+                                    .border_color(cx.theme().border)
+                                    .pt_2()
+                                    .text_sm()
+                                    .child("已导入的表情"),
+                            )
+                            .child(
+                                div()
+                                    .id("wheel-custom-emotes")
+                                    .max_h(rems(8.))
+                                    .child(
+                                        div().flex().flex_wrap().gap_1().children(
+                                            library.entries.iter().map(|emote| {
+                                                button(WheelEmote::Custom(emote.id()))
+                                            }),
+                                        ),
+                                    )
+                                    .overflow_y_scrollbar(),
+                            )
+                    })
+            })
+    }
+
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         close_to_tray(window, cx);
         let model = cx.global::<Desktop>().model.clone();
@@ -1112,6 +1517,7 @@ impl Settings {
             triggers,
             remote_overlay,
             overlay,
+            emote_pages,
             ..
         } = model.read(cx).profile.clone();
         let name = cx.new(|cx| InputState::new(window, cx).default_value(name));
@@ -1140,6 +1546,7 @@ impl Settings {
             cx.new(|_| setting_slider(ANIMATION_TIMEOUT, 100, overlay.emote_timeout_ms));
         let volume = cx.new(|_| setting_slider(SOUND_VOLUME, 1, overlay.volume));
         let capture_focus = cx.focus_handle();
+        let library = cx.global::<Desktop>().library.clone();
         let mut subscriptions = vec![
             cx.on_blur(&capture_focus, window, |this: &mut Self, _, cx| {
                 this.end_capture(cx)
@@ -1155,6 +1562,7 @@ impl Settings {
                 }
             }),
             cx.observe(&model, |_, _, cx| cx.notify()),
+            cx.observe(&library, |_, _, cx| cx.notify()),
             cx.subscribe_in(&ip, window, |this, _, event, _, cx| {
                 if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
                     this.connect(false, cx);
@@ -1179,12 +1587,17 @@ impl Settings {
         );
         Self {
             model,
+            category: SettingsCategory::General,
             name,
             ip,
             port,
             sound,
             gestures,
             triggers,
+            emote_pages,
+            wheel_page: 0,
+            wheel_slot: 0,
+            swap_source: None,
             recording: None,
             capture_focus,
             capture_paused: cx.global::<Desktop>().capture_paused.clone(),
@@ -1235,7 +1648,7 @@ impl Settings {
                 &self.triggers.emote_key,
             ),
         };
-        let row = div().flex().items_center().gap_2().child(
+        let row = div().flex().flex_wrap().items_center().gap_2().child(
             Switch::new(id)
                 .label(label)
                 .checked(enabled)
@@ -1291,8 +1704,10 @@ impl Settings {
         profile.name = self.name.read(cx).value().trim().to_owned();
         profile.sound = self.sound;
         let input_changed = profile.gestures != self.gestures || profile.triggers != self.triggers;
+        let wheel_changed = profile.emote_pages != self.emote_pages;
         profile.gestures = self.gestures;
         profile.triggers = self.triggers.clone();
+        profile.emote_pages.clone_from(&self.emote_pages);
         profile.remote_overlay = self.remote_overlay;
         profile.overlay = self.overlay_settings(cx);
         let result = self.model.update(cx, |model, cx| {
@@ -1302,6 +1717,9 @@ impl Settings {
         });
         self.feedback = Some(match result {
             Ok(()) => {
+                if wheel_changed {
+                    refresh_wheel_posters(cx);
+                }
                 if input_changed {
                     cx.update_global::<Desktop, _>(|desktop, _| {
                         desktop.monitor = None;
@@ -1387,6 +1805,29 @@ impl Settings {
     }
 }
 
+fn wheel_emote_preview(
+    emote: Option<WheelEmote>,
+    desktop: &Desktop,
+    library: &LocalEmotes,
+) -> (String, Option<ImageSource>) {
+    match emote {
+        Some(WheelEmote::BuiltIn(index)) => (
+            EMOTES[index].name.into(),
+            Some(desktop.emotes[index].clone().into()),
+        ),
+        Some(WheelEmote::Custom(id)) => (
+            library
+                .entries
+                .iter()
+                .find(|emote| emote.id() == id)
+                .map_or("自定义表情", LibraryEmote::name)
+                .into(),
+            Some(library.store.poster(id).into()),
+        ),
+        None => ("空槽位".into(), None),
+    }
+}
+
 fn setting_slider(range: RangeInclusive<u32>, step: u32, value: u32) -> SliderState {
     // Each bound setter clamps the current value, so expand the upper bound first.
     // 每次设置边界都会限制当前值，因此先扩大上限。
@@ -1416,8 +1857,8 @@ fn slider_field(label: &'static str, value: String, slider: Slider) -> Div {
         .child(slider)
 }
 
-impl Render for Settings {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl Settings {
+    fn room_settings(&self, cx: &Context<Self>) -> Div {
         let model = self.model.read(cx);
         let connection = model.connection();
         let busy = self.connecting.is_some();
@@ -1425,26 +1866,8 @@ impl Render for Settings {
             .connection_error
             .clone()
             .or_else(|| (!busy).then(|| model.room_error.clone()).flatten());
-        let active = model.input_ready;
-        let incoming_muted = model.profile.incoming_muted();
-        #[cfg(target_os = "macos")]
-        let capture_access = model.profile.gestures && model.profile.triggers.captures_mouse();
-        #[cfg(target_os = "macos")]
-        let permission_hint = if capture_access {
-            "轮盘拦截鼠标事件需要「隐私与安全性 → 辅助功能」权限。授权后请重新检测。"
-        } else {
-            "请在系统设置的「隐私与安全性 → 输入监控」中授权，再重试。"
-        };
-        #[cfg(not(target_os = "macos"))]
-        let permission_hint = "全局输入监听未启动。";
-        let theme = cx.theme().clone();
-        let overlay = self.overlay_settings(cx);
-        let content = div().id("settings-scroll").flex_1().min_h_0().overflow_y_scroll().p_5().flex().flex_col().gap_5()
-            .child(div().flex().flex_col().gap_2()
-                .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child("昵称"))
-                .child(Input::new(&self.name)))
-            .child(div().flex().flex_col().gap_2().border_t_1().border_color(theme.border).pt_4()
-                .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child("局域网房间"))
+        let theme = cx.theme();
+        div().flex().flex_col().gap_2()
                 .child(div().text_sm().text_color(theme.muted_foreground).child(if cfg!(target_os = "windows") {
                     "主机用 ipconfig 查找本机 IPv4，填入地址和端口后创建房间。好友用相同地址和端口连接。"
                 } else {
@@ -1474,9 +1897,25 @@ impl Render for Settings {
                 .when_some(connection, |group, config| group
                     .child(div().text_sm().text_color(theme.muted_foreground).child(format!("{} · {}", if matches!(config, RoomConfig::Host(_)) { "正在监听" } else { "已连接" }, config.address()))))
                 .when_some(room_error, |group, error| group
-                    .child(div().text_sm().text_color(theme.danger).child(error))))
-            .child(div().flex().flex_col().gap_3().border_t_1().border_color(theme.border).pt_4()
-                .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child("桌面轮盘"))
+                    .child(div().text_sm().text_color(theme.danger).child(error)))
+    }
+
+    fn wheel_shortcuts(&self, cx: &Context<Self>) -> Div {
+        let model = self.model.read(cx);
+        let active = model.input_ready;
+        #[cfg(target_os = "macos")]
+        let capture_access = model.profile.gestures && model.profile.triggers.captures_mouse();
+        #[cfg(target_os = "macos")]
+        let permission_hint = if capture_access {
+            "轮盘拦截鼠标事件需要「隐私与安全性 → 辅助功能」权限。授权后请重新检测。"
+        } else {
+            "请在系统设置的「隐私与安全性 → 输入监控」中授权，再重试。"
+        };
+        #[cfg(not(target_os = "macos"))]
+        let permission_hint = "全局输入监听未启动。";
+        let theme = cx.theme();
+        div().flex().flex_col().gap_3().border_t_1().border_color(theme.border).pt_4()
+                .child(div().font_weight(FontWeight::SEMIBOLD).child("轮盘快捷键"))
                 .child(div().text_sm().text_color(theme.muted_foreground).child("键盘触发时，按住快捷键并用左键拖动。鼠标侧键可直接按住拖动，松开确认；拖回中心可取消。"))
                 .child(Switch::new("gestures").label("启用全局轮盘").checked(self.gestures)
                     .on_change(cx.listener(|this, value, _, cx| { this.gestures = *value; cx.notify(); })))
@@ -1488,48 +1927,229 @@ impl Render for Settings {
                 .when(!active, |group| group
                     .child(div().text_sm().text_color(theme.muted_foreground).child(permission_hint))
                     .child({
-                        let row = div().flex().gap_2();
+                        let row = div().flex().flex_wrap().gap_2();
                         #[cfg(target_os = "macos")]
                         let row = row.child(Button::new("permission").label(if capture_access { "请求辅助功能权限…" } else { "请求输入监控权限…" }).on_click(move |_, _, _| platform::request_input_access(capture_access)));
                         row.child(Button::new("retry").ghost().label("重新检测").on_click(cx.listener(|this, _, _, cx| this.retry_input(cx))))
-                    })))
-            .child(div().flex().flex_col().gap_3().border_t_1().border_color(theme.border).pt_4()
-                .child(div().flex().items_center().justify_between().gap_2()
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("桌面动画"))
-                    .child(Button::new("preview-ping").label("预览信号")
-                        .on_click(cx.listener(|this, _, _, cx| this.preview(Wheel::Ping, cx)))))
-                .child(div().flex().gap_5()
-                    .child(slider_field("信号大小", format!("{} px", overlay.ping_size), Slider::new(&self.ping_size)))
-                    .child(slider_field("信号停留时长", format!("{:.1} 秒", overlay.ping_timeout_ms as f32 / 1000.), Slider::new(&self.ping_timeout))))
-                .child(div().flex().items_center().justify_between().gap_2()
+                    }))
+    }
+
+    fn animation_settings(&self, cx: &Context<Self>) -> Div {
+        let incoming_muted = self.model.read(cx).profile.incoming_muted();
+        let theme = cx.theme();
+        let overlay = self.overlay_settings(cx);
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("信号"))
+                    .child(
+                        Button::new("preview-ping")
+                            .label("预览信号")
+                            .on_click(cx.listener(|this, _, _, cx| this.preview(Wheel::Ping, cx))),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_5()
+                    .child(slider_field(
+                        "信号大小",
+                        format!("{} px", overlay.ping_size),
+                        Slider::new(&self.ping_size),
+                    ))
+                    .child(slider_field(
+                        "信号停留时长",
+                        format!("{:.1} 秒", overlay.ping_timeout_ms as f32 / 1000.),
+                        Slider::new(&self.ping_timeout),
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
                     .child(div().font_weight(FontWeight::SEMIBOLD).child("表情"))
-                    .child(Button::new("preview-emote").label("预览表情")
-                        .on_click(cx.listener(|this, _, _, cx| this.preview(Wheel::Emote, cx)))))
-                .child(div().flex().gap_5()
-                    .child(slider_field("表情大小", format!("{} px", overlay.emote_size), Slider::new(&self.emote_size)))
-                    .child(slider_field("表情停留时长", format!("{:.1} 秒", overlay.emote_timeout_ms as f32 / 1000.), Slider::new(&self.emote_timeout))))
-                .child(Switch::new("room-overlay").label("在桌面播放房间信号和表情").checked(self.remote_overlay)
-                    .on_change(cx.listener(|this, value, _, cx| { this.remote_overlay = *value; cx.notify(); })))
-                .child(div().flex().flex_col().gap_1()
-                    .child(Switch::new("incoming-mute").label("静音").checked(incoming_muted)
-                        .on_change(cx.listener(|this, value, _, cx| {
-                            this.feedback = set_incoming_muted(*value, cx)
-                                .err()
-                                .map(|error| (false, format!("无法切换静音：{error:#}")));
-                            cx.notify();
-                        })))
-                    .child(div().text_sm().text_color(theme.muted_foreground)
-                        .child("开启后立即生效，收到的内容仅显示在聊天和历史记录中。"))))
-            .child(div().flex().flex_col().gap_3().border_t_1().border_color(theme.border).pt_4()
-                .child(div().font_weight(FontWeight::SEMIBOLD).child("音效"))
-                .child(Switch::new("sound").label("播放音效").checked(self.sound)
-                    .on_change(cx.listener(|this, value, _, cx| { this.sound = *value; cx.notify(); })))
-                .child(slider_field("音量", format!("{}%", overlay.volume), Slider::new(&self.volume).disabled(!self.sound)))
-                .child(div().flex().flex_wrap().gap_5()
-                    .child(Switch::new("emote-sound").label("表情音效").checked(self.emote_sound).disabled(!self.sound)
-                        .on_change(cx.listener(|this, value, _, cx| { this.emote_sound = *value; cx.notify(); })))
-                    .child(Switch::new("wheel-sound").label("轮盘提示音").checked(self.wheel_sound).disabled(!self.sound)
-                        .on_change(cx.listener(|this, value, _, cx| { this.wheel_sound = *value; cx.notify(); })))));
+                    .child(
+                        Button::new("preview-emote")
+                            .label("预览表情")
+                            .on_click(cx.listener(|this, _, _, cx| this.preview(Wheel::Emote, cx))),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_5()
+                    .child(slider_field(
+                        "表情大小",
+                        format!("{} px", overlay.emote_size),
+                        Slider::new(&self.emote_size),
+                    ))
+                    .child(slider_field(
+                        "表情停留时长",
+                        format!("{:.1} 秒", overlay.emote_timeout_ms as f32 / 1000.),
+                        Slider::new(&self.emote_timeout),
+                    )),
+            )
+            .child(
+                Switch::new("room-overlay")
+                    .label("在桌面播放房间信号和表情")
+                    .checked(self.remote_overlay)
+                    .on_change(cx.listener(|this, value, _, cx| {
+                        this.remote_overlay = *value;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        Switch::new("incoming-mute")
+                            .label("静音")
+                            .checked(incoming_muted)
+                            .on_change(cx.listener(|this, value, _, cx| {
+                                this.feedback = set_incoming_muted(*value, cx)
+                                    .err()
+                                    .map(|error| (false, format!("无法切换静音：{error:#}")));
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child("开启后立即生效，收到的内容仅显示在聊天和历史记录中。"),
+                    ),
+            )
+    }
+
+    fn sound_settings(&self, cx: &Context<Self>) -> Div {
+        let overlay = self.overlay_settings(cx);
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                Switch::new("sound")
+                    .label("播放音效")
+                    .checked(self.sound)
+                    .on_change(cx.listener(|this, value, _, cx| {
+                        this.sound = *value;
+                        cx.notify();
+                    })),
+            )
+            .child(slider_field(
+                "音量",
+                format!("{}%", overlay.volume),
+                Slider::new(&self.volume).disabled(!self.sound),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_5()
+                    .child(
+                        Switch::new("emote-sound")
+                            .label("表情音效")
+                            .checked(self.emote_sound)
+                            .disabled(!self.sound)
+                            .on_change(cx.listener(|this, value, _, cx| {
+                                this.emote_sound = *value;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Switch::new("wheel-sound")
+                            .label("轮盘提示音")
+                            .checked(self.wheel_sound)
+                            .disabled(!self.sound)
+                            .on_change(cx.listener(|this, value, _, cx| {
+                                this.wheel_sound = *value;
+                                cx.notify();
+                            })),
+                    ),
+            )
+    }
+}
+
+impl Render for Settings {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let sidebar = div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .w_32()
+            .gap_1()
+            .p_3()
+            .border_r_1()
+            .border_color(theme.border)
+            .bg(theme.sidebar)
+            .children(SettingsCategory::ALL.map(|category| {
+                Button::new(("settings-category", category as usize))
+                    .ghost()
+                    .selected(self.category == category)
+                    .toggled(self.category == category)
+                    .accessibility_label(category.label())
+                    .child(div().w_full().text_left().child(category.label()))
+                    .w_full()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.end_capture(cx);
+                        if this.category != category {
+                            this.swap_source = None;
+                        }
+                        this.category = category;
+                        cx.notify();
+                    }))
+            }));
+        let panel = match self.category {
+            SettingsCategory::General => div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(div().text_sm().child("昵称"))
+                .child(Input::new(&self.name)),
+            SettingsCategory::Room => self.room_settings(cx),
+            SettingsCategory::Wheel => div()
+                .flex()
+                .flex_col()
+                .gap_5()
+                .child(self.wheel_layout(cx))
+                .child(self.wheel_shortcuts(cx)),
+            SettingsCategory::Animation => self.animation_settings(cx),
+            SettingsCategory::Sound => self.sound_settings(cx),
+        };
+        let content = div().flex().flex_1().min_h_0().child(sidebar).child(
+            div()
+                .id(("settings-scroll", self.category as usize))
+                .flex_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .p_5()
+                        .flex()
+                        .flex_col()
+                        .gap_5()
+                        .child(
+                            div()
+                                .text_lg()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(self.category.label()),
+                        )
+                        .child(panel),
+                )
+                .overflow_y_scrollbar(),
+        );
+
         div()
             .track_focus(&self.capture_focus)
             .when(self.recording.is_some(), |root| {

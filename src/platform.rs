@@ -1,6 +1,7 @@
 //! Platform selection and shared media decoding and audio playback.
 //! 平台后端选择，以及共用的媒体解码与音频播放。
 
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::time::Duration;
@@ -10,11 +11,26 @@ use rodio::{Decoder, DeviceSinkBuilder, Player};
 use crate::assets::{EMOTES, PINGS, WHEEL_TICK};
 use crate::emotes::{EmoteId, EmoteStore};
 use crate::gesture::Wheel;
-use crate::model::OverlaySettings;
+use crate::model::{EmotePage, OverlaySettings, WheelEmote};
 
 mod playback;
 pub(crate) use playback::{Animation, AnimationOverlay};
 mod wheel;
+pub(crate) use wheel::load_wheel_posters;
+
+pub(crate) enum WheelContents {
+    Ping,
+    Emote(Vec<EmotePage>),
+}
+
+impl WheelContents {
+    fn kind(&self) -> Wheel {
+        match self {
+            Self::Ping => Wheel::Ping,
+            Self::Emote(_) => Wheel::Emote,
+        }
+    }
+}
 
 enum AudioCue {
     Clip(Wheel, usize, f32),
@@ -31,16 +47,43 @@ mod windows;
 pub(crate) use windows::*;
 
 impl Overlay {
+    pub(crate) fn set_wheel_posters(
+        &mut self,
+        posters: HashMap<EmoteId, tiny_skia::Pixmap>,
+        cx: &gpui_kit::App,
+    ) {
+        self.wheel_view.set_posters(posters, cx);
+    }
+
+    pub(crate) fn turn_wheel_page(
+        &mut self,
+        steps: i32,
+        selected: Option<usize>,
+        tick_volume: Option<f32>,
+        cx: &gpui_kit::App,
+    ) {
+        if self.wheel_view.turn_page(steps, selected, cx)
+            && let Some(volume) = tick_volume
+        {
+            let _ = self.audio.try_send(AudioCue::Tick(volume));
+        }
+    }
+
+    pub(crate) fn wheel_emote(&self, slot: usize) -> Option<WheelEmote> {
+        self.wheel_view.emote(slot)
+    }
+
     pub(crate) fn play_custom(
         &mut self,
         store: EmoteStore,
         id: EmoteId,
+        local: Option<crate::gesture::Position>,
         settings: OverlaySettings,
         cx: &gpui_kit::App,
     ) {
         let timeout = Duration::from_millis(u64::from(settings.emote_timeout_ms));
         let animation = Animation::custom(store, id, settings.emote_size, timeout);
-        self.animations.play(animation, None, None, cx);
+        self.animations.play(animation, local, None, cx);
     }
 
     pub(crate) fn play(

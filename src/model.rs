@@ -13,7 +13,7 @@ use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
-use crate::assets::{EMOTES, PINGS};
+use crate::assets::{DEFAULT_EMOTE_SLOTS, EMOTES, PINGS};
 use crate::emotes::{EmoteId, EmoteStore};
 use crate::room::{Room, RoomConfig};
 
@@ -162,6 +162,18 @@ impl OverlaySettings {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum WheelEmote {
+    BuiltIn(usize),
+    Custom(EmoteId),
+}
+
+pub(crate) type EmotePage = [Option<WheelEmote>; DEFAULT_EMOTE_SLOTS.len()];
+
+fn default_emote_pages() -> Vec<EmotePage> {
+    vec![DEFAULT_EMOTE_SLOTS.map(|index| Some(WheelEmote::BuiltIn(index)))]
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Profile {
     pub(crate) id: Uuid,
@@ -177,9 +189,23 @@ pub(crate) struct Profile {
     incoming_muted: bool,
     #[serde(default)]
     pub(crate) overlay: OverlaySettings,
+    #[serde(default = "default_emote_pages")]
+    pub(crate) emote_pages: Vec<EmotePage>,
 }
 
 impl Profile {
+    fn normalize(&mut self) {
+        self.overlay.normalize();
+        if self.emote_pages.is_empty() {
+            self.emote_pages = default_emote_pages();
+        }
+        for slot in self.emote_pages.iter_mut().flatten() {
+            if matches!(slot, Some(WheelEmote::BuiltIn(index)) if *index >= EMOTES.len()) {
+                *slot = None;
+            }
+        }
+    }
+
     pub(crate) fn incoming_muted(&self) -> bool {
         self.incoming_muted
     }
@@ -201,6 +227,7 @@ impl Default for Profile {
             remote_overlay: true,
             incoming_muted: false,
             overlay: OverlaySettings::default(),
+            emote_pages: default_emote_pages(),
         }
     }
 }
@@ -276,7 +303,7 @@ impl Model {
                 profile
             }
         };
-        profile.overlay.normalize();
+        profile.normalize();
         let mut history: VecDeque<Entry> = load_json(&history_path)
             .context("无法读取历史记录")?
             .unwrap_or_default();
@@ -379,7 +406,7 @@ impl Model {
                     .same_key(&profile.triggers.emote_key)),
             "信号和表情同时启用时，请选择不同的快捷键"
         );
-        profile.overlay.normalize();
+        profile.normalize();
         save_json(&self.data_dir.join("settings.json"), &profile).context("无法保存设置")?;
         self.profile = profile;
         Ok(())
@@ -468,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_profiles_use_defaults_for_playback_settings() {
+    fn legacy_profiles_use_defaults_for_playback_settings_and_emote_pages() {
         let profile = Profile {
             sound: false,
             ..Profile::default()
@@ -477,11 +504,29 @@ mod tests {
         let fields = legacy.as_object_mut().unwrap();
         fields.remove("overlay");
         fields.remove("incoming_muted");
+        fields.remove("emote_pages");
         let loaded: Profile = serde_json::from_value(legacy).unwrap();
         assert_eq!(loaded.overlay, OverlaySettings::default());
         assert!(loaded.overlay.with_sound(loaded.sound).volume().is_none());
         assert!(!loaded.incoming_muted());
         assert!(loaded.plays_incoming_effects());
+        assert_eq!(loaded.emote_pages, default_emote_pages());
+    }
+
+    #[test]
+    fn wheel_pages_round_trip_slots_without_reindexing_built_in_emotes() {
+        let mut page = [None; 8];
+        page[2] = Some(WheelEmote::BuiltIn(12));
+        page[4] = Some(WheelEmote::BuiltIn(EMOTES.len()));
+        let profile = Profile {
+            emote_pages: vec![[None; 8], page],
+            ..Profile::default()
+        };
+        let mut loaded: Profile =
+            serde_json::from_slice(&serde_json::to_vec(&profile).unwrap()).unwrap();
+        loaded.normalize();
+        page[4] = None;
+        assert_eq!(loaded.emote_pages, vec![[None; 8], page]);
     }
 
     #[test]

@@ -17,6 +17,7 @@ pub(crate) enum Wheel {
 pub(crate) enum GestureEvent {
     Open(Wheel, Position, Option<usize>),
     Select(Option<usize>),
+    Page(i32, Option<usize>),
     Finish(Option<(Wheel, usize, Position)>),
 }
 
@@ -107,6 +108,7 @@ pub(crate) enum InputEvent {
     Left(bool),
     OtherButton(u8, bool),
     Move,
+    Scroll(i32),
     Interrupt,
 }
 
@@ -215,6 +217,7 @@ impl WheelInput {
                 }
             }
             InputEvent::Move => Pointer::Move,
+            InputEvent::Scroll(delta) => Pointer::Scroll(delta),
             _ => Pointer::Key,
         };
         self.suppressed |= paused
@@ -267,7 +270,7 @@ impl WheelInput {
         if was_open || self.gesture.visible {
             delivery = match event {
                 InputEvent::Move => MouseDelivery::WheelMove,
-                InputEvent::Interrupt => MouseDelivery::Swallow,
+                InputEvent::Scroll(_) | InputEvent::Interrupt => MouseDelivery::Swallow,
                 _ => delivery,
             };
         }
@@ -289,6 +292,7 @@ pub(crate) enum Pointer {
     Down,
     Up,
     Move,
+    Scroll(i32),
     Key,
 }
 
@@ -298,10 +302,12 @@ pub(crate) struct Gesture {
     visible: bool,
     selected: Option<usize>,
     scale: f64,
+    scroll_remainder: i32,
 }
 
 pub(crate) const WHEEL_SIZE: u32 = 600;
 pub(crate) const INNER_RADIUS: f64 = 86.0;
+pub(crate) const SCROLL_STEP: i32 = 120;
 const OPEN_DISTANCE: f64 = 8.0;
 
 // Sector zero is up. Screen coordinates increase downward, and sectors advance clockwise.
@@ -357,6 +363,22 @@ impl Gesture {
                 Vec::new()
             };
         }
+        if let Pointer::Scroll(delta) = action {
+            if !self.visible || owner != Wheel::Emote {
+                return Vec::new();
+            }
+            // Accumulate high-resolution scroll input into whole wheel steps.
+            // 累积高精度滚动输入，达到一个滚轮刻度时再翻页。
+            let total = self.scroll_remainder.saturating_add(delta);
+            let steps = total / SCROLL_STEP;
+            self.scroll_remainder = total % SCROLL_STEP;
+            if steps != 0 {
+                let selected = sector(origin, cursor, self.scale);
+                self.selected = selected;
+                return vec![GestureEvent::Page(steps, selected)];
+            }
+            return Vec::new();
+        }
         if action != Pointer::Move {
             return Vec::new();
         }
@@ -377,6 +399,45 @@ impl Gesture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scrolling_only_turns_open_emote_wheels_and_release_uses_final_coordinates() {
+        let mut state = WheelInput::default();
+        let mut event = |input, x| {
+            state.event(
+                &Triggers::default(),
+                CTRL,
+                input,
+                Position { x, y: 0. },
+                false,
+                || 1.,
+            )
+        };
+        let partial = InputEvent::Scroll(SCROLL_STEP / 2);
+        assert_eq!(event(InputEvent::Left(true), 0.).1, MouseDelivery::HoldDown);
+        assert_eq!(event(partial, 0.), (vec![], MouseDelivery::Pass));
+        assert_eq!(event(InputEvent::Move, 100.).1, MouseDelivery::WheelMove);
+        assert_eq!(event(partial, 100.), (vec![], MouseDelivery::Swallow));
+        assert_eq!(
+            event(partial, 100.),
+            (vec![GestureEvent::Page(1, Some(2))], MouseDelivery::Swallow)
+        );
+        assert_eq!(
+            event(InputEvent::Scroll(-SCROLL_STEP), 100.),
+            (
+                vec![GestureEvent::Page(-1, Some(2))],
+                MouseDelivery::Swallow
+            )
+        );
+        assert!(matches!(
+            event(InputEvent::Left(false), -100.),
+            (updates, MouseDelivery::Swallow) if matches!(updates.as_slice(), [GestureEvent::Finish(Some((Wheel::Emote, 6, _)))])
+        ));
+        assert_eq!(
+            event(InputEvent::Scroll(SCROLL_STEP), -100.),
+            (vec![], MouseDelivery::Pass)
+        );
+    }
 
     #[test]
     fn keyboard_drag_consumes_open_move_selection_and_release() {

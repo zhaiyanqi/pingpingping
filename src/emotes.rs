@@ -21,7 +21,7 @@ const MAX_FRAMES: usize = 240;
 const MAX_ANIMATION_PIXELS: u64 = 64 * 1024 * 1024;
 const POSTER_SIZE: u32 = 128;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub(crate) struct EmoteId([u8; 32]);
 
 impl EmoteId {

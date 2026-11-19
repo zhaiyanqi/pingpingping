@@ -2,6 +2,7 @@
 //! 两个平台共用的原生轮盘绘制与可打断动画。
 
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -11,8 +12,11 @@ use tiny_skia::{
     PixmapPaint, Point, RadialGradient, SpreadMode, Stroke, Transform,
 };
 
-use crate::assets::{EMOTE_HUB, EMOTE_WHEEL, EMOTES, PINGS};
+use super::WheelContents;
+use crate::assets::{EMOTE_HUB, EMOTES, PINGS};
+use crate::emotes::{EmoteId, EmoteStore};
 use crate::gesture::{INNER_RADIUS, WHEEL_SIZE, Wheel};
+use crate::model::{EmotePage, WheelEmote};
 
 const CENTER: f32 = WHEEL_SIZE as f32 / 2.0;
 const INNER: f32 = INNER_RADIUS as f32;
@@ -134,13 +138,61 @@ impl Motion {
 }
 
 struct Active {
-    kind: Wheel,
+    contents: WheelContents,
+    page: usize,
     motion: Motion,
     present: Present,
 }
 
+impl Active {
+    fn turn_page(&mut self, steps: i32) -> bool {
+        let WheelContents::Emote(pages) = &self.contents else {
+            return false;
+        };
+        let previous = self.page;
+        self.page = (previous as i64 + i64::from(steps)).rem_euclid(pages.len() as i64) as usize;
+        self.page != previous
+    }
+
+    fn frame(&self) -> WheelFrame {
+        match &self.contents {
+            WheelContents::Ping => WheelFrame::ping(),
+            WheelContents::Emote(pages) => WheelFrame {
+                kind: Wheel::Emote,
+                slots: pages[self.page],
+                page: self.page,
+                page_count: pages.len(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct WheelFrame {
+    kind: Wheel,
+    slots: EmotePage,
+    page: usize,
+    page_count: usize,
+}
+
+impl WheelFrame {
+    fn ping() -> Self {
+        Self {
+            kind: Wheel::Ping,
+            slots: [None; 8],
+            page: 0,
+            page_count: 1,
+        }
+    }
+
+    fn occupied(self, selected: Option<usize>) -> Option<usize> {
+        selected.filter(|&slot| self.kind == Wheel::Ping || self.slots[slot].is_some())
+    }
+}
+
 pub(super) struct WheelView {
     art: Rc<WheelArt>,
+    posters: Rc<HashMap<EmoteId, Pixmap>>,
     canvas: Option<Rc<RefCell<Canvas>>>,
     active: Option<Active>,
     task: Option<Task<()>>,
@@ -150,6 +202,7 @@ impl WheelView {
     pub(super) fn new(size: u32) -> Self {
         Self {
             art: Rc::new(WheelArt::new(size)),
+            posters: Rc::default(),
             canvas: None,
             active: None,
             task: None,
@@ -158,12 +211,12 @@ impl WheelView {
 
     pub(super) fn open(
         &mut self,
-        kind: Wheel,
+        contents: WheelContents,
         size: u32,
         selected: Option<usize>,
         present: Present,
         cx: &App,
-    ) {
+    ) -> bool {
         self.task.take();
         if self.art.size != size {
             self.art = Rc::new(WheelArt::new(size));
@@ -174,30 +227,62 @@ impl WheelView {
         if let Some(previous) = self
             .active
             .as_ref()
-            .filter(|previous| previous.kind == kind)
+            .filter(|previous| previous.contents.kind() == contents.kind())
         {
             motion = previous.motion.clone();
         }
         motion.visibility.animate(1.0, WHEEL_TIME, true, now);
-        motion.select(selected, now);
-        self.active = Some(Active {
-            kind,
+        let mut active = Active {
+            contents,
+            page: 0,
             motion,
             present,
-        });
+        };
+        let selected = active.frame().occupied(selected);
+        active.motion.select(selected, now);
+        self.active = Some(active);
         self.draw(cx);
+        selected.is_some()
     }
 
     pub(super) fn select(&mut self, selected: Option<usize>, cx: &App) -> bool {
         let Some(active) = self.active.as_mut() else {
             return false;
         };
+        let selected = active.frame().occupied(selected);
         if active.motion.visibility.to == 0.0 || active.motion.selection == selected {
             return false;
         }
         active.motion.select(selected, Instant::now());
         self.draw(cx);
         selected.is_some()
+    }
+
+    pub(super) fn turn_page(&mut self, steps: i32, selected: Option<usize>, cx: &App) -> bool {
+        let Some(active) = self.active.as_mut() else {
+            return false;
+        };
+        if active.motion.visibility.to == 0.0 || !active.turn_page(steps) {
+            return self.select(selected, cx);
+        }
+        let selected = active.frame().occupied(selected);
+        active.motion.select(selected, Instant::now());
+        self.draw(cx);
+        true
+    }
+
+    pub(super) fn emote(&self, slot: usize) -> Option<WheelEmote> {
+        let active = self.active.as_ref()?;
+        if active.motion.visibility.to == 0.0 {
+            return None;
+        }
+        active.frame().slots[slot]
+    }
+
+    pub(super) fn set_posters(&mut self, posters: HashMap<EmoteId, Pixmap>, cx: &App) {
+        self.posters = Rc::new(posters);
+        self.canvas = None;
+        self.draw(cx);
     }
 
     pub(super) fn close(&mut self, cx: &App) {
@@ -226,7 +311,8 @@ impl WheelView {
         self.task.take();
         let Some(active) = &self.active else { return };
         let art = self.art.clone();
-        let kind = active.kind;
+        let wheel = active.frame();
+        let posters = self.posters.clone();
         let motion = active.motion.clone();
         let present = active.present.clone();
         let now = Instant::now();
@@ -241,7 +327,7 @@ impl WheelView {
         };
         canvas
             .borrow_mut()
-            .draw(&art, kind, &motion, first, &present);
+            .draw(&art, wheel, &posters, &motion, first, &present);
         if motion.running(now) {
             self.task = Some(cx.spawn(async move |cx| {
                 let mut last_frame = now;
@@ -255,7 +341,9 @@ impl WheelView {
                         .await;
                     let now = Instant::now();
                     last_frame = now;
-                    canvas.borrow_mut().draw(&art, kind, &motion, now, &present);
+                    canvas
+                        .borrow_mut()
+                        .draw(&art, wheel, &posters, &motion, now, &present);
                     if !motion.running(now) {
                         break;
                     }
@@ -268,7 +356,7 @@ impl WheelView {
 struct Canvas {
     scene: Pixmap,
     frame: Pixmap,
-    cached: Option<(Wheel, Option<usize>)>,
+    cached: Option<(WheelFrame, Option<usize>)>,
 }
 
 impl Canvas {
@@ -283,7 +371,8 @@ impl Canvas {
     fn draw(
         &mut self,
         art: &WheelArt,
-        kind: Wheel,
+        wheel: WheelFrame,
+        posters: &HashMap<EmoteId, Pixmap>,
         motion: &Motion,
         now: Instant,
         present: &Present,
@@ -300,9 +389,9 @@ impl Canvas {
             .iter()
             .chain(&motion.icons)
             .any(|tween| tween.running(now));
-        let key = (kind, motion.selection);
+        let key = (wheel, motion.selection);
         if !settled || self.cached != Some(key) {
-            art.draw(&mut self.scene, kind, motion, now);
+            art.draw(&mut self.scene, wheel, posters, motion, now);
             self.cached = settled.then_some(key);
         }
         if opacity >= 1.0 {
@@ -333,7 +422,9 @@ struct WheelArt {
     background: Pixmap,
     foreground: [Pixmap; 2],
     wedges: [Path; 8],
-    icons: [[(Pixmap, Pixmap); 8]; 2],
+    ping_icons: [(Pixmap, Pixmap); 8],
+    emote_icons: [Pixmap; EMOTES.len()],
+    font: Option<Vec<u8>>,
 }
 
 fn square(size: u32) -> Pixmap {
@@ -419,6 +510,10 @@ fn asset(bytes: &[u8], round: bool, tinted: bool) -> Pixmap {
     let image = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
         .unwrap()
         .into_rgba8();
+    pixmap(image, round, tinted)
+}
+
+fn pixmap(image: image::RgbaImage, round: bool, tinted: bool) -> Pixmap {
     let (width, height) = image.dimensions();
     let mut bytes = image.into_raw();
     for (index, [red, green, blue, alpha]) in bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
@@ -441,6 +536,34 @@ fn asset(bytes: &[u8], round: bool, tinted: bool) -> Pixmap {
         *alpha = (255.0 * opacity).round() as u8;
     }
     Pixmap::from_vec(bytes, IntSize::from_wh(width, height).unwrap()).unwrap()
+}
+
+pub(crate) fn load_wheel_posters(
+    store: &EmoteStore,
+    pages: &[EmotePage],
+) -> HashMap<EmoteId, Pixmap> {
+    let ids: HashSet<_> = pages
+        .iter()
+        .flatten()
+        .filter_map(|slot| match *slot {
+            Some(WheelEmote::Custom(id)) => Some(id),
+            _ => None,
+        })
+        .collect();
+    ids.into_iter()
+        .filter_map(|id| {
+            let image = image::open(store.poster(id)).ok()?.into_rgba8();
+            let edge = image.width().max(image.height());
+            let mut square = image::RgbaImage::new(edge, edge);
+            image::imageops::overlay(
+                &mut square,
+                &image,
+                i64::from((edge - image.width()) / 2),
+                i64::from((edge - image.height()) / 2),
+            );
+            Some((id, pixmap(square, false, false)))
+        })
+        .collect()
 }
 
 fn sprite(target: &mut Pixmap, sprite: &Pixmap, center: Point, edge: f32, dpi: f32, opacity: f32) {
@@ -661,32 +784,31 @@ impl WheelArt {
         let wedges = std::array::from_fn(|index| {
             sector(INNER, if index % 2 == 0 { EXTENT } else { OUTER }, index)
         });
-        let icons = std::array::from_fn(|kind| {
-            std::array::from_fn(|index| {
-                let bytes = if kind == 0 {
-                    PINGS[index].image
-                } else {
-                    EMOTES[EMOTE_WHEEL[index]].image
-                };
-                (
-                    asset(bytes, kind == 1, kind == 0),
-                    asset(bytes, kind == 1, false),
-                )
-            })
+        let ping_icons = std::array::from_fn(|index| {
+            let bytes = PINGS[index].image;
+            (asset(bytes, false, true), asset(bytes, false, false))
         });
         Self {
             size,
             background,
             foreground,
             wedges,
-            icons,
+            ping_icons,
+            emote_icons: EMOTES.map(|clip| asset(clip.image, true, false)),
+            font,
         }
     }
 
-    fn draw(&self, target: &mut Pixmap, kind: Wheel, motion: &Motion, now: Instant) {
+    fn draw(
+        &self,
+        target: &mut Pixmap,
+        wheel: WheelFrame,
+        posters: &HashMap<EmoteId, Pixmap>,
+        motion: &Motion,
+        now: Instant,
+    ) {
         target.data_mut().copy_from_slice(self.background.data());
         let dpi = self.size as f32 / WHEEL_SIZE as f32;
-        let kind = usize::from(kind == Wheel::Emote);
         for (index, wedge) in self.wedges.iter().enumerate() {
             let hot = motion.wedges[index].sample(now);
             if hot > 0.0 {
@@ -710,26 +832,57 @@ impl WheelArt {
         target.draw_pixmap(
             0,
             0,
-            self.foreground[kind].as_ref(),
+            self.foreground[usize::from(wheel.kind == Wheel::Emote)].as_ref(),
             &PixmapPaint::default(),
             Transform::identity(),
             None,
         );
-        for (index, (normal, hot)) in self.icons[kind].iter().enumerate() {
+        let face = self
+            .font
+            .as_deref()
+            .and_then(|font| ttf_parser::Face::parse(font, 0).ok());
+        if wheel.page_count > 1
+            && let Some(face) = &face
+        {
+            text(
+                target,
+                face,
+                &format!("{} / {}", wheel.page + 1, wheel.page_count),
+                Point::from_xy(CENTER, CENTER + 28.0),
+                12.0,
+                [200, 170, 110, 255],
+                dpi,
+            );
+        }
+        for index in 0..wheel.slots.len() {
             let active = motion.icons[index].sample(now);
             let center = polar(137.0, angle(index));
             let edge = 48.0 * (1.0 + 0.18 * active);
-            if kind == 0 && active < 1.0 {
-                sprite(target, normal, center, edge, dpi, 1.0);
+            if wheel.kind == Wheel::Ping {
+                let (normal, hot) = &self.ping_icons[index];
+                if active < 1.0 {
+                    sprite(target, normal, center, edge, dpi, 1.0);
+                }
+                sprite(target, hot, center, edge, dpi, active);
+            } else if let Some(emote) = wheel.slots[index] {
+                let icon = match emote {
+                    WheelEmote::BuiltIn(id) => self.emote_icons.get(id),
+                    WheelEmote::Custom(id) => posters.get(&id),
+                };
+                if let Some(icon) = icon {
+                    sprite(target, icon, center, edge, dpi, 1.0);
+                } else if let Some(face) = &face {
+                    text(
+                        target,
+                        face,
+                        "?",
+                        Point::from_xy(center.x, center.y + 6.0),
+                        20.0,
+                        [200, 170, 110, 255],
+                        dpi,
+                    );
+                }
             }
-            sprite(
-                target,
-                hot,
-                center,
-                edge,
-                dpi,
-                if kind == 0 { active } else { 1.0 },
-            );
         }
     }
 }
@@ -737,6 +890,33 @@ impl WheelArt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn displayed_emote_page_wraps_and_empty_slots_do_not_resolve() {
+        let mut first = [None; 8];
+        first[0] = Some(WheelEmote::BuiltIn(8));
+        let mut second = [None; 8];
+        second[6] = Some(WheelEmote::BuiltIn(3));
+        let mut wheel = WheelView::new(WHEEL_SIZE);
+        let now = Instant::now();
+        let mut motion = Motion::new(now);
+        motion.visibility.animate(1.0, WHEEL_TIME, true, now);
+        wheel.active = Some(Active {
+            contents: WheelContents::Emote(vec![first, second]),
+            page: 0,
+            motion,
+            present: Rc::new(|_| {}),
+        });
+        assert_eq!(wheel.emote(0), first[0]);
+        let active = wheel.active.as_mut().unwrap();
+        assert!(active.turn_page(-1));
+        assert_eq!(active.frame().occupied(Some(0)), None);
+        assert_eq!(active.frame().occupied(Some(6)), Some(6));
+        assert_eq!(wheel.emote(6), second[6]);
+        assert_eq!(wheel.emote(0), None);
+        assert!(wheel.active.as_mut().unwrap().turn_page(1));
+        assert_eq!(wheel.emote(0), first[0]);
+    }
 
     #[test]
     fn opening_wheel_grows_and_brightens_in_presented_frames() {
@@ -761,7 +941,8 @@ mod tests {
         for ms in [16, 60, 120] {
             canvas.draw(
                 &art,
-                Wheel::Ping,
+                WheelFrame::ping(),
+                &HashMap::new(),
                 &motion,
                 start + Duration::from_millis(ms),
                 &present,
@@ -806,7 +987,13 @@ mod tests {
         let art = WheelArt::new(WHEEL_SIZE);
         let now = Instant::now();
         let mut target = square(WHEEL_SIZE);
-        art.draw(&mut target, Wheel::Ping, &Motion::new(now), now);
+        art.draw(
+            &mut target,
+            WheelFrame::ping(),
+            &HashMap::new(),
+            &Motion::new(now),
+            now,
+        );
         assert_eq!(target.pixel(0, 0).unwrap().alpha(), 0);
         assert_eq!(target.pixel(300, 300).unwrap().alpha(), 255);
         assert!(target.pixel(300, 60).unwrap().alpha() > 0);

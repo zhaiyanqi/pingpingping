@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::{AnimationOverlay, AudioCue, start_audio, wheel::WheelView};
+use super::{AnimationOverlay, AudioCue, WheelContents, start_audio, wheel::WheelView};
 use async_channel::Sender;
 use core_foundation::base::TCFType;
 use core_foundation::mach_port::{CFMachPort, CFMachPortInvalidate, CFMachPortRef};
@@ -32,8 +32,8 @@ use objc2_foundation::{NSPoint, NSRect, NSSize};
 use objc2_quartz_core::{CALayer, CATransaction};
 
 use crate::gesture::{
-    ALT, CTRL, GestureEvent, InputEvent, MouseDelivery, Position, SHIFT, SUPER, Triggers,
-    WHEEL_SIZE, Wheel, WheelInput,
+    ALT, CTRL, GestureEvent, InputEvent, MouseDelivery, Position, SCROLL_STEP, SHIFT, SUPER,
+    Triggers, WHEEL_SIZE, WheelInput,
 };
 use crate::model::Location;
 
@@ -129,6 +129,7 @@ impl TapState {
             Kind::RightMouseDown | Kind::RightMouseUp => {
                 InputEvent::OtherButton(1, matches!(kind, Kind::RightMouseDown))
             }
+            Kind::ScrollWheel => InputEvent::Scroll(scroll_delta(event)),
             Kind::MouseMoved
             | Kind::LeftMouseDragged
             | Kind::OtherMouseDragged
@@ -153,6 +154,24 @@ impl TapState {
         }
         delivery
     }
+}
+
+fn scroll_delta(event: &CGEvent) -> i32 {
+    // Quartz SDK fields missing from core-graphics 0.24's EventField constants.
+    // Quartz SDK 中的字段，core-graphics 0.24 未在 EventField 中提供。
+    const IS_CONTINUOUS: u32 = 88;
+    const MOMENTUM_PHASE: u32 = 123;
+    if event.get_integer_value_field(MOMENTUM_PHASE) != 0 {
+        return 0;
+    }
+    if event.get_integer_value_field(IS_CONTINUOUS) == 0 {
+        let lines = event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1);
+        return -(lines.signum() as i32) * SCROLL_STEP;
+    }
+    // Forty points of trackpad motion are equivalent to one mechanical notch.
+    // 触控板滚动四十点相当于机械滚轮转动一格。
+    let points = event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
+    points.clamp(-480, 480) as i32 * -(SCROLL_STEP / 40)
 }
 
 // Quartz needs a null return to drop an event. The Rust convenience callback maps None to pass-through.
@@ -394,7 +413,7 @@ pub(crate) struct Overlay {
     mtm: MainThreadMarker,
     wheel: Retained<NSPanel>,
     wheel_art: Retained<CALayer>,
-    wheel_view: WheelView,
+    pub(super) wheel_view: WheelView,
     pub(super) animations: AnimationOverlay,
     pub(super) audio: std::sync::mpsc::SyncSender<AudioCue>,
 }
@@ -419,7 +438,7 @@ impl Overlay {
 
     pub(crate) fn open(
         &mut self,
-        kind: Wheel,
+        contents: WheelContents,
         position: Position,
         selected: Option<usize>,
         tick_volume: Option<f32>,
@@ -454,8 +473,9 @@ impl Overlay {
                 update_layers(|| content(&layer, None));
             }
         });
-        self.wheel_view.open(kind, size, selected, present, cx);
-        if let Some(volume) = tick_volume.filter(|_| selected.is_some()) {
+        if self.wheel_view.open(contents, size, selected, present, cx)
+            && let Some(volume) = tick_volume
+        {
             let _ = self.audio.try_send(AudioCue::Tick(volume));
         }
     }
