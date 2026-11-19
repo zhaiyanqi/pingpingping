@@ -27,7 +27,8 @@ use core_graphics::event::{
     CGEventTapProxy, CGEventType, EventField,
 };
 use foreign_types::ForeignType;
-use gpui_kit::App;
+use gpui_kit::{App, Pixels, Point, Window};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use objc2::{
     MainThreadMarker, MainThreadOnly, define_class, msg_send, rc::Retained, runtime::AnyObject,
@@ -35,7 +36,7 @@ use objc2::{
 use objc2_app_kit::{
     NSApplication, NSBackingStoreType, NSColor, NSFloatingWindowLevel, NSFont,
     NSFontWeightSemibold, NSLineBreakMode, NSPanel, NSScreen, NSStatusWindowLevel, NSTextField,
-    NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
+    NSView, NSWindow, NSWindowButton, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_core_graphics::CGImage;
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
@@ -323,6 +324,58 @@ impl Drop for InputMonitor {
 
 fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
+}
+
+fn palette_panel(window: &Window) -> Option<Retained<NSPanel>> {
+    let RawWindowHandle::AppKit(handle) = HasWindowHandle::window_handle(window).ok()?.as_raw()
+    else {
+        return None;
+    };
+    // SAFETY: GPUI lends its live main-thread view for the duration of this call.
+    // 安全性：GPUI 在本次调用期间借出主线程上的有效视图。
+    let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
+    view.window()?.downcast().ok()
+}
+
+pub(crate) fn configure_palette(window: &Window) -> bool {
+    let Some(panel) = palette_panel(window) else {
+        return false;
+    };
+    panel.setLevel(NSFloatingWindowLevel);
+    panel.setHidesOnDeactivate(false);
+    panel.setBecomesKeyOnlyIfNeeded(true);
+    for button in [
+        NSWindowButton::CloseButton,
+        NSWindowButton::MiniaturizeButton,
+        NSWindowButton::ZoomButton,
+    ] {
+        if let Some(button) = panel.standardWindowButton(button) {
+            button.setHidden(true);
+        }
+    }
+    true
+}
+
+pub(crate) fn palette_drop(window: &Window, release: Point<Pixels>) -> Option<Position> {
+    let panel = palette_panel(window)?;
+    let viewport = window.viewport_size();
+    if gpui_kit::Bounds::new(gpui_kit::Point::default(), viewport).contains(&release) {
+        return None;
+    }
+    // GPUI reports the mouse-up event in top-left content coordinates. Convert that event
+    // through AppKit to the Quartz coordinate space consumed by the desktop overlays.
+    // GPUI 返回以内容区左上角为原点的松键坐标。经 AppKit 转为悬浮层使用的 Quartz 坐标。
+    let on_screen = panel.convertPointToScreen(NSPoint::new(
+        f64::from(release.x),
+        f64::from(viewport.height - release.y),
+    ));
+    let primary = NSScreen::screens(MainThreadMarker::new()?)
+        .firstObject()?
+        .frame();
+    Some(Position {
+        x: on_screen.x,
+        y: primary.origin.y + primary.size.height - on_screen.y,
+    })
 }
 
 // Quartz and AppKit use opposite vertical origins. Convert through the primary display.

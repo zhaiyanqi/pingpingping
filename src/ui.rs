@@ -40,6 +40,8 @@ use crate::platform::{
 };
 use crate::room::{DEFAULT_PORT, Room, RoomConfig, RoomEvent};
 
+mod palette;
+
 gpui_kit::actions!([OpenChat, OpenHistory, OpenSettings, CloseWindow, Quit]);
 
 struct WheelEmoteAdded(WheelEmote);
@@ -160,6 +162,7 @@ pub(crate) fn start(cx: &mut App) {
                         crate::tray::Command::Chat => open_chat(cx),
                         crate::tray::Command::History => open_history(cx),
                         crate::tray::Command::Settings => open_settings(cx),
+                        crate::tray::Command::TogglePalette => palette::toggle(cx),
                         crate::tray::Command::ToggleMute => {
                             let muted = cx
                                 .global::<Desktop>()
@@ -182,6 +185,7 @@ pub(crate) fn start(cx: &mut App) {
             open_chat(cx);
         }
     }
+    palette::restore(cx);
 }
 
 fn register_window_actions(cx: &mut App) {
@@ -1321,6 +1325,14 @@ impl Render for Conversation {
                             .gap_2()
                             .when(!self.history, |row| {
                                 row.child(
+                                    Button::new("palette")
+                                        .ghost()
+                                        .label("快捷浮窗")
+                                        .selected(palette::is_open(cx))
+                                        .toggled(palette::is_open(cx))
+                                        .on_click(|_, _, cx| palette::toggle(cx)),
+                                )
+                                .child(
                                     Button::new("history")
                                         .ghost()
                                         .label("历史记录…")

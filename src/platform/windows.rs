@@ -6,17 +6,23 @@ use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
 use async_channel::Sender;
-use gpui_kit::App;
+use gpui_kit::{App, Window};
 use image::RgbaImage;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
     Graphics::Gdi::*,
     System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
-    UI::{HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
+    UI::{
+        HiDpi::*,
+        Input::KeyboardAndMouse::*,
+        Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
+        WindowsAndMessaging::*,
+    },
 };
 
 use super::playback::{
@@ -40,6 +46,7 @@ pub(crate) fn init_dpi() {
 pub(crate) struct InputMonitor {
     thread: u32,
     worker: Option<JoinHandle<()>>,
+    palette_release: Arc<Mutex<Option<Sender<Position>>>>,
 }
 
 impl InputMonitor {
@@ -51,6 +58,8 @@ impl InputMonitor {
         paused: std::sync::Arc<AtomicBool>,
     ) -> Option<Self> {
         let (ready, result) = mpsc::sync_channel(1);
+        let palette_release = Arc::new(Mutex::new(None));
+        let hook_release = palette_release.clone();
         let worker = std::thread::Builder::new()
             .name("global-input".into())
             .spawn(move || {
@@ -68,6 +77,7 @@ impl InputMonitor {
                         move_window,
                         paused,
                         keys: initial_keys(),
+                        palette_release: hook_release,
                     });
                 });
                 let (keyboard, mouse) = unsafe {
@@ -105,7 +115,20 @@ impl InputMonitor {
         Some(Self {
             thread,
             worker: Some(worker),
+            palette_release,
         })
+    }
+
+    pub(crate) fn watch_palette_release(&self) -> Option<async_channel::Receiver<Position>> {
+        let mut pending = self.palette_release.lock().ok()?;
+        // Background windows cannot capture a release across another app's window.
+        // 后台窗口无法捕获在其他应用窗口上发生的松键。
+        if unsafe { GetAsyncKeyState(i32::from(VK_LBUTTON)) } >= 0 {
+            return None;
+        }
+        let (sender, receiver) = async_channel::bounded(1);
+        *pending = Some(sender);
+        Some(receiver)
     }
 }
 
@@ -129,6 +152,7 @@ struct Input {
     move_window: WheelMouseWindow,
     keys: u16,
     paused: std::sync::Arc<AtomicBool>,
+    palette_release: Arc<Mutex<Option<Sender<Position>>>>,
 }
 
 const MODIFIERS: [u32; 8] = [
@@ -276,6 +300,12 @@ unsafe extern "system" fn mouse_hook(code: i32, message: WPARAM, data: LPARAM) -
             let Some(input) = cell.as_mut() else {
                 return MouseDelivery::Pass;
             };
+            if message as u32 == WM_LBUTTONUP
+                && let Ok(mut pending) = input.palette_release.lock()
+                && let Some(sender) = pending.take()
+            {
+                let _ = sender.try_send(position(event.pt));
+            }
             let kind = match message as u32 {
                 WM_MOUSEMOVE if input.keys != 0 || input.gesture.active() => InputEvent::Move,
                 WM_LBUTTONDOWN => InputEvent::Left(true),
@@ -363,6 +393,49 @@ fn point(position: Position) -> POINT {
         x: position.x.round() as i32,
         y: position.y.round() as i32,
     }
+}
+
+fn palette_hwnd(window: &Window) -> Option<HWND> {
+    match HasWindowHandle::window_handle(window).ok()?.as_raw() {
+        RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as HWND),
+        _ => None,
+    }
+}
+
+pub(crate) fn configure_palette(window: &Window) -> bool {
+    palette_hwnd(window)
+        .is_some_and(|hwnd| unsafe { SetWindowSubclass(hwnd, Some(palette_proc), 1, 0) != 0 })
+}
+
+unsafe extern "system" fn palette_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    id: usize,
+    _: usize,
+) -> LRESULT {
+    match message {
+        WM_MOUSEACTIVATE => return MA_NOACTIVATE as LRESULT,
+        WM_NCDESTROY => unsafe { RemoveWindowSubclass(hwnd, Some(palette_proc), id) },
+        _ => 0,
+    };
+    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+}
+
+pub(crate) fn palette_drop(window: &Window, release: Position) -> Option<Position> {
+    let hwnd = palette_hwnd(window)?;
+    let mut bounds = RECT::default();
+    let mut client_point = point(release);
+    let outside = unsafe {
+        if GetCapture() == hwnd {
+            ReleaseCapture();
+        }
+        GetClientRect(hwnd, &mut bounds) != 0
+            && ScreenToClient(hwnd, &mut client_point) != 0
+            && PtInRect(&bounds, client_point) == 0
+    };
+    outside.then_some(release)
 }
 
 pub(crate) fn normalized(position: Position) -> Location {

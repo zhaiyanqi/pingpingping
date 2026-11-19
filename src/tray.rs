@@ -9,6 +9,7 @@ pub(crate) enum Command {
     Chat,
     History,
     Settings,
+    TogglePalette,
     ToggleMute,
     Quit,
 }
@@ -16,11 +17,16 @@ pub(crate) enum Command {
 pub(crate) struct Tray {
     _icon: TrayIcon,
     mute: CheckMenuItem,
+    palette: CheckMenuItem,
 }
 
 impl Tray {
     pub(crate) fn set_incoming_muted(&self, muted: bool) {
         self.mute.set_checked(muted);
+    }
+
+    pub(crate) fn set_palette_visible(&self, visible: bool) {
+        self.palette.set_checked(visible);
     }
 }
 
@@ -29,12 +35,14 @@ pub(crate) fn install(sender: Sender<Command>, muted: bool) -> anyhow::Result<Tr
     let chat = MenuItem::new("聊天", true, None);
     let history = MenuItem::new("历史记录", true, None);
     let settings = MenuItem::new("设置", true, None);
+    let palette = CheckMenuItem::new("快捷浮窗", true, false, None);
     let mute = CheckMenuItem::new("静音", true, muted, None);
     let quit = MenuItem::new("退出", true, None);
     menu.append_items(&[
         &chat,
         &history,
         &settings,
+        &palette,
         &mute,
         &PredefinedMenuItem::separator(),
         &quit,
@@ -43,6 +51,7 @@ pub(crate) fn install(sender: Sender<Command>, muted: bool) -> anyhow::Result<Tr
         (chat.id().clone(), Command::Chat),
         (history.id().clone(), Command::History),
         (settings.id().clone(), Command::Settings),
+        (palette.id().clone(), Command::TogglePalette),
         (mute.id().clone(), Command::ToggleMute),
         (quit.id().clone(), Command::Quit),
     ];
@@ -69,7 +78,11 @@ pub(crate) fn install(sender: Sender<Command>, muted: bool) -> anyhow::Result<Tr
     // Only menu commands matter; do not queue unused pointer events.
     // 仅处理菜单命令，避免未消费的指针事件积压。
     TrayIconEvent::set_event_handler(Some(|_| {}));
-    Ok(Tray { _icon: icon, mute })
+    Ok(Tray {
+        _icon: icon,
+        mute,
+        palette,
+    })
 }
 
 pub(crate) fn hide_window(window: &Window) -> bool {

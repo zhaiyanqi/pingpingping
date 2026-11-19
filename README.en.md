@@ -95,6 +95,12 @@ In chat, select **Add to emote library** below a received custom emote to save i
 
 The app accepts private, link-local, and loopback IPv4 addresses. LAN traffic is unauthenticated and unencrypted. Use it on a trusted LAN. For a same-machine test, use `127.0.0.1` and assign each instance a different `PINGPINGPING_DATA_DIR` to keep their identities and histories separate.
 
+## Quick-send palette
+
+Open **快捷浮窗** (Quick-send palette) from the tray menu or the chat header. The palette stays on top. Drag its title bar to move it, or use the close button to hide it. The app remembers whether the palette was open when it restarts.
+
+Choose **表情** (Emotes) or **信号** (Pings), then drag an icon out of the palette and release to send and play it at the pointer. A click or a release inside the palette cancels the send. The palette includes custom emotes from your library. Sent effects appear in history and play at the corresponding position on room members' primary displays when you are connected.
+
 ## Desktop animations
 
 The ping and emote wheels take keyboard focus when opened and release it on selection or cancellation. Playing, previewing, or replaying an animation leaves the current window focused.

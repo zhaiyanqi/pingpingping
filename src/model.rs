@@ -318,6 +318,8 @@ pub(crate) struct Profile {
     #[serde(default)]
     incoming_muted: bool,
     #[serde(default)]
+    pub(crate) palette_visible: bool,
+    #[serde(default)]
     pub(crate) overlay: OverlaySettings,
     #[serde(default = "default_emote_pages")]
     pub(crate) emote_pages: Vec<EmotePage>,
@@ -356,6 +358,7 @@ impl Default for Profile {
             triggers: Default::default(),
             remote_overlay: true,
             incoming_muted: false,
+            palette_visible: false,
             overlay: OverlaySettings::default(),
             emote_pages: default_emote_pages(),
         }
