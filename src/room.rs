@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::emotes::{EmoteStore, MAX_EMOTE_BYTES};
 use crate::model::{Body, Message};
 
-pub(crate) const DEFAULT_PORT: u16 = 49378;
+pub(crate) const DEFAULT_PORT: u16 = 30086;
 const MAX_FRAME: usize = 4096;
 const MAX_PEERS: usize = 16;
 // The greeting identifies the wire format. It does not authenticate peers.

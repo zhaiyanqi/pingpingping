@@ -67,7 +67,7 @@ Finder and the Dock use the gold question mark. The menu bar uses a monochrome q
 
 ## Connect on a LAN
 
-1. The **host** finds their active adapter's IPv4 address. On Windows, use `ipconfig`. Enter that address and the TCP port (default `49378`) in **Settings → LAN room**, then create the room. If prompted, allow the app through Windows Firewall on private networks.
+1. The **host** finds their active adapter's IPv4 address. On Windows, use `ipconfig`. Enter that address and the TCP port (default `30086`) in **Settings → LAN room**, then create the room. If prompted, allow the app through Windows Firewall on private networks.
 2. **Guests** on the same LAN enter the host's IP and port and connect. The host keeps the app running and can accept up to 16 guests.
 3. In **Chat**, press Enter to send text and Shift+Enter to start a new line. Choose an item from **Emotes** or **Pings** above the input to send it. While outside a room, messages stay on this device. History can show all conversations or filter to emotes.
 
