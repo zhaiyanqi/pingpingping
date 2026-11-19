@@ -41,6 +41,7 @@ if [ -n "${PINGPINGPING_RELEASE_VERSION:-}" ]; then
     plutil -replace CFBundleVersion -string "$version" "$bundle/Contents/Info.plist"
 fi
 cp packaging/pingpingping.icns "$bundle/Contents/Resources/"
+cp packaging/LICENSE-LUCIDE.txt "$bundle/Contents/Resources/"
 cp "target/$profile/pingpingping" "$bundle/Contents/MacOS/"
 codesign --force --sign - "$bundle"
 codesign --verify --strict "$bundle"

@@ -89,6 +89,7 @@ try {
 
     if ($Package -ne 'Setup') {
         Copy-Item -LiteralPath (Join-Path $packaging 'Launch-PingPingPing.bat') -Destination $payload
+        Copy-Item -LiteralPath (Join-Path $packaging 'LICENSE-LUCIDE.txt') -Destination $payload
         $archive = Join-Path $staging "$name-portable.zip"
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         [IO.Compression.ZipFile]::CreateFromDirectory($payload, $archive, 'Optimal', $false)

@@ -1,5 +1,5 @@
-//! Always-on-top picker for sending effects at the mouse release point.
-//! 在鼠标松手的位置发送动效的置顶选择面板。
+//! Borderless picker for sending effects at the mouse release point.
+//! 在鼠标松手的位置发送动效的无边框选择面板。
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -52,6 +52,7 @@ pub(super) fn toggle(cx: &mut App) {
 }
 
 fn open(cx: &mut App) -> anyhow::Result<()> {
+    let pinned = cx.global::<Desktop>().model.read(cx).profile.palette_pinned;
     let size = size(px(288.), px(272.));
     let bounds = cx.primary_display().map(|display| {
         let area = display.visible_bounds();
@@ -82,18 +83,18 @@ fn open(cx: &mut App) -> anyhow::Result<()> {
                 }
                 true
             });
-            cx.new(Palette::new)
+            cx.new(|cx| Palette::new(pinned, cx))
         },
     )?;
     let configured = handle.update(cx, |_, window, _| {
-        if platform::configure_palette(window) {
+        if platform::configure_palette(window, pinned) {
             true
         } else {
             window.remove_window();
             false
         }
     })?;
-    anyhow::ensure!(configured, "无法配置置顶窗口");
+    anyhow::ensure!(configured, "无法配置快捷浮窗");
     cx.set_global(OpenPalette(handle));
     remember(true, cx);
     Ok(())
@@ -154,6 +155,7 @@ impl Item {
 struct Palette {
     library: Entity<LocalEmotes>,
     _library_subscription: Subscription,
+    pinned: bool,
     category: Wheel,
     dragging: Option<Item>,
     #[cfg(target_os = "windows")]
@@ -162,18 +164,38 @@ struct Palette {
 }
 
 impl Palette {
-    fn new(cx: &mut Context<Self>) -> Self {
+    fn new(pinned: bool, cx: &mut Context<Self>) -> Self {
         let library = cx.global::<Desktop>().library.clone();
         let library_subscription = cx.observe(&library, |_, _, cx| cx.notify());
         Self {
             library,
             _library_subscription: library_subscription,
+            pinned,
             category: Wheel::Emote,
             dragging: None,
             #[cfg(target_os = "windows")]
             release_task: None,
             error: None,
         }
+    }
+
+    fn toggle_pin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pinned = !self.pinned;
+        if !platform::set_palette_pinned(window, pinned) {
+            self.error = Some("无法切换浮窗置顶状态。".into());
+        } else {
+            self.pinned = pinned;
+            let model = cx.global::<Desktop>().model.clone();
+            self.error = model
+                .update(cx, |model, _| {
+                    let mut profile = model.profile.clone();
+                    profile.palette_pinned = pinned;
+                    model.apply(profile)
+                })
+                .err()
+                .map(|error| format!("无法保存置顶状态：{error:#}"));
+        }
+        cx.notify();
     }
 
     fn begin_drag(&mut self, item: Item, _window: &mut Window, cx: &mut Context<Self>) {
@@ -362,13 +384,33 @@ impl Render for Palette {
                     .flex_shrink_0()
                     .px_3()
                     .py_1()
-                    .border_b_1()
-                    .border_color(theme.border)
+                    .gap_1()
                     .child(title)
+                    .child(
+                        Button::new("pin-palette")
+                            .ghost()
+                            .small()
+                            .icon(if self.pinned {
+                                IconName::Pin
+                            } else {
+                                IconName::PinOff
+                            })
+                            .selected(self.pinned)
+                            .toggled(self.pinned)
+                            .accessibility_label("浮窗置顶")
+                            .tooltip(if self.pinned {
+                                "取消置顶"
+                            } else {
+                                "置顶"
+                            })
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.toggle_pin(window, cx)),
+                            ),
+                    )
                     .child(
                         Button::new("close-palette")
                             .ghost()
-                            .xsmall()
+                            .small()
                             .icon(IconName::X)
                             .accessibility_label("关闭快捷浮窗")
                             .tooltip("关闭快捷浮窗")

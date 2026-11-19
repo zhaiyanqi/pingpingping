@@ -15,7 +15,10 @@ use image::RgbaImage;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
-    Graphics::Gdi::*,
+    Graphics::{
+        Dwm::{DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DwmSetWindowAttribute},
+        Gdi::*,
+    },
     System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
     UI::{
         HiDpi::*,
@@ -402,9 +405,39 @@ fn palette_hwnd(window: &Window) -> Option<HWND> {
     }
 }
 
-pub(crate) fn configure_palette(window: &Window) -> bool {
-    palette_hwnd(window)
-        .is_some_and(|hwnd| unsafe { SetWindowSubclass(hwnd, Some(palette_proc), 1, 0) != 0 })
+pub(crate) fn configure_palette(window: &Window, pinned: bool) -> bool {
+    let Some(hwnd) = palette_hwnd(window) else {
+        return false;
+    };
+    unsafe {
+        if SetWindowSubclass(hwnd, Some(palette_proc), 1, 0) == 0 {
+            return false;
+        }
+        // The popup has no Win32 frame; Windows 11 can still draw a compositor border.
+        // 弹出窗口没有 Win32 边框，Windows 11 仍可能由桌面合成器绘制描边。
+        let color = DWMWA_COLOR_NONE;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR as u32,
+            (&raw const color).cast(),
+            size_of_val(&color) as u32,
+        );
+    }
+    set_palette_pinned(window, pinned)
+}
+
+pub(crate) fn set_palette_pinned(window: &Window, pinned: bool) -> bool {
+    palette_hwnd(window).is_some_and(|hwnd| unsafe {
+        SetWindowPos(
+            hwnd,
+            if pinned { HWND_TOPMOST } else { HWND_NOTOPMOST },
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+        ) != 0
+    })
 }
 
 unsafe extern "system" fn palette_proc(

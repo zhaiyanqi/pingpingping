@@ -97,7 +97,7 @@ The app accepts private, link-local, and loopback IPv4 addresses. LAN traffic is
 
 ## Quick-send palette
 
-Open **快捷浮窗** (Quick-send palette) from the tray menu or the chat header. The palette stays on top. Drag its title bar to move it, or use the close button to hide it. The app remembers whether the palette was open when it restarts.
+Open **快捷浮窗** (Quick-send palette) from the tray menu or the chat header. Drag the top of the borderless palette to move it. Click the pin to toggle always-on-top. When unpinned, other windows can cover the palette. Use the close button to hide it. The app restores the palette's visibility and pin state when it restarts. The controls use Lucide icons. [Icon license](packaging/LICENSE-LUCIDE.txt)
 
 Choose **表情** (Emotes) or **信号** (Pings), then drag an icon out of the palette and release to send and play it at the pointer. A click or a release inside the palette cancels the send. The palette includes custom emotes from your library. Sent effects appear in history and play at the corresponding position on room members' primary displays when you are connected.
 

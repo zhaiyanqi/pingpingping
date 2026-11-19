@@ -304,6 +304,10 @@ fn default_emote_pages() -> Vec<EmotePage> {
     vec![DEFAULT_EMOTE_SLOTS.map(|index| Some(WheelEmote::BuiltIn(index)))]
 }
 
+fn default_palette_pinned() -> bool {
+    true
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Profile {
     pub(crate) id: Uuid,
@@ -319,6 +323,8 @@ pub(crate) struct Profile {
     incoming_muted: bool,
     #[serde(default)]
     pub(crate) palette_visible: bool,
+    #[serde(default = "default_palette_pinned")]
+    pub(crate) palette_pinned: bool,
     #[serde(default)]
     pub(crate) overlay: OverlaySettings,
     #[serde(default = "default_emote_pages")]
@@ -359,6 +365,7 @@ impl Default for Profile {
             remote_overlay: true,
             incoming_muted: false,
             palette_visible: false,
+            palette_pinned: default_palette_pinned(),
             overlay: OverlaySettings::default(),
             emote_pages: default_emote_pages(),
         }
@@ -751,11 +758,13 @@ mod tests {
         fields.remove("overlay");
         fields.remove("incoming_muted");
         fields.remove("emote_pages");
+        fields.remove("palette_pinned");
         let loaded: Profile = serde_json::from_value(legacy).unwrap();
         assert_eq!(loaded.overlay, OverlaySettings::default());
         assert!(loaded.overlay.with_sound(loaded.sound).volume().is_none());
         assert!(!loaded.incoming_muted());
         assert!(loaded.plays_incoming_effects());
+        assert!(loaded.palette_pinned);
         assert_eq!(loaded.emote_pages, default_emote_pages());
     }
 

@@ -21,7 +21,7 @@ mod ui;
 fn main() {
     #[cfg(target_os = "windows")]
     platform::init_dpi();
-    let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
+    let app = gpui_kit::application().with_assets(assets::AppAssets);
     app.on_reopen(ui::open_chat);
     app.run(|cx| {
         #[cfg(target_os = "macos")]

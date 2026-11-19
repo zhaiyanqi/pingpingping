@@ -35,8 +35,9 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApplication, NSBackingStoreType, NSColor, NSFloatingWindowLevel, NSFont,
-    NSFontWeightSemibold, NSLineBreakMode, NSPanel, NSScreen, NSStatusWindowLevel, NSTextField,
-    NSView, NSWindow, NSWindowButton, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
+    NSFontWeightSemibold, NSLineBreakMode, NSNormalWindowLevel, NSPanel, NSScreen,
+    NSStatusWindowLevel, NSTextField, NSView, NSWindow, NSWindowCollectionBehavior,
+    NSWindowStyleMask, NSWorkspace,
 };
 use objc2_core_graphics::CGImage;
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
@@ -337,22 +338,35 @@ fn palette_panel(window: &Window) -> Option<Retained<NSPanel>> {
     view.window()?.downcast().ok()
 }
 
-pub(crate) fn configure_palette(window: &Window) -> bool {
+pub(crate) fn configure_palette(window: &Window, pinned: bool) -> bool {
     let Some(panel) = palette_panel(window) else {
         return false;
     };
-    panel.setLevel(NSFloatingWindowLevel);
+    // GPUI's popup still has a titled AppKit frame. Keep its geometry when removing the title bar.
+    // GPUI 弹窗仍有 AppKit 标题栏边框，移除时保留窗口的大小和位置。
+    let frame = panel.frame();
+    panel.setStyleMask(NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel);
+    panel.setFrame_display(frame, true);
     panel.setHidesOnDeactivate(false);
     panel.setBecomesKeyOnlyIfNeeded(true);
-    for button in [
-        NSWindowButton::CloseButton,
-        NSWindowButton::MiniaturizeButton,
-        NSWindowButton::ZoomButton,
-    ] {
-        if let Some(button) = panel.standardWindowButton(button) {
-            button.setHidden(true);
-        }
-    }
+    set_palette_pinned(window, pinned)
+}
+
+pub(crate) fn set_palette_pinned(window: &Window, pinned: bool) -> bool {
+    let Some(panel) = palette_panel(window) else {
+        return false;
+    };
+    panel.setLevel(if pinned {
+        NSFloatingWindowLevel
+    } else {
+        NSNormalWindowLevel
+    });
+    panel.setCollectionBehavior(if pinned {
+        NSWindowCollectionBehavior::CanJoinAllSpaces
+            | NSWindowCollectionBehavior::FullScreenAuxiliary
+    } else {
+        NSWindowCollectionBehavior::Default
+    });
     true
 }
 

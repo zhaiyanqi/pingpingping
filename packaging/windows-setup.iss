@@ -15,6 +15,7 @@ WizardStyle=modern
 
 [Files]
 Source: "{#AppBinary}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "LICENSE-LUCIDE.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\PingPingPing"; Filename: "{app}\pingpingping.exe"; WorkingDir: "{app}"

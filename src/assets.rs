@@ -1,6 +1,32 @@
 //! Embedded visual and audio assets shared by desktop playback and the chat UI.
 //! 内嵌的图像和音频素材由桌面播放与聊天界面共用。
 
+use std::borrow::Cow;
+
+use gpui_kit::assets::{Assets, icon_assets};
+use gpui_kit::{AssetSource, Result, SharedString};
+
+icon_assets!(PaletteIcons, [Pin, PinOff, X]);
+
+pub(crate) struct AppAssets;
+
+impl AssetSource for AppAssets {
+    fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        match PaletteIcons.load(path)? {
+            Some(icon) => Ok(Some(icon)),
+            None => Assets.load(path),
+        }
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        let mut files = Assets.list(path)?;
+        files.extend(PaletteIcons.list(path)?);
+        files.sort_unstable();
+        files.dedup();
+        Ok(files)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct Clip {
     pub(crate) name: &'static str,
@@ -68,3 +94,22 @@ pub(crate) const EMOTES: [Clip; 13] = [
 pub(crate) const DEFAULT_EMOTE_SLOTS: [usize; 8] = [8, 7, 9, 10, 11, 2, 12, 0];
 pub(crate) const EMOTE_HUB: usize = 3;
 pub(crate) const WHEEL_TICK: &[u8] = include_bytes!("../assets/sounds/button.wav");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::assets::IconName;
+
+    #[test]
+    fn app_assets_include_palette_and_component_svgs() {
+        for icon in [
+            IconName::Pin,
+            IconName::PinOff,
+            IconName::X,
+            IconName::CircleX,
+        ] {
+            let svg = AppAssets.load(icon.path().as_ref()).unwrap().unwrap();
+            assert!(std::str::from_utf8(&svg).unwrap().contains("<svg"));
+        }
+    }
+}
