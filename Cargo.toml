@@ -1,0 +1,29 @@
+[package]
+name = "pingpingping"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+async-channel = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+gpui-kit = "=0.7.1"
+image = { version = "0.25", default-features = false, features = ["png", "webp"] }
+rodio = { version = "0.22", default-features = false, features = ["playback", "wav"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+smol = "2"
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+core-graphics = "0.24"
+foreign-types = "0.5"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSColor", "NSGraphics", "NSGraphicsContext", "NSImage", "NSImageRep", "NSPanel", "NSScreen", "NSView", "NSWindow", "NSWorkspace", "objc2-core-graphics", "objc2-quartz-core", "NSResponder"] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGColor", "CGColorSpace", "CGDataProvider", "CGImage"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSData", "NSDate", "NSGeometry", "NSString", "NSObject"] }
+objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "CALayer", "CATransaction", "objc2-core-foundation", "objc2-core-graphics"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
