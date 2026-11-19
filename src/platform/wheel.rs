@@ -53,7 +53,7 @@ impl Tween {
         if time == 0.0 {
             return self.from;
         }
-        let progress = if self.ease_out { ease_out(time) } else { time };
+        let progress = css_ease(time, self.ease_out);
         self.from + (self.to - self.from) * progress
     }
 
@@ -72,11 +72,16 @@ impl Tween {
     }
 }
 
-fn ease_out(time: f32) -> f32 {
-    let (mut low, mut high) = (0.0, 1.0);
+fn css_ease(time: f32, ease_out: bool) -> f32 {
+    let (x1, y1, x2) = if ease_out {
+        (0.0, 0.0, 0.58)
+    } else {
+        (0.25, 0.1, 0.25)
+    };
+    let (mut low, mut high) = (0.0_f32, 1.0);
     for _ in 0..12 {
         let t = (low + high) * 0.5;
-        let x = 3.0 * (1.0 - t) * t * t * 0.58 + t * t * t;
+        let x = 3.0 * (1.0 - t).powi(2) * t * x1 + 3.0 * (1.0 - t) * t * t * x2 + t * t * t;
         if x < time {
             low = t;
         } else {
@@ -84,7 +89,7 @@ fn ease_out(time: f32) -> f32 {
         }
     }
     let t = (low + high) * 0.5;
-    t * t * (3.0 - 2.0 * t)
+    3.0 * (1.0 - t).powi(2) * t * y1 + t * t * (3.0 - 2.0 * t)
 }
 
 #[derive(Clone)]
@@ -113,7 +118,7 @@ impl Motion {
         for index in [self.selection, selected].into_iter().flatten() {
             let target = if Some(index) == selected { 1.0 } else { 0.0 };
             self.wedges[index].animate(target, if animate { WEDGE_TIME } else { 0 }, false, now);
-            self.icons[index].animate(target, if animate { ICON_TIME } else { 0 }, true, now);
+            self.icons[index].animate(target, if animate { ICON_TIME } else { 0 }, false, now);
         }
         self.selection = selected;
     }
@@ -137,7 +142,7 @@ struct Active {
 
 pub(super) struct WheelView {
     art: Rc<WheelArt>,
-    canvas: Rc<RefCell<Canvas>>,
+    canvas: Option<Rc<RefCell<Canvas>>>,
     active: Option<Active>,
     task: Option<Task<()>>,
 }
@@ -146,7 +151,7 @@ impl WheelView {
     pub(super) fn new(size: u32) -> Self {
         Self {
             art: Rc::new(WheelArt::new(size)),
-            canvas: Rc::new(RefCell::new(Canvas::new(size))),
+            canvas: None,
             active: None,
             task: None,
         }
@@ -164,7 +169,7 @@ impl WheelView {
         self.task.take();
         if self.art.size != size {
             self.art = Rc::new(WheelArt::new(size));
-            self.canvas = Rc::new(RefCell::new(Canvas::new(size)));
+            self.canvas = None;
         }
         let now = Instant::now();
         let mut motion = Motion::new(now);
@@ -218,10 +223,12 @@ impl WheelView {
             now,
         );
         self.draw(cx);
+        self.canvas = None;
     }
 
     pub(super) fn hide(&mut self) {
         self.task.take();
+        self.canvas = None;
         if let Some(active) = self.active.take() {
             (active.present)(None);
         }
@@ -235,7 +242,10 @@ impl WheelView {
         let motion = active.motion.clone();
         let present = active.present.clone();
         let now = Instant::now();
-        let canvas = self.canvas.clone();
+        let canvas = self
+            .canvas
+            .get_or_insert_with(|| Rc::new(RefCell::new(Canvas::new(art.size))))
+            .clone();
         let first = if motion.visibility.to == 1.0 && motion.visibility.from == 0.0 {
             now.max(motion.visibility.start + Duration::from_millis(8))
         } else {
@@ -246,11 +256,17 @@ impl WheelView {
             .draw(&art, kind, &motion, first, &present);
         if motion.running(now) {
             self.task = Some(cx.spawn(async move |cx| {
+                let mut last_frame = now;
                 loop {
                     cx.background_executor()
-                        .timer(Duration::from_millis(16))
+                        .timer(
+                            Duration::from_millis(16)
+                                .saturating_sub(last_frame.elapsed())
+                                .max(Duration::from_millis(1)),
+                        )
                         .await;
                     let now = Instant::now();
+                    last_frame = now;
                     canvas.borrow_mut().draw(&art, kind, &motion, now, &present);
                     if !motion.running(now) {
                         break;
@@ -264,6 +280,7 @@ impl WheelView {
 struct Canvas {
     scene: Pixmap,
     frame: Pixmap,
+    cached: Option<(Wheel, Option<usize>)>,
 }
 
 impl Canvas {
@@ -271,6 +288,7 @@ impl Canvas {
         Self {
             scene: square(size),
             frame: square(size),
+            cached: None,
         }
     }
 
@@ -287,7 +305,18 @@ impl Canvas {
             present(None);
             return;
         }
-        art.draw(&mut self.scene, kind, motion, now);
+        // Reuse the composed scene while only the whole wheel scales and fades.
+        // 仅轮盘整体缩放淡入淡出时，复用已合成的图层。
+        let settled = !motion
+            .wedges
+            .iter()
+            .chain(&motion.icons)
+            .any(|tween| tween.running(now));
+        let key = (kind, motion.selection);
+        if !settled || self.cached != Some(key) {
+            art.draw(&mut self.scene, kind, motion, now);
+            self.cached = settled.then_some(key);
+        }
         if opacity >= 1.0 {
             present(Some(&self.scene));
             return;
@@ -720,6 +749,43 @@ impl WheelArt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opening_wheel_grows_and_brightens_in_presented_frames() {
+        let size = WHEEL_SIZE;
+        let art = WheelArt::new(size);
+        let mut canvas = Canvas::new(size);
+        let start = Instant::now();
+        let mut motion = Motion::new(start);
+        motion.visibility.animate(1.0, WHEEL_TIME, true, start);
+        let samples = Rc::new(RefCell::new(Vec::new()));
+        let capture = samples.clone();
+        let present: Present = Rc::new(move |frame| {
+            let frame = frame.unwrap();
+            let center = size / 2;
+            let top = (0..center)
+                .find(|&y| frame.pixel(center, y).unwrap().alpha() > 4)
+                .unwrap();
+            capture
+                .borrow_mut()
+                .push((top, frame.pixel(center, center).unwrap().alpha()));
+        });
+        for ms in [16, 60, 120] {
+            canvas.draw(
+                &art,
+                Wheel::Ping,
+                &motion,
+                start + Duration::from_millis(ms),
+                &present,
+            );
+        }
+        assert!(
+            samples
+                .borrow()
+                .windows(2)
+                .all(|pair| pair[0].0 > pair[1].0 && pair[0].1 < pair[1].1)
+        );
+    }
 
     #[test]
     fn wheel_motion_reverses_from_the_visible_state_and_uses_reference_timings() {

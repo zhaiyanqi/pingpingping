@@ -52,6 +52,10 @@ You can also run `cargo run --release --locked`. Request Input Monitoring throug
 
 The app accepts private, link-local, and loopback IPv4 addresses. LAN traffic is unauthenticated and unencrypted. Use it on a trusted LAN. For a same-machine test, use `127.0.0.1` and assign each instance a different `PINGPINGPING_DATA_DIR` to keep their identities and histories separate.
 
+## Desktop animations
+
+Under **Settings → Desktop animations**, set the size and timeout for pings and emotes separately and preview them before saving. Animations loop at their source frame rate and disappear at the configured timeout. With system Reduce Motion enabled, a static image stays visible until the same timeout. **Sound** controls the volume and has separate switches for emote sounds and wheel ticks.
+
 ## Shortcuts and local data
 
 | Action | Windows | macOS |

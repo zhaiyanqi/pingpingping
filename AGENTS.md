@@ -14,6 +14,7 @@
 | `src/ui.rs` | GPUI entities and windows / GPUI 实体与窗口 |
 | `src/gesture.rs` | Shared gesture state and sector selection / 共享手势状态与扇区选择 |
 | `src/platform/windows.rs`, `src/platform/macos.rs` | Global input and desktop overlays / 全局输入和桌面悬浮层 |
+| `src/platform/playback.rs` | Shared animation overlay, WebP decoding, and timeout / 公共动画浮窗、WebP 解码与超时 |
 | `src/platform.rs`, `src/assets.rs` | Shared media playback and embedded asset catalog / 共用媒体播放与内嵌素材目录 |
 | `src/model.rs` | Settings, records, and session state / 设置、历史和会话状态 |
 | `src/room.rs` | LAN TCP transport, frame validation, and forwarding / 局域网 TCP 传输、帧校验与转发 |

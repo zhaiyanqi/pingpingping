@@ -5,7 +5,7 @@
 pub(crate) struct Clip {
     pub(crate) name: &'static str,
     pub(crate) image: &'static [u8],
-    pub(crate) animation: Option<&'static [u8]>,
+    pub(crate) animation: &'static [u8],
     pub(crate) sound: &'static [u8],
 }
 
@@ -14,7 +14,7 @@ macro_rules! ping {
         Clip {
             name: $name,
             image: include_bytes!(concat!("../assets/textures/", $image, ".png")),
-            animation: None,
+            animation: include_bytes!(concat!("../assets/ping-fx/", $image, ".webp")),
             sound: include_bytes!(concat!("../assets/sounds/", $sound, ".wav")),
         }
     };
@@ -25,11 +25,7 @@ macro_rules! emote {
         Clip {
             name: $name,
             image: include_bytes!(concat!("../assets/emotes/", $asset, ".png")),
-            animation: Some(include_bytes!(concat!(
-                "../assets/emotes/",
-                $asset,
-                ".webp"
-            ))),
+            animation: include_bytes!(concat!("../assets/emotes/", $asset, ".webp")),
             sound: include_bytes!(concat!("../assets/emotes/", $asset, ".wav")),
         }
     };

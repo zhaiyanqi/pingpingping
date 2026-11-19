@@ -2,20 +2,22 @@
 //! 平台后端选择，以及共用的媒体解码与音频播放。
 
 use std::io::Cursor;
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::time::Duration;
 
-use async_channel::Sender;
-use image::{AnimationDecoder, RgbaImage, codecs::webp::WebPDecoder, imageops};
-use rodio::{Decoder, DeviceSinkBuilder, Player, Source, buffer::SamplesBuffer};
+use rodio::{Decoder, DeviceSinkBuilder, Player};
 
 use crate::assets::{EMOTES, PINGS, WHEEL_TICK};
 use crate::gesture::Wheel;
+use crate::model::OverlaySettings;
 
+mod playback;
+pub(crate) use playback::{Animation, AnimationOverlay};
 mod wheel;
 
 enum AudioCue {
-    Clip(Wheel, usize),
-    Tick,
+    Clip(Wheel, usize, f32),
+    Tick(f32),
 }
 
 #[cfg(target_os = "macos")]
@@ -27,74 +29,103 @@ mod windows;
 #[cfg(target_os = "windows")]
 pub(crate) use windows::*;
 
-fn decode_animation(bytes: &'static [u8], size: u32) -> Vec<(RgbaImage, Duration)> {
-    let Ok(decoder) = WebPDecoder::new(Cursor::new(bytes)) else {
-        return Vec::new();
-    };
-    decoder
-        .into_frames()
-        .take(80)
-        .map_while(Result::ok)
-        .map(|frame| {
-            let (numerator, denominator) = frame.delay().numer_denom_ms();
-            let delay = (u64::from(numerator) / u64::from(denominator.max(1))).clamp(16, 220);
-            let scaled =
-                imageops::resize(frame.buffer(), size, size, imageops::FilterType::Triangle);
-            (scaled, Duration::from_millis(delay))
-        })
-        .collect()
+impl Overlay {
+    pub(crate) fn play(
+        &mut self,
+        kind: Wheel,
+        index: usize,
+        local: Option<crate::gesture::Position>,
+        location: Option<crate::model::Location>,
+        settings: OverlaySettings,
+        cx: &gpui_kit::App,
+    ) {
+        let (clip, size, timeout_ms) = match kind {
+            Wheel::Ping => (PINGS[index], settings.ping_size, settings.ping_timeout_ms),
+            Wheel::Emote => (
+                EMOTES[index],
+                settings.emote_size,
+                settings.emote_timeout_ms,
+            ),
+        };
+        let timeout = Duration::from_millis(u64::from(timeout_ms));
+        let animation = if animation_enabled() {
+            // The source canvases include room for expanding rings and emote effects.
+            // 素材画布为扩散光环和表情特效预留了空间。
+            let canvas = match kind {
+                Wheel::Ping => (size * 256).div_ceil(110),
+                Wheel::Emote => (size * 5).div_ceil(4),
+            };
+            Animation::webp(clip.animation, canvas, timeout).with_poster(clip.image)
+        } else {
+            Animation::still(clip.image, size, timeout)
+        };
+        self.animations.play(animation, local, location, cx);
+        if let Some(volume) = settings
+            .volume()
+            .filter(|_| kind != Wheel::Emote || settings.emote_sound)
+        {
+            let _ = self.audio.try_send(AudioCue::Clip(kind, index, volume));
+        }
+    }
 }
 
-// Predecode bundled clips on a worker so playback can enqueue them immediately.
-// 在后台预解码内置音效，播放时可立即加入音频队列。
-fn start_audio() -> Sender<AudioCue> {
-    let (sender, receiver) = async_channel::bounded::<AudioCue>(12);
+// Open the device for an audible burst; after silence the worker sleeps on the channel.
+// 收到音效再打开设备，静音后关闭设备，线程阻塞等待下一次请求。
+fn start_audio() -> SyncSender<AudioCue> {
+    let (sender, receiver) = mpsc::sync_channel::<AudioCue>(32);
     let _ = std::thread::Builder::new()
         .name("native-audio".into())
         .spawn(move || {
-            let output = match DeviceSinkBuilder::open_default_sink() {
-                Ok(output) => output,
-                Err(error) => {
-                    eprintln!("无法打开默认音频输出：{error}");
-                    return;
-                }
-            };
-            let decode = |bytes: &'static [u8]| {
-                let decoder = Decoder::try_from(Cursor::new(bytes)).ok()?;
-                let (channels, rate) = (decoder.channels(), decoder.sample_rate());
-                Some(SamplesBuffer::new(
-                    channels,
-                    rate,
-                    decoder.collect::<Vec<_>>(),
-                ))
-            };
-            let pings = PINGS.map(|clip| decode(clip.sound));
-            let emotes = EMOTES.map(|clip| decode(clip.sound));
-            let tick = decode(WHEEL_TICK);
-            let ticks = Player::connect_new(output.mixer());
-            ticks.set_volume(0.5);
-            let players: [Player; 3] = std::array::from_fn(|_| Player::connect_new(output.mixer()));
-            let sounds = std::iter::from_fn(|| receiver.recv_blocking().ok());
-            let mut slot = 0;
-            for cue in sounds {
-                let (player, sound) = match cue {
-                    AudioCue::Clip(wheel, index) => {
-                        let player = &players[slot];
-                        slot = (slot + 1) % players.len();
-                        (
-                            player,
-                            match wheel {
-                                Wheel::Ping => &pings[index],
-                                Wheel::Emote => &emotes[index],
-                            },
-                        )
+            while let Ok(mut cue) = receiver.recv() {
+                let mut output = match DeviceSinkBuilder::open_default_sink() {
+                    Ok(output) => output,
+                    Err(error) => {
+                        eprintln!("无法打开默认音频输出：{error}");
+                        continue;
                     }
-                    AudioCue::Tick => (&ticks, &tick),
                 };
-                if let Some(sound) = sound {
-                    player.clear();
-                    player.append(sound.clone());
-                    player.play();
+                output.log_on_drop(false);
+                let ticks = Player::connect_new(output.mixer());
+                let mut voices = std::collections::VecDeque::<Player>::new();
+                'burst: loop {
+                    let (voice, bytes, volume) = match cue {
+                        AudioCue::Clip(kind, index, volume) => {
+                            voices.retain(|voice| !voice.empty());
+                            if voices.len() == playback::MAX_ACTIVE {
+                                voices.pop_front();
+                            }
+                            voices.push_back(Player::connect_new(output.mixer()));
+                            let bytes = match kind {
+                                Wheel::Ping => PINGS[index].sound,
+                                Wheel::Emote => EMOTES[index].sound,
+                            };
+                            (voices.back().unwrap(), bytes, volume)
+                        }
+                        AudioCue::Tick(volume) => {
+                            ticks.clear();
+                            (&ticks, WHEEL_TICK, volume * 0.5)
+                        }
+                    };
+                    if let Ok(source) = Decoder::try_from(Cursor::new(bytes)) {
+                        voice.set_volume(volume);
+                        voice.append(source);
+                        voice.play();
+                    }
+                    loop {
+                        match receiver.recv_timeout(Duration::from_secs(2)) {
+                            Ok(next) => {
+                                cue = next;
+                                break;
+                            }
+                            Err(RecvTimeoutError::Disconnected) => return,
+                            Err(RecvTimeoutError::Timeout)
+                                if ticks.empty() && voices.iter().all(Player::empty) =>
+                            {
+                                break 'burst;
+                            }
+                            Err(RecvTimeoutError::Timeout) => continue,
+                        }
+                    }
                 }
             }
         });
@@ -104,21 +135,24 @@ fn start_audio() -> Sender<AudioCue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::{AnimationDecoder, codecs::webp::WebPDecoder};
 
     #[test]
-    fn every_bundled_effect_has_decodable_audio_and_emotes_have_frames() {
+    fn every_effect_has_audio_and_distinct_animation_frames() {
         for clip in PINGS.iter().chain(&EMOTES) {
             let mut audio = Decoder::try_from(Cursor::new(clip.sound)).unwrap();
             assert!(audio.any(|sample| sample.abs() > 0.001), "{}", clip.name);
-            if let Some(bytes) = clip.animation {
-                let decoder = WebPDecoder::new(Cursor::new(bytes)).unwrap();
-                let mut frames = decoder.into_frames();
-                assert!(
-                    matches!((frames.next(), frames.next()), (Some(Ok(_)), Some(Ok(_)))),
-                    "{}",
-                    clip.name
-                );
-            }
+            let decoder = WebPDecoder::new(Cursor::new(clip.animation)).unwrap();
+            let mut frames = decoder.into_frames();
+            let first = frames.next().unwrap().unwrap().into_buffer();
+            assert!(
+                frames
+                    .take(8)
+                    .map(Result::unwrap)
+                    .any(|f| f.buffer() != &first),
+                "{}",
+                clip.name
+            );
         }
     }
 }

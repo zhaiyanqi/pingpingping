@@ -6,9 +6,8 @@ use std::ptr;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
 
-use super::{AudioCue, decode_animation, start_audio, wheel::WheelView};
+use super::{AnimationOverlay, AudioCue, start_audio, wheel::WheelView};
 use async_channel::Sender;
 use core_foundation::base::TCFType;
 use core_foundation::mach_port::CFMachPortRef;
@@ -20,22 +19,19 @@ use core_graphics::event::{
     CGEventType,
 };
 use foreign_types::ForeignType;
-use gpui_kit::{App, Task};
-use image::RgbaImage;
-use objc2::{AnyThread, MainThreadMarker, MainThreadOnly, rc::Retained, runtime::AnyObject};
+use gpui_kit::App;
+
+use objc2::{MainThreadMarker, MainThreadOnly, rc::Retained, runtime::AnyObject};
 use objc2_app_kit::{
-    NSBackingStoreType, NSColor, NSFloatingWindowLevel, NSImage, NSPanel, NSScreen,
+    NSBackingStoreType, NSColor, NSFloatingWindowLevel, NSPanel, NSScreen,
     NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_core_graphics::CGImage;
-use objc2_foundation::{NSData, NSPoint, NSRect, NSSize};
+use objc2_foundation::{NSPoint, NSRect, NSSize};
 use objc2_quartz_core::{CALayer, CATransaction};
 
-use crate::assets::{Clip, EMOTES, PINGS};
 use crate::gesture::{Gesture, GestureEvent, Position, WHEEL_SIZE, Wheel};
 use crate::model::Location;
-
-const EFFECT_SIZE: f64 = 138.0;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -229,11 +225,6 @@ fn content(layer: &CALayer, image: Option<&CGImage>) {
     }
 }
 
-fn picture(clip: &Clip) -> Option<Retained<CGImage>> {
-    let image = NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(clip.image))?;
-    unsafe { image.CGImageForProposedRect_context_hints(ptr::null_mut(), None, None) }
-}
-
 // Disable implicit transitions so the wheel and its selection appear immediately.
 // 禁用隐式过渡，让轮盘及其选中项立即显示。
 fn update_layers(update: impl FnOnce()) {
@@ -259,7 +250,12 @@ fn place(panel: &NSPanel, point: NSPoint, size: f64, screen: NSRect) {
 struct Effect {
     panel: Retained<NSPanel>,
     art: Retained<CALayer>,
-    task: Option<Task<()>>,
+}
+
+impl Drop for Effect {
+    fn drop(&mut self) {
+        self.panel.orderOut(None);
+    }
 }
 
 pub(crate) struct Overlay {
@@ -267,11 +263,8 @@ pub(crate) struct Overlay {
     wheel: Retained<NSPanel>,
     wheel_art: Retained<CALayer>,
     wheel_view: WheelView,
-    ping_images: [Option<Retained<CGImage>>; 9],
-    emote_images: [Option<Retained<CGImage>>; EMOTES.len()],
-    effects: [Effect; 3],
-    next_effect: usize,
-    audio: Sender<AudioCue>,
+    pub(super) animations: AnimationOverlay,
+    pub(super) audio: std::sync::mpsc::SyncSender<AudioCue>,
 }
 
 impl Overlay {
@@ -282,23 +275,12 @@ impl Overlay {
             .firstObject()
             .map_or(1.0, |screen| screen.backingScaleFactor());
         let wheel_view = WheelView::new((f64::from(WHEEL_SIZE) * scale).round() as u32);
-        let effects = std::array::from_fn(|_| {
-            let (panel, art) = panel(EFFECT_SIZE, mtm);
-            Effect {
-                panel,
-                art,
-                task: None,
-            }
-        });
         Self {
             mtm,
             wheel,
             wheel_art,
             wheel_view,
-            ping_images: PINGS.map(|clip| picture(&clip)),
-            emote_images: EMOTES.map(|clip| picture(&clip)),
-            effects,
-            next_effect: 0,
+            animations: AnimationOverlay::default(),
             audio: start_audio(),
         }
     }
@@ -308,7 +290,7 @@ impl Overlay {
         kind: Wheel,
         position: Position,
         selected: Option<usize>,
-        sound: bool,
+        tick_volume: Option<f32>,
         cx: &App,
     ) {
         let Some((point, _)) = screen_for(position, self.mtm) else {
@@ -340,17 +322,19 @@ impl Overlay {
                 update_layers(|| content(&layer, None));
             }
         });
-        let animate = !NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
+        let animate = animation_enabled();
         self.wheel_view
             .open(kind, size, selected, animate, present, cx);
-        if sound && selected.is_some() {
-            let _ = self.audio.try_send(AudioCue::Tick);
+        if let Some(volume) = tick_volume.filter(|_| selected.is_some()) {
+            let _ = self.audio.try_send(AudioCue::Tick(volume));
         }
     }
 
-    pub(crate) fn select(&mut self, selected: Option<usize>, sound: bool, cx: &App) {
-        if self.wheel_view.select(selected, cx) && sound {
-            let _ = self.audio.try_send(AudioCue::Tick);
+    pub(crate) fn select(&mut self, selected: Option<usize>, tick_volume: Option<f32>, cx: &App) {
+        if self.wheel_view.select(selected, cx)
+            && let Some(volume) = tick_volume
+        {
+            let _ = self.audio.try_send(AudioCue::Tick(volume));
         }
     }
 
@@ -361,90 +345,46 @@ impl Overlay {
     pub(crate) fn hide(&mut self) {
         self.wheel_view.hide();
     }
-
-    pub(crate) fn play(
-        &mut self,
-        kind: Wheel,
-        index: usize,
-        local: Option<Position>,
-        location: Option<Location>,
-        sound: bool,
-        cx: &App,
-    ) {
-        let (clip, image) = match kind {
-            Wheel::Ping => (&PINGS[index], self.ping_images[index].as_deref()),
-            Wheel::Emote => (&EMOTES[index], self.emote_images[index].as_deref()),
-        };
-        let target = local
-            .and_then(|point| screen_for(point, self.mtm))
-            .or_else(|| {
-                let screen = NSScreen::screens(self.mtm).firstObject()?.frame();
-                let location = location.unwrap_or(Location { x: 0.5, y: 0.5 });
-                Some((
-                    NSPoint::new(
-                        screen.origin.x + location.x * screen.size.width,
-                        screen.origin.y + (1.0 - location.y) * screen.size.height,
-                    ),
-                    screen,
-                ))
-            });
-        let Some((point, screen)) = target else {
-            return;
-        };
-        let slot = self.next_effect;
-        self.next_effect = (self.next_effect + 1) % self.effects.len();
-        let effect = &mut self.effects[slot];
-        effect.task.take();
-        update_layers(|| {
-            effect.art.setOpacity(1.0);
-            content(&effect.art, image);
-        });
-        place(&effect.panel, point, EFFECT_SIZE, screen);
-        if sound {
-            let _ = self.audio.try_send(AudioCue::Clip(kind, index));
-        }
-
-        let reduce_motion = NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
-        let animation = clip.animation.filter(|_| !reduce_motion);
-        let panel = effect.panel.clone();
-        let art = effect.art.clone();
-        effect.task = Some(cx.spawn(async move |cx| {
-            let started = Instant::now();
-            if let Some(bytes) = animation {
-                let frames = cx
-                    .background_executor()
-                    .spawn(async move { decode_animation(bytes, 192) })
-                    .await;
-                for (frame, delay) in frames {
-                    if started.elapsed() > Duration::from_millis(1850) {
-                        break;
-                    }
-                    update_layers(|| set_frame(&art, frame));
-                    cx.background_executor().timer(delay).await;
-                }
-            }
-            let remainder = Duration::from_millis(1400).saturating_sub(started.elapsed());
-            if !remainder.is_zero() {
-                cx.background_executor().timer(remainder).await;
-            }
-            if !reduce_motion {
-                CATransaction::begin();
-                CATransaction::setAnimationDuration(0.16);
-                art.setOpacity(0.0);
-                CATransaction::commit();
-                cx.background_executor()
-                    .timer(Duration::from_millis(160))
-                    .await;
-            }
-            panel.orderOut(None);
-            update_layers(|| content(&art, None));
-        }));
-    }
 }
 
-fn set_frame(layer: &CALayer, frame: RgbaImage) {
-    let (width, height) = frame.dimensions();
-    set_pixels(layer, width, height, frame.into_raw(), 3);
+pub(super) fn animation_presenter(
+    size: u32,
+    local: Option<Position>,
+    location: Option<Location>,
+) -> Option<(Option<u32>, impl FnMut(image::RgbaImage))> {
+    let mtm = MainThreadMarker::new()?;
+    let (point, screen) = local.and_then(|point| screen_for(point, mtm)).or_else(|| {
+        let screen = NSScreen::screens(mtm).firstObject()?.frame();
+        let location = location.unwrap_or(Location { x: 0.5, y: 0.5 });
+        Some((
+            NSPoint::new(
+                screen.origin.x + location.x * screen.size.width,
+                screen.origin.y + (1.0 - location.y) * screen.size.height,
+            ),
+            screen,
+        ))
+    })?;
+    let size = f64::from(size);
+    let mut effect = None;
+    Some((None, move |frame: image::RgbaImage| {
+        let window = effect.get_or_insert_with(|| {
+            let (panel, art) = panel(size, mtm);
+            art.setContentsGravity(unsafe { objc2_quartz_core::kCAGravityResizeAspect });
+            Effect { panel, art }
+        });
+        update_layers(|| {
+            set_pixels(
+                &window.art,
+                frame.width(),
+                frame.height(),
+                frame.into_raw(),
+                3,
+            )
+        });
+        if !window.panel.isVisible() {
+            place(&window.panel, point, size, screen);
+        }
+    }))
 }
 
 fn set_pixels(layer: &CALayer, width: u32, height: u32, bytes: Vec<u8>, alpha: u32) {
@@ -462,4 +402,8 @@ fn set_pixels(layer: &CALayer, width: u32, height: u32, bytes: Vec<u8>, alpha: u
         0,
     );
     unsafe { layer.setContents(Some(&*image.as_ptr().cast::<AnyObject>())) };
+}
+
+pub(super) fn animation_enabled() -> bool {
+    !NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
 }

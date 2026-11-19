@@ -11,11 +11,10 @@ use std::sync::{
     mpsc,
 };
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 
 use async_channel::Sender;
-use gpui_kit::{App, Task};
-use image::{RgbaImage, imageops};
+use gpui_kit::App;
+use image::RgbaImage;
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
     Graphics::Gdi::*,
@@ -23,12 +22,9 @@ use windows_sys::Win32::{
     UI::{HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
 
-use super::{AudioCue, decode_animation, start_audio, wheel::WheelView};
-use crate::assets::{EMOTES, PINGS};
+use super::{AnimationOverlay, AudioCue, start_audio, wheel::WheelView};
 use crate::gesture::{Gesture, GestureEvent, Position, WHEEL_SIZE, Wheel};
 use crate::model::Location;
-
-const EFFECT_SIZE: u32 = 138;
 
 pub(crate) fn init_dpi() {
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
@@ -353,24 +349,6 @@ impl Surface {
             })
         }
     }
-
-    // UpdateLayeredWindow expects premultiplied BGRA pixels in the DIB.
-    // UpdateLayeredWindow 要求 DIB 使用预乘透明度的 BGRA 像素。
-    fn write(&mut self, image: &RgbaImage) {
-        let bytes = unsafe {
-            std::slice::from_raw_parts_mut(self.bits, self.size as usize * self.size as usize * 4)
-        };
-        for (dest, source) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(image.pixels()) {
-            let alpha = u32::from(source[3]);
-            let premultiply = |channel: u8| ((u32::from(channel) * alpha + 127) / 255) as u8;
-            *dest = [
-                premultiply(source[2]),
-                premultiply(source[1]),
-                premultiply(source[0]),
-                source[3],
-            ];
-        }
-    }
 }
 
 impl Drop for Surface {
@@ -433,7 +411,13 @@ impl Layer {
     fn frame(&mut self, image: &RgbaImage, origin: POINT) {
         self.warm(image.width());
         if let Some(surface) = &mut self.surface {
-            surface.write(image);
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    surface.bits,
+                    surface.size as usize * surface.size as usize * 4,
+                )
+            };
+            bytes.copy_from_slice(image.as_raw());
             self.present(origin, 255);
         }
     }
@@ -494,7 +478,8 @@ impl Layer {
         }
     }
 
-    fn hide(&self) {
+    fn hide(&mut self) {
+        self.surface = None;
         if !self.hwnd.is_null() {
             unsafe { ShowWindow(self.hwnd, SW_HIDE) };
         }
@@ -509,49 +494,21 @@ impl Drop for Layer {
     }
 }
 
-struct Effect {
-    layer: Rc<RefCell<Layer>>,
-    task: Option<Task<()>>,
-}
-
 pub(crate) struct Overlay {
     wheel: Rc<RefCell<Layer>>,
     wheel_view: WheelView,
-    pings: [RgbaImage; 9],
-    emotes: [RgbaImage; EMOTES.len()],
-    effects: [Effect; 3],
-    next_effect: usize,
-    audio: Sender<AudioCue>,
+    pub(super) animations: AnimationOverlay,
+    pub(super) audio: std::sync::mpsc::SyncSender<AudioCue>,
 }
 
 impl Overlay {
     pub(crate) fn new() -> Self {
-        let decode = |clip: crate::assets::Clip| {
-            image::load_from_memory_with_format(clip.image, image::ImageFormat::Png)
-                .map_or_else(|_| RgbaImage::new(1, 1), |image| image.to_rgba8())
-        };
-        let pings = PINGS.map(decode);
-        let emotes = EMOTES.map(decode);
         let (_, dpi) = screen(POINT::default(), true);
-        let mut wheel = Layer::new();
-        wheel.warm(pixels(WHEEL_SIZE, dpi));
-        // Reuse hidden windows and pixel buffers for the first visible frame.
-        // 复用隐藏窗口和像素缓冲区以缩短首帧等待。
-        let effects = std::array::from_fn(|_| {
-            let mut layer = Layer::new();
-            layer.warm(pixels(EFFECT_SIZE, dpi));
-            Effect {
-                layer: Rc::new(RefCell::new(layer)),
-                task: None,
-            }
-        });
+        let wheel = Layer::new();
         Self {
             wheel: Rc::new(RefCell::new(wheel)),
             wheel_view: WheelView::new(pixels(WHEEL_SIZE, dpi)),
-            pings,
-            emotes,
-            effects,
-            next_effect: 0,
+            animations: AnimationOverlay::default(),
             audio: start_audio(),
         }
     }
@@ -561,7 +518,7 @@ impl Overlay {
         wheel: Wheel,
         position: Position,
         selected: Option<usize>,
-        sound: bool,
+        tick_volume: Option<f32>,
         cx: &App,
     ) {
         let point = point(position);
@@ -576,19 +533,21 @@ impl Overlay {
             if let Some(frame) = frame {
                 layer.borrow_mut().wheel_frame(frame, origin);
             } else {
-                layer.borrow().hide();
+                layer.borrow_mut().hide();
             }
         });
         self.wheel_view
             .open(wheel, size, selected, animation_enabled(), present, cx);
-        if sound && selected.is_some() {
-            let _ = self.audio.try_send(AudioCue::Tick);
+        if let Some(volume) = tick_volume.filter(|_| selected.is_some()) {
+            let _ = self.audio.try_send(AudioCue::Tick(volume));
         }
     }
 
-    pub(crate) fn select(&mut self, selection: Option<usize>, sound: bool, cx: &App) {
-        if self.wheel_view.select(selection, cx) && sound {
-            let _ = self.audio.try_send(AudioCue::Tick);
+    pub(crate) fn select(&mut self, selection: Option<usize>, tick_volume: Option<f32>, cx: &App) {
+        if self.wheel_view.select(selection, cx)
+            && let Some(volume) = tick_volume
+        {
+            let _ = self.audio.try_send(AudioCue::Tick(volume));
         }
     }
 
@@ -599,82 +558,35 @@ impl Overlay {
     pub(crate) fn hide(&mut self) {
         self.wheel_view.hide();
     }
-
-    pub(crate) fn play(
-        &mut self,
-        wheel: Wheel,
-        index: usize,
-        local: Option<Position>,
-        location: Option<Location>,
-        sound: bool,
-        cx: &App,
-    ) {
-        let (image, clip) = match wheel {
-            Wheel::Ping => (&self.pings[index], &PINGS[index]),
-            Wheel::Emote => (&self.emotes[index], &EMOTES[index]),
-        };
-        let (point, bounds, dpi) = if let Some(local) = local {
-            let point = point(local);
-            let (bounds, dpi) = screen(point, false);
-            (point, bounds, dpi)
-        } else {
-            let (bounds, dpi) = screen(POINT::default(), true);
-            let location = location.unwrap_or(Location { x: 0.5, y: 0.5 });
-            let point = POINT {
-                x: bounds.left + (location.x * f64::from(bounds.right - bounds.left)) as i32,
-                y: bounds.top + (location.y * f64::from(bounds.bottom - bounds.top)) as i32,
-            };
-            (point, bounds, dpi)
-        };
-        let size = pixels(EFFECT_SIZE, dpi);
-        let origin = fit(point, bounds, size);
-        let slot = self.next_effect;
-        self.next_effect = (slot + 1) % self.effects.len();
-        let effect = &mut self.effects[slot];
-        effect.task.take();
-        effect.layer.borrow_mut().frame(
-            &imageops::resize(image, size, size, imageops::FilterType::Triangle),
-            origin,
-        );
-        if sound {
-            let _ = self.audio.try_send(AudioCue::Clip(wheel, index));
-        }
-        let animation_enabled = animation_enabled();
-        let bytes = clip.animation.filter(|_| animation_enabled);
-        let layer = effect.layer.clone();
-        effect.task = Some(cx.spawn(async move |cx| {
-            let started = Instant::now();
-            if let Some(bytes) = bytes {
-                let frames = cx
-                    .background_executor()
-                    .spawn(async move { decode_animation(bytes, size) })
-                    .await;
-                for (frame, delay) in frames {
-                    if started.elapsed() > Duration::from_millis(1850) {
-                        break;
-                    }
-                    layer.borrow_mut().frame(&frame, origin);
-                    cx.background_executor().timer(delay).await;
-                }
-            }
-            let remainder = Duration::from_millis(1400).saturating_sub(started.elapsed());
-            if !remainder.is_zero() {
-                cx.background_executor().timer(remainder).await;
-            }
-            if animation_enabled {
-                for opacity in [215, 175, 135, 95, 55, 15] {
-                    layer.borrow().present(origin, opacity);
-                    cx.background_executor()
-                        .timer(Duration::from_millis(16))
-                        .await;
-                }
-            }
-            layer.borrow().hide();
-        }));
-    }
 }
 
-fn animation_enabled() -> bool {
+pub(super) fn animation_presenter(
+    size: u32,
+    local: Option<Position>,
+    location: Option<Location>,
+) -> Option<(Option<u32>, impl FnMut(image::RgbaImage))> {
+    let (point, bounds, dpi) = if let Some(local) = local {
+        let point = point(local);
+        let (bounds, dpi) = screen(point, false);
+        (point, bounds, dpi)
+    } else {
+        let (bounds, dpi) = screen(POINT::default(), true);
+        let location = location.unwrap_or(Location { x: 0.5, y: 0.5 });
+        let point = POINT {
+            x: bounds.left + (location.x * f64::from(bounds.right - bounds.left)) as i32,
+            y: bounds.top + (location.y * f64::from(bounds.bottom - bounds.top)) as i32,
+        };
+        (point, bounds, dpi)
+    };
+    let size = pixels(size, dpi);
+    let origin = fit(point, bounds, size);
+    let mut layer = None;
+    Some((Some(size), move |frame: RgbaImage| {
+        layer.get_or_insert_with(Layer::new).frame(&frame, origin);
+    }))
+}
+
+pub(super) fn animation_enabled() -> bool {
     let mut enabled = 1i32;
     unsafe {
         SystemParametersInfoW(

@@ -1,6 +1,7 @@
 //! GPUI Kit chat, history, and settings windows.
 //! 使用 GPUI Kit 实现的聊天、历史和设置窗口。
 
+use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,6 +13,7 @@ use gpui_kit::component::{
     ActiveTheme, Disableable,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
+    slider::{Slider, SliderState},
     switch::Switch,
 };
 use gpui_kit::prelude::FluentBuilder;
@@ -19,7 +21,10 @@ use gpui_kit::*;
 
 use crate::assets::{EMOTE_WHEEL, EMOTES, PINGS};
 use crate::gesture::{GestureEvent, Wheel};
-use crate::model::{Body, Message, Model, Profile};
+use crate::model::{
+    ANIMATION_TIMEOUT, Body, EMOTE_SIZE, Message, Model, OverlaySettings, PING_SIZE, Profile,
+    SOUND_VOLUME,
+};
 use crate::platform::{self, InputMonitor, Overlay};
 use crate::room::{DEFAULT_PORT, Room, RoomConfig, RoomEvent};
 
@@ -222,22 +227,27 @@ fn play(body: &Body, cx: &mut App) {
         Body::Ping { index, .. } => (Wheel::Ping, *index),
         Body::Text(_) => return,
     };
-    let sound = cx.global::<Desktop>().model.read(cx).profile.sound;
+    let profile = &cx.global::<Desktop>().model.read(cx).profile;
+    let settings = profile.overlay.with_sound(profile.sound);
     cx.update_global::<Desktop, _>(|desktop, cx| {
         desktop
             .overlay
-            .play(kind, index, None, body.location(), sound, cx);
+            .play(kind, index, None, body.location(), settings, cx);
     });
 }
 
 fn handle_gesture(event: GestureEvent, cx: &mut App) {
     let profile = &cx.global::<Desktop>().model.read(cx).profile;
-    let (enabled, sound) = (profile.gestures, profile.sound);
+    let enabled = profile.gestures;
+    let settings = profile.overlay.with_sound(profile.sound);
+    let tick_volume = settings.volume().filter(|_| settings.wheel_sound);
     cx.update_global::<Desktop, _>(|desktop, cx| match event {
         GestureEvent::Open(kind, origin, selected) if enabled => {
-            desktop.overlay.open(kind, origin, selected, sound, cx)
+            desktop
+                .overlay
+                .open(kind, origin, selected, tick_volume, cx)
         }
-        GestureEvent::Select(index) if enabled => desktop.overlay.select(index, sound, cx),
+        GestureEvent::Select(index) if enabled => desktop.overlay.select(index, tick_volume, cx),
         GestureEvent::Finish(choice) => {
             desktop.overlay.close(cx);
             if let Some((kind, index, origin)) = choice.filter(|_| enabled) {
@@ -256,7 +266,7 @@ fn handle_gesture(event: GestureEvent, cx: &mut App) {
                 };
                 desktop
                     .overlay
-                    .play(kind, index, Some(origin), Some(location), sound, cx);
+                    .play(kind, index, Some(origin), Some(location), settings, cx);
                 desktop
                     .model
                     .update(cx, |model, cx| match model.send(body) {
@@ -831,6 +841,13 @@ struct Settings {
     sound: bool,
     gestures: bool,
     remote_overlay: bool,
+    ping_size: Entity<SliderState>,
+    emote_size: Entity<SliderState>,
+    ping_timeout: Entity<SliderState>,
+    emote_timeout: Entity<SliderState>,
+    volume: Entity<SliderState>,
+    emote_sound: bool,
+    wheel_sound: bool,
     feedback: Option<(bool, String)>,
     connection_error: Option<String>,
     connecting: Option<Task<()>>,
@@ -847,6 +864,7 @@ impl Settings {
             sound,
             gestures,
             remote_overlay,
+            overlay,
             ..
         } = model.read(cx).profile.clone();
         let name = cx.new(|cx| InputState::new(window, cx).default_value(name));
@@ -867,7 +885,12 @@ impl Settings {
                     .to_string(),
             )
         });
-        let subscriptions = vec![
+        let ping_size = setting_slider(cx, PING_SIZE, 1, overlay.ping_size);
+        let emote_size = setting_slider(cx, EMOTE_SIZE, 1, overlay.emote_size);
+        let ping_timeout = setting_slider(cx, ANIMATION_TIMEOUT, 100, overlay.ping_timeout_ms);
+        let emote_timeout = setting_slider(cx, ANIMATION_TIMEOUT, 100, overlay.emote_timeout_ms);
+        let volume = setting_slider(cx, SOUND_VOLUME, 1, overlay.volume);
+        let mut subscriptions = vec![
             cx.observe(&model, |_, _, cx| cx.notify()),
             cx.subscribe_in(&ip, window, |this, _, event, _, cx| {
                 if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
@@ -880,6 +903,17 @@ impl Settings {
                 }
             }),
         ];
+        subscriptions.extend(
+            [
+                &ping_size,
+                &emote_size,
+                &ping_timeout,
+                &emote_timeout,
+                &volume,
+            ]
+            .into_iter()
+            .map(|slider| cx.observe(slider, |_, _, cx| cx.notify())),
+        );
         Self {
             model,
             name,
@@ -888,11 +922,37 @@ impl Settings {
             sound,
             gestures,
             remote_overlay,
+            ping_size,
+            emote_size,
+            ping_timeout,
+            emote_timeout,
+            volume,
+            emote_sound: overlay.emote_sound,
+            wheel_sound: overlay.wheel_sound,
             feedback: None,
             connection_error: None,
             connecting: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    fn overlay_settings(&self, cx: &App) -> OverlaySettings {
+        OverlaySettings {
+            ping_size: self.ping_size.read(cx).value().start().round() as u32,
+            emote_size: self.emote_size.read(cx).value().start().round() as u32,
+            ping_timeout_ms: self.ping_timeout.read(cx).value().start().round() as u32,
+            emote_timeout_ms: self.emote_timeout.read(cx).value().start().round() as u32,
+            volume: self.volume.read(cx).value().start().round() as u32,
+            emote_sound: self.emote_sound,
+            wheel_sound: self.wheel_sound,
+        }
+    }
+
+    fn preview(&self, kind: Wheel, cx: &mut App) {
+        let settings = self.overlay_settings(cx).with_sound(self.sound);
+        cx.update_global::<Desktop, _>(|desktop, cx| {
+            desktop.overlay.play(kind, 0, None, None, settings, cx);
+        });
     }
 
     fn save(&mut self, cx: &mut Context<Self>) {
@@ -901,6 +961,7 @@ impl Settings {
         profile.sound = self.sound;
         profile.gestures = self.gestures;
         profile.remote_overlay = self.remote_overlay;
+        profile.overlay = self.overlay_settings(cx);
         let result = self.model.update(cx, |model, cx| {
             model.apply(profile.clone())?;
             cx.notify();
@@ -982,6 +1043,40 @@ impl Settings {
     }
 }
 
+fn setting_slider(
+    cx: &mut App,
+    range: RangeInclusive<u32>,
+    step: u32,
+    value: u32,
+) -> Entity<SliderState> {
+    cx.new(|_| {
+        SliderState::new()
+            .min(*range.start() as f32)
+            .max(*range.end() as f32)
+            .step(step as f32)
+            .default_value(value as f32)
+    })
+}
+
+fn slider_field(label: &'static str, value: String, slider: Slider) -> Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .flex()
+                .justify_between()
+                .gap_2()
+                .text_sm()
+                .child(label)
+                .child(value),
+        )
+        .child(slider)
+}
+
 impl Render for Settings {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let model = self.model.read(cx);
@@ -993,8 +1088,8 @@ impl Render for Settings {
             .or_else(|| (!busy).then(|| model.room_error.clone()).flatten());
         let active = model.input_ready;
         let theme = cx.theme().clone();
-        div().id("settings-scroll").size_full().overflow_y_scroll().p_5().flex().flex_col().gap_5()
-            .bg(theme.background).text_color(theme.foreground)
+        let overlay = self.overlay_settings(cx);
+        let content = div().id("settings-scroll").flex_1().min_h_0().overflow_y_scroll().p_5().flex().flex_col().gap_5()
             .child(div().flex().flex_col().gap_2()
                 .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child("昵称"))
                 .child(Input::new(&self.name)))
@@ -1039,10 +1134,6 @@ impl Render for Settings {
                 }))
                 .child(Switch::new("gestures").label("启用全局轮盘").checked(self.gestures)
                     .on_change(cx.listener(|this, value, _, cx| { this.gestures = *value; cx.notify(); })))
-                .child(Switch::new("sound").label("播放音效").checked(self.sound)
-                    .on_change(cx.listener(|this, value, _, cx| { this.sound = *value; cx.notify(); })))
-                .child(Switch::new("room-overlay").label("在桌面播放房间信号和表情").checked(self.remote_overlay)
-                    .on_change(cx.listener(|this, value, _, cx| { this.remote_overlay = *value; cx.notify(); })))
                 .when(!active, |group| group
                     .child(div().text_sm().text_color(theme.muted_foreground).child(if cfg!(target_os = "macos") {
                         "请在系统设置的「隐私与安全性 → 输入监控」中授权，再重试。"
@@ -1053,11 +1144,69 @@ impl Render for Settings {
                         let row = row.child(Button::new("permission").label("请求输入监控权限…").on_click(|_, _, _| platform::request_input_access()));
                         row.child(Button::new("retry").ghost().label("重新检测").on_click(cx.listener(|this, _, _, cx| this.retry_input(cx))))
                     })))
-            .child(div().flex().items_center().justify_between().gap_3().border_t_1().border_color(theme.border).pt_4()
-                .child(div().flex_1().text_sm().when_some(self.feedback.clone(), |label, (ok, message)| {
-                    label.text_color(if ok { theme.muted_foreground } else { theme.danger }).child(message)
-                }))
-                .child(Button::new("save").primary().label("保存设置")
-                    .on_click(cx.listener(|this, _, _, cx| this.save(cx)))))
+            .child(div().flex().flex_col().gap_3().border_t_1().border_color(theme.border).pt_4()
+                .child(div().flex().items_center().justify_between().gap_2()
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("桌面动画"))
+                    .child(Button::new("preview-ping").label("预览信号")
+                        .on_click(cx.listener(|this, _, _, cx| this.preview(Wheel::Ping, cx)))))
+                .child(div().flex().gap_5()
+                    .child(slider_field("信号大小", format!("{} px", overlay.ping_size), Slider::new(&self.ping_size)))
+                    .child(slider_field("信号停留时长", format!("{:.1} 秒", overlay.ping_timeout_ms as f32 / 1000.), Slider::new(&self.ping_timeout))))
+                .child(div().flex().items_center().justify_between().gap_2()
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("表情"))
+                    .child(Button::new("preview-emote").label("预览表情")
+                        .on_click(cx.listener(|this, _, _, cx| this.preview(Wheel::Emote, cx)))))
+                .child(div().flex().gap_5()
+                    .child(slider_field("表情大小", format!("{} px", overlay.emote_size), Slider::new(&self.emote_size)))
+                    .child(slider_field("表情停留时长", format!("{:.1} 秒", overlay.emote_timeout_ms as f32 / 1000.), Slider::new(&self.emote_timeout))))
+                .child(Switch::new("room-overlay").label("在桌面播放房间信号和表情").checked(self.remote_overlay)
+                    .on_change(cx.listener(|this, value, _, cx| { this.remote_overlay = *value; cx.notify(); }))))
+            .child(div().flex().flex_col().gap_3().border_t_1().border_color(theme.border).pt_4()
+                .child(div().font_weight(FontWeight::SEMIBOLD).child("音效"))
+                .child(Switch::new("sound").label("播放音效").checked(self.sound)
+                    .on_change(cx.listener(|this, value, _, cx| { this.sound = *value; cx.notify(); })))
+                .child(slider_field("音量", format!("{}%", overlay.volume), Slider::new(&self.volume).disabled(!self.sound)))
+                .child(div().flex().flex_wrap().gap_5()
+                    .child(Switch::new("emote-sound").label("表情音效").checked(self.emote_sound).disabled(!self.sound)
+                        .on_change(cx.listener(|this, value, _, cx| { this.emote_sound = *value; cx.notify(); })))
+                    .child(Switch::new("wheel-sound").label("轮盘提示音").checked(self.wheel_sound).disabled(!self.sound)
+                        .on_change(cx.listener(|this, value, _, cx| { this.wheel_sound = *value; cx.notify(); })))));
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme.background)
+            .text_color(theme.foreground)
+            .child(content)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .px_5()
+                    .py_3()
+                    .flex_shrink_0()
+                    .child(div().flex_1().text_sm().when_some(
+                        self.feedback.clone(),
+                        |label, (ok, message)| {
+                            label
+                                .text_color(if ok {
+                                    theme.muted_foreground
+                                } else {
+                                    theme.danger
+                                })
+                                .child(message)
+                        },
+                    ))
+                    .child(
+                        Button::new("save")
+                            .primary()
+                            .label("保存设置")
+                            .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                    ),
+            )
     }
 }

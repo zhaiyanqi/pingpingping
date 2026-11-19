@@ -4,6 +4,7 @@
 use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -98,6 +99,67 @@ fn now() -> u64 {
         .as_secs()
 }
 
+pub(crate) const PING_SIZE: RangeInclusive<u32> = 60..=220;
+pub(crate) const EMOTE_SIZE: RangeInclusive<u32> = 80..=300;
+pub(crate) const ANIMATION_TIMEOUT: RangeInclusive<u32> = 1000..=8000;
+pub(crate) const SOUND_VOLUME: RangeInclusive<u32> = 0..=100;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
+pub(crate) struct OverlaySettings {
+    pub(crate) ping_size: u32,
+    pub(crate) emote_size: u32,
+    pub(crate) ping_timeout_ms: u32,
+    pub(crate) emote_timeout_ms: u32,
+    pub(crate) volume: u32,
+    pub(crate) emote_sound: bool,
+    pub(crate) wheel_sound: bool,
+}
+
+impl Default for OverlaySettings {
+    fn default() -> Self {
+        Self {
+            ping_size: 110,
+            emote_size: 150,
+            ping_timeout_ms: 3200,
+            emote_timeout_ms: 3000,
+            volume: 70,
+            emote_sound: true,
+            wheel_sound: true,
+        }
+    }
+}
+
+impl OverlaySettings {
+    fn normalize(&mut self) {
+        self.ping_size = self.ping_size.clamp(*PING_SIZE.start(), *PING_SIZE.end());
+        self.emote_size = self
+            .emote_size
+            .clamp(*EMOTE_SIZE.start(), *EMOTE_SIZE.end());
+        self.ping_timeout_ms = self
+            .ping_timeout_ms
+            .clamp(*ANIMATION_TIMEOUT.start(), *ANIMATION_TIMEOUT.end());
+        self.emote_timeout_ms = self
+            .emote_timeout_ms
+            .clamp(*ANIMATION_TIMEOUT.start(), *ANIMATION_TIMEOUT.end());
+        self.volume = self
+            .volume
+            .clamp(*SOUND_VOLUME.start(), *SOUND_VOLUME.end());
+    }
+
+    pub(crate) fn with_sound(mut self, enabled: bool) -> Self {
+        if !enabled {
+            self.volume = 0;
+        }
+        self
+    }
+
+    pub(crate) fn volume(self) -> Option<f32> {
+        (self.volume > 0).then_some(self.volume as f32 / 100.0)
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Profile {
     pub(crate) id: Uuid,
@@ -107,6 +169,8 @@ pub(crate) struct Profile {
     pub(crate) sound: bool,
     pub(crate) gestures: bool,
     pub(crate) remote_overlay: bool,
+    #[serde(default)]
+    pub(crate) overlay: OverlaySettings,
 }
 
 impl Default for Profile {
@@ -118,6 +182,7 @@ impl Default for Profile {
             sound: true,
             gestures: true,
             remote_overlay: true,
+            overlay: OverlaySettings::default(),
         }
     }
 }
@@ -185,7 +250,7 @@ impl Model {
         fs::create_dir_all(&data_dir).context("无法创建应用数据目录")?;
         let profile_path = data_dir.join("settings.json");
         let history_path = data_dir.join("history.json");
-        let profile: Profile = match load_json(&profile_path).context("无法读取设置")? {
+        let mut profile: Profile = match load_json(&profile_path).context("无法读取设置")? {
             Some(profile) => profile,
             None => {
                 let profile = Profile::default();
@@ -193,6 +258,7 @@ impl Model {
                 profile
             }
         };
+        profile.overlay.normalize();
         let mut history: VecDeque<Entry> = load_json(&history_path)
             .context("无法读取历史记录")?
             .unwrap_or_default();
@@ -268,7 +334,7 @@ impl Model {
         self.disk_thread.take()
     }
 
-    pub(crate) fn apply(&mut self, profile: Profile) -> Result<()> {
+    pub(crate) fn apply(&mut self, mut profile: Profile) -> Result<()> {
         ensure!(
             !profile.name.is_empty()
                 && profile.name.len() <= 64
@@ -278,6 +344,7 @@ impl Model {
                     .all(|character| !character.is_control()),
             "请输入昵称（最多 64 字节）"
         );
+        profile.overlay.normalize();
         save_json(&self.data_dir.join("settings.json"), &profile).context("无法保存设置")?;
         self.profile = profile;
         Ok(())
@@ -353,6 +420,19 @@ impl Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_profiles_use_defaults_for_overlay_settings() {
+        let profile = Profile {
+            sound: false,
+            ..Profile::default()
+        };
+        let mut legacy = serde_json::to_value(&profile).unwrap();
+        legacy.as_object_mut().unwrap().remove("overlay");
+        let loaded: Profile = serde_json::from_value(legacy).unwrap();
+        assert_eq!(loaded.overlay, OverlaySettings::default());
+        assert!(loaded.overlay.with_sound(loaded.sound).volume().is_none());
+    }
 
     #[test]
     fn emote_history_and_identity_survive_reopening() {
