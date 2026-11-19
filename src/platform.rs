@@ -8,8 +8,15 @@ use async_channel::Sender;
 use image::{AnimationDecoder, RgbaImage, codecs::webp::WebPDecoder, imageops};
 use rodio::{Decoder, DeviceSinkBuilder, Player, Source, buffer::SamplesBuffer};
 
-use crate::assets::{Clip, EMOTES, PINGS};
+use crate::assets::{EMOTES, PINGS, WHEEL_TICK};
 use crate::gesture::Wheel;
+
+mod wheel;
+
+enum AudioCue {
+    Clip(Wheel, usize),
+    Tick,
+}
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -40,8 +47,8 @@ fn decode_animation(bytes: &'static [u8], size: u32) -> Vec<(RgbaImage, Duration
 
 // Predecode bundled clips on a worker so playback can enqueue them immediately.
 // 在后台预解码内置音效，播放时可立即加入音频队列。
-fn start_audio() -> Sender<(Wheel, usize)> {
-    let (sender, receiver) = async_channel::bounded::<(Wheel, usize)>(12);
+fn start_audio() -> Sender<AudioCue> {
+    let (sender, receiver) = async_channel::bounded::<AudioCue>(12);
     let _ = std::thread::Builder::new()
         .name("native-audio".into())
         .spawn(move || {
@@ -52,8 +59,8 @@ fn start_audio() -> Sender<(Wheel, usize)> {
                     return;
                 }
             };
-            let decode = |clip: Clip| {
-                let decoder = Decoder::try_from(Cursor::new(clip.sound)).ok()?;
+            let decode = |bytes: &'static [u8]| {
+                let decoder = Decoder::try_from(Cursor::new(bytes)).ok()?;
                 let (channels, rate) = (decoder.channels(), decoder.sample_rate());
                 Some(SamplesBuffer::new(
                     channels,
@@ -61,19 +68,33 @@ fn start_audio() -> Sender<(Wheel, usize)> {
                     decoder.collect::<Vec<_>>(),
                 ))
             };
-            let pings = PINGS.map(decode);
-            let emotes = EMOTES.map(decode);
+            let pings = PINGS.map(|clip| decode(clip.sound));
+            let emotes = EMOTES.map(|clip| decode(clip.sound));
+            let tick = decode(WHEEL_TICK);
+            let ticks = Player::connect_new(output.mixer());
+            ticks.set_volume(0.5);
             let players: [Player; 3] = std::array::from_fn(|_| Player::connect_new(output.mixer()));
             let sounds = std::iter::from_fn(|| receiver.recv_blocking().ok());
-            for (slot, (wheel, index)) in (0..players.len()).cycle().zip(sounds) {
-                let sound = match wheel {
-                    Wheel::Ping => &pings[index],
-                    Wheel::Emote => &emotes[index],
+            let mut slot = 0;
+            for cue in sounds {
+                let (player, sound) = match cue {
+                    AudioCue::Clip(wheel, index) => {
+                        let player = &players[slot];
+                        slot = (slot + 1) % players.len();
+                        (
+                            player,
+                            match wheel {
+                                Wheel::Ping => &pings[index],
+                                Wheel::Emote => &emotes[index],
+                            },
+                        )
+                    }
+                    AudioCue::Tick => (&ticks, &tick),
                 };
                 if let Some(sound) = sound {
-                    players[slot].clear();
-                    players[slot].append(sound.clone());
-                    players[slot].play();
+                    player.clear();
+                    player.append(sound.clone());
+                    player.play();
                 }
             }
         });

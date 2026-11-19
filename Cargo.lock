@@ -5131,6 +5131,8 @@ dependencies = [
  "serde",
  "serde_json",
  "smol",
+ "tiny-skia",
+ "ttf-parser",
  "uuid",
  "windows-sys 0.61.2",
 ]

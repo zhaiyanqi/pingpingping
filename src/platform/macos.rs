@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use super::{decode_animation, start_audio};
+use super::{AudioCue, decode_animation, start_audio, wheel::WheelView};
 use async_channel::Sender;
 use core_foundation::base::TCFType;
 use core_foundation::mach_port::CFMachPortRef;
@@ -32,10 +32,9 @@ use objc2_foundation::{NSData, NSPoint, NSRect, NSSize};
 use objc2_quartz_core::{CALayer, CATransaction};
 
 use crate::assets::{Clip, EMOTES, PINGS};
-use crate::gesture::{Gesture, GestureEvent, Position, Wheel};
+use crate::gesture::{Gesture, GestureEvent, Position, WHEEL_SIZE, Wheel};
 use crate::model::Location;
 
-const WHEEL_SIZE: f64 = 222.0;
 const EFFECT_SIZE: f64 = 138.0;
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -139,7 +138,7 @@ impl InputMonitor {
                     let _ = events.try_send(GestureEvent::Finish(Some((Wheel::Ping, 8, origin))));
                     return None;
                 }
-                for update in gesture.input(wheel, position, cancel) {
+                for update in gesture.input(wheel, position, cancel, 1.0) {
                     let _ = events.try_send(update);
                 }
                 None
@@ -266,47 +265,23 @@ struct Effect {
 pub(crate) struct Overlay {
     mtm: MainThreadMarker,
     wheel: Retained<NSPanel>,
-    slots: Vec<(Retained<CALayer>, Retained<CALayer>)>,
-    current_wheel: Option<Wheel>,
-    selected: Option<usize>,
+    wheel_art: Retained<CALayer>,
+    wheel_view: WheelView,
     ping_images: [Option<Retained<CGImage>>; 9],
-    emote_images: [Option<Retained<CGImage>>; 8],
+    emote_images: [Option<Retained<CGImage>>; EMOTES.len()],
     effects: [Effect; 3],
     next_effect: usize,
-    audio: Sender<(Wheel, usize)>,
+    audio: Sender<AudioCue>,
 }
 
 impl Overlay {
     pub(crate) fn new() -> Self {
         let mtm = MainThreadMarker::new().expect("GUI must use the main thread");
-        let (wheel, root) = panel(WHEEL_SIZE, mtm);
-        root.setCornerRadius(WHEEL_SIZE / 2.0);
-        root.setBackgroundColor(Some(
-            &NSColor::colorWithSRGBRed_green_blue_alpha(0.045, 0.066, 0.10, 0.94).CGColor(),
-        ));
-        root.setBorderColor(Some(
-            &NSColor::colorWithSRGBRed_green_blue_alpha(0.38, 0.53, 0.62, 0.9).CGColor(),
-        ));
-        root.setBorderWidth(1.0);
-        let slots = (0..8)
-            .map(|index| {
-                let angle = index as f64 * std::f64::consts::FRAC_PI_4;
-                let center = WHEEL_SIZE / 2.0;
-                let badge = CALayer::layer();
-                badge.setFrame(rect(
-                    center + angle.sin() * 77.0 - 25.0,
-                    center + angle.cos() * 77.0 - 25.0,
-                    50.0,
-                    50.0,
-                ));
-                badge.setCornerRadius(25.0);
-                let icon = CALayer::layer();
-                icon.setFrame(rect(6.0, 6.0, 38.0, 38.0));
-                badge.addSublayer(&icon);
-                root.addSublayer(&badge);
-                (badge, icon)
-            })
-            .collect();
+        let (wheel, wheel_art) = panel(f64::from(WHEEL_SIZE), mtm);
+        let scale = NSScreen::screens(mtm)
+            .firstObject()
+            .map_or(1.0, |screen| screen.backingScaleFactor());
+        let wheel_view = WheelView::new((f64::from(WHEEL_SIZE) * scale).round() as u32);
         let effects = std::array::from_fn(|_| {
             let (panel, art) = panel(EFFECT_SIZE, mtm);
             Effect {
@@ -318,9 +293,8 @@ impl Overlay {
         Self {
             mtm,
             wheel,
-            slots,
-            current_wheel: None,
-            selected: None,
+            wheel_art,
+            wheel_view,
             ping_images: PINGS.map(|clip| picture(&clip)),
             emote_images: EMOTES.map(|clip| picture(&clip)),
             effects,
@@ -329,45 +303,63 @@ impl Overlay {
         }
     }
 
-    pub(crate) fn open(&mut self, kind: Wheel, position: Position, selected: usize) {
-        let Some((point, screen)) = screen_for(position, self.mtm) else {
+    pub(crate) fn open(
+        &mut self,
+        kind: Wheel,
+        position: Position,
+        selected: Option<usize>,
+        sound: bool,
+        cx: &App,
+    ) {
+        let Some((point, _)) = screen_for(position, self.mtm) else {
             return;
         };
-        if self.current_wheel != Some(kind) {
-            let images: &[_] = match kind {
-                Wheel::Ping => &self.ping_images,
-                Wheel::Emote => &self.emote_images,
-            };
-            update_layers(|| {
-                for ((_, icon), image) in self.slots.iter().zip(images) {
-                    content(icon, image.as_deref());
+        let panel = self.wheel.clone();
+        let layer = self.wheel_art.clone();
+        let half = f64::from(WHEEL_SIZE) / 2.0;
+        panel.setFrameOrigin(NSPoint::new(point.x - half, point.y - half));
+        let scale = panel.backingScaleFactor();
+        let size = (f64::from(WHEEL_SIZE) * scale).round() as u32;
+        let present = Rc::new(move |frame: Option<&tiny_skia::Pixmap>| {
+            if let Some(frame) = frame {
+                update_layers(|| {
+                    layer.setContentsScale(scale);
+                    set_pixels(
+                        &layer,
+                        frame.width(),
+                        frame.height(),
+                        frame.data().to_vec(),
+                        1,
+                    );
+                });
+                if !panel.isVisible() {
+                    panel.orderFrontRegardless();
                 }
-            });
-            self.current_wheel = Some(kind);
-        }
-        self.select(Some(selected));
-        place(&self.wheel, point, WHEEL_SIZE, screen);
-    }
-
-    pub(crate) fn select(&mut self, selected: Option<usize>) {
-        if self.selected == selected {
-            return;
-        }
-        update_layers(|| {
-            if let Some(index) = self.selected {
-                self.slots[index].0.setBackgroundColor(None);
-            }
-            if let Some(index) = selected {
-                self.slots[index].0.setBackgroundColor(Some(
-                    &NSColor::colorWithSRGBRed_green_blue_alpha(0.15, 0.68, 0.73, 0.58).CGColor(),
-                ));
+            } else {
+                panel.orderOut(None);
+                update_layers(|| content(&layer, None));
             }
         });
-        self.selected = selected;
+        let animate = !NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
+        self.wheel_view
+            .open(kind, size, selected, animate, present, cx);
+        if sound && selected.is_some() {
+            let _ = self.audio.try_send(AudioCue::Tick);
+        }
     }
 
-    pub(crate) fn hide(&self) {
-        self.wheel.orderOut(None);
+    pub(crate) fn select(&mut self, selected: Option<usize>, sound: bool, cx: &App) {
+        if self.wheel_view.select(selected, cx) && sound {
+            let _ = self.audio.try_send(AudioCue::Tick);
+        }
+    }
+
+    pub(crate) fn close(&mut self, cx: &App) {
+        self.wheel_view.close(cx);
+    }
+
+    pub(crate) fn hide(&mut self) {
+        self.wheel_view.hide();
     }
 
     pub(crate) fn play(
@@ -409,7 +401,7 @@ impl Overlay {
         });
         place(&effect.panel, point, EFFECT_SIZE, screen);
         if sound {
-            let _ = self.audio.try_send((kind, index));
+            let _ = self.audio.try_send(AudioCue::Clip(kind, index));
         }
 
         let reduce_motion = NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
@@ -452,7 +444,11 @@ impl Overlay {
 
 fn set_frame(layer: &CALayer, frame: RgbaImage) {
     let (width, height) = frame.dimensions();
-    let provider = CGDataProvider::from_buffer(Arc::new(frame.into_raw()));
+    set_pixels(layer, width, height, frame.into_raw(), 3);
+}
+
+fn set_pixels(layer: &CALayer, width: u32, height: u32, bytes: Vec<u8>, alpha: u32) {
+    let provider = CGDataProvider::from_buffer(Arc::new(bytes));
     let image = core_graphics::image::CGImage::new(
         width as usize,
         height as usize,
@@ -460,7 +456,7 @@ fn set_frame(layer: &CALayer, frame: RgbaImage) {
         32,
         width as usize * 4,
         &CGColorSpace::create_device_rgb(),
-        3,
+        alpha,
         &provider,
         true,
         0,

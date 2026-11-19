@@ -51,7 +51,7 @@ pub(crate) const PINGS: [Clip; 9] = [
 
 // Existing indices must keep referring to the same emotes.
 // 已有下标必须继续指向同一个表情。
-pub(crate) const EMOTES: [Clip; 8] = [
+pub(crate) const EMOTES: [Clip; 13] = [
     emote!("愤怒蜜蜂", "bee_mad"),
     emote!("伤心蜜蜂", "bee_sad"),
     emote!("爱心", "gg_heart"),
@@ -60,4 +60,15 @@ pub(crate) const EMOTES: [Clip; 8] = [
     emote!("无语", "unimpressed"),
     emote!("今天不行", "not_today"),
     emote!("魄罗点心", "poro_snax"),
+    emote!("不配", "unworthy_cn"),
+    emote!("伤心小猫", "sad_kitten"),
+    emote!("调皮魄罗", "cheeky_poro"),
+    emote!("生气小猫", "angry_kitty"),
+    emote!("开心蜜蜂", "bee_happy"),
 ];
+
+// Wheel slots map to stable catalog IDs rather than changing the wire format.
+// 轮盘槽位映射到稳定的素材 ID，不改变网络协议。
+pub(crate) const EMOTE_WHEEL: [usize; 8] = [8, 7, 9, 10, 11, 2, 12, 0];
+pub(crate) const EMOTE_HUB: usize = 3;
+pub(crate) const WHEEL_TICK: &[u8] = include_bytes!("../assets/sounds/button.wav");

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use async_channel::Sender;
 use gpui_kit::{App, Task};
-use image::{Rgba, RgbaImage, imageops};
+use image::{RgbaImage, imageops};
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
     Graphics::Gdi::*,
@@ -23,12 +23,11 @@ use windows_sys::Win32::{
     UI::{HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
 
-use super::{decode_animation, start_audio};
+use super::{AudioCue, decode_animation, start_audio, wheel::WheelView};
 use crate::assets::{EMOTES, PINGS};
-use crate::gesture::{Gesture, GestureEvent, Position, Wheel};
+use crate::gesture::{Gesture, GestureEvent, Position, WHEEL_SIZE, Wheel};
 use crate::model::Location;
 
-const WHEEL_SIZE: u32 = 222;
 const EFFECT_SIZE: u32 = 138;
 
 pub(crate) fn init_dpi() {
@@ -170,7 +169,12 @@ impl Input {
                 .try_send(GestureEvent::Finish(Some((Wheel::Ping, 8, origin))));
             return;
         }
-        for event in self.gesture.input(kind, position, cancel) {
+        let scale = if !cancel && kind.is_some() && self.gesture.pending() {
+            f64::from(screen(point(position), false).1) / 96.0
+        } else {
+            1.0
+        };
+        for event in self.gesture.input(kind, position, cancel, scale) {
             let _ = self.events.try_send(event);
         }
     }
@@ -434,6 +438,22 @@ impl Layer {
         }
     }
 
+    fn wheel_frame(&mut self, image: &tiny_skia::Pixmap, origin: POINT) {
+        self.warm(image.width());
+        if let Some(surface) = &mut self.surface {
+            let bytes = unsafe { std::slice::from_raw_parts_mut(surface.bits, image.data().len()) };
+            for (dest, [red, green, blue, alpha]) in bytes
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(image.data().as_chunks::<4>().0)
+            {
+                *dest = [*blue, *green, *red, *alpha];
+            }
+            self.present(origin, 255);
+        }
+    }
+
     fn present(&self, origin: POINT, opacity: u8) {
         let Some(surface) = &self.surface else { return };
         let size = SIZE {
@@ -494,123 +514,14 @@ struct Effect {
     task: Option<Task<()>>,
 }
 
-struct WheelArt {
-    base: [RgbaImage; 2],
-    icons: [[RgbaImage; 8]; 2],
-    dpi: u32,
-}
-
-fn wheel_index(wheel: Wheel) -> usize {
-    match wheel {
-        Wheel::Ping => 0,
-        Wheel::Emote => 1,
-    }
-}
-
-fn resized(image: &RgbaImage, size: u32) -> RgbaImage {
-    imageops::resize(image, size, size, imageops::FilterType::Triangle)
-}
-
-fn circle(image: &mut RgbaImage, center: (f64, f64), radius: f64, color: Rgba<u8>) {
-    let min_x = (center.0 - radius - 1.).max(0.) as u32;
-    let min_y = (center.1 - radius - 1.).max(0.) as u32;
-    let max_x = ((center.0 + radius + 2.) as u32).min(image.width());
-    let max_y = ((center.1 + radius + 2.) as u32).min(image.height());
-    for y in min_y..max_y {
-        for x in min_x..max_x {
-            let distance = (f64::from(x) + 0.5 - center.0).hypot(f64::from(y) + 0.5 - center.1);
-            let coverage = (radius + 0.5 - distance).clamp(0., 1.);
-            if coverage > 0. {
-                let mut paint = color;
-                paint[3] = (f64::from(color[3]) * coverage) as u8;
-                use image::Pixel as _;
-                image.get_pixel_mut(x, y).blend(&paint);
-            }
-        }
-    }
-}
-
-fn slot(index: usize, dpi: u32) -> (f64, f64) {
-    let angle = index as f64 * std::f64::consts::FRAC_PI_4;
-    let center = f64::from(pixels(WHEEL_SIZE, dpi)) / 2.0;
-    let reach = f64::from(pixels(77, dpi));
-    (center + reach * angle.sin(), center - reach * angle.cos())
-}
-
-fn icon(image: &mut RgbaImage, art: &RgbaImage, location: (f64, f64)) {
-    let half = f64::from(art.width()) / 2.0;
-    imageops::overlay(
-        image,
-        art,
-        (location.0 - half).round() as i64,
-        (location.1 - half).round() as i64,
-    );
-}
-
-impl WheelArt {
-    fn new(dpi: u32, pings: &[RgbaImage; 9], emotes: &[RgbaImage; 8]) -> Self {
-        let size = pixels(WHEEL_SIZE, dpi);
-        let center = f64::from(size) / 2.;
-        let mut background = RgbaImage::new(size, size);
-        circle(
-            &mut background,
-            (center, center),
-            center - 1.,
-            Rgba([98, 135, 158, 235]),
-        );
-        let inset = f64::from(pixels(2, dpi));
-        circle(
-            &mut background,
-            (center, center),
-            center - inset,
-            Rgba([12, 18, 28, 255]),
-        );
-        let icons: [[RgbaImage; 8]; 2] = std::array::from_fn(|kind| {
-            std::array::from_fn(|index| {
-                resized(
-                    if kind == 0 {
-                        &pings[index]
-                    } else {
-                        &emotes[index]
-                    },
-                    pixels(38, dpi),
-                )
-            })
-        });
-        let base = std::array::from_fn(|kind| {
-            let mut frame = background.clone();
-            for (index, art) in icons[kind].iter().enumerate() {
-                icon(&mut frame, art, slot(index, dpi));
-            }
-            frame
-        });
-        Self { base, icons, dpi }
-    }
-
-    fn highlight(&self, wheel: Wheel, index: usize) -> RgbaImage {
-        let kind = wheel_index(wheel);
-        let mut frame = self.base[kind].clone();
-        let location = slot(index, self.dpi);
-        circle(
-            &mut frame,
-            location,
-            f64::from(pixels(25, self.dpi)),
-            Rgba([30, 104, 111, 255]),
-        );
-        icon(&mut frame, &self.icons[kind][index], location);
-        frame
-    }
-}
-
 pub(crate) struct Overlay {
-    wheel: Layer,
-    active: Option<(Wheel, POINT, Option<usize>)>,
-    wheel_art: WheelArt,
+    wheel: Rc<RefCell<Layer>>,
+    wheel_view: WheelView,
     pings: [RgbaImage; 9],
-    emotes: [RgbaImage; 8],
+    emotes: [RgbaImage; EMOTES.len()],
     effects: [Effect; 3],
     next_effect: usize,
-    audio: Sender<(Wheel, usize)>,
+    audio: Sender<AudioCue>,
 }
 
 impl Overlay {
@@ -635,9 +546,8 @@ impl Overlay {
             }
         });
         Self {
-            wheel,
-            active: None,
-            wheel_art: WheelArt::new(dpi, &pings, &emotes),
+            wheel: Rc::new(RefCell::new(wheel)),
+            wheel_view: WheelView::new(pixels(WHEEL_SIZE, dpi)),
             pings,
             emotes,
             effects,
@@ -646,36 +556,48 @@ impl Overlay {
         }
     }
 
-    pub(crate) fn open(&mut self, wheel: Wheel, position: Position, selected: usize) {
+    pub(crate) fn open(
+        &mut self,
+        wheel: Wheel,
+        position: Position,
+        selected: Option<usize>,
+        sound: bool,
+        cx: &App,
+    ) {
         let point = point(position);
-        let (bounds, dpi) = screen(point, false);
-        if self.wheel_art.dpi != dpi {
-            self.wheel_art = WheelArt::new(dpi, &self.pings, &self.emotes);
+        let (_, dpi) = screen(point, false);
+        let size = pixels(WHEEL_SIZE, dpi);
+        let origin = POINT {
+            x: point.x - size as i32 / 2,
+            y: point.y - size as i32 / 2,
+        };
+        let layer = self.wheel.clone();
+        let present = Rc::new(move |frame: Option<&tiny_skia::Pixmap>| {
+            if let Some(frame) = frame {
+                layer.borrow_mut().wheel_frame(frame, origin);
+            } else {
+                layer.borrow().hide();
+            }
+        });
+        self.wheel_view
+            .open(wheel, size, selected, animation_enabled(), present, cx);
+        if sound && selected.is_some() {
+            let _ = self.audio.try_send(AudioCue::Tick);
         }
-        let origin = fit(point, bounds, pixels(WHEEL_SIZE, dpi));
-        self.active = Some((wheel, origin, None));
-        self.select(Some(selected));
     }
 
-    pub(crate) fn select(&mut self, selection: Option<usize>) {
-        let Some((wheel, origin, current)) = self.active else {
-            return;
-        };
-        if current != selection {
-            self.active = Some((wheel, origin, selection));
-            if let Some(index) = selection {
-                self.wheel
-                    .frame(&self.wheel_art.highlight(wheel, index), origin);
-            } else {
-                self.wheel
-                    .frame(&self.wheel_art.base[wheel_index(wheel)], origin);
-            }
+    pub(crate) fn select(&mut self, selection: Option<usize>, sound: bool, cx: &App) {
+        if self.wheel_view.select(selection, cx) && sound {
+            let _ = self.audio.try_send(AudioCue::Tick);
         }
+    }
+
+    pub(crate) fn close(&mut self, cx: &App) {
+        self.wheel_view.close(cx);
     }
 
     pub(crate) fn hide(&mut self) {
-        self.active = None;
-        self.wheel.hide();
+        self.wheel_view.hide();
     }
 
     pub(crate) fn play(
@@ -710,23 +632,15 @@ impl Overlay {
         self.next_effect = (slot + 1) % self.effects.len();
         let effect = &mut self.effects[slot];
         effect.task.take();
-        effect
-            .layer
-            .borrow_mut()
-            .frame(&resized(image, size), origin);
+        effect.layer.borrow_mut().frame(
+            &imageops::resize(image, size, size, imageops::FilterType::Triangle),
+            origin,
+        );
         if sound {
-            let _ = self.audio.try_send((wheel, index));
+            let _ = self.audio.try_send(AudioCue::Clip(wheel, index));
         }
-        let mut animation_enabled = 1i32;
-        unsafe {
-            SystemParametersInfoW(
-                SPI_GETCLIENTAREAANIMATION,
-                0,
-                (&mut animation_enabled as *mut i32).cast(),
-                0,
-            )
-        };
-        let bytes = clip.animation.filter(|_| animation_enabled != 0);
+        let animation_enabled = animation_enabled();
+        let bytes = clip.animation.filter(|_| animation_enabled);
         let layer = effect.layer.clone();
         effect.task = Some(cx.spawn(async move |cx| {
             let started = Instant::now();
@@ -747,7 +661,7 @@ impl Overlay {
             if !remainder.is_zero() {
                 cx.background_executor().timer(remainder).await;
             }
-            if animation_enabled != 0 {
+            if animation_enabled {
                 for opacity in [215, 175, 135, 95, 55, 15] {
                     layer.borrow().present(origin, opacity);
                     cx.background_executor()
@@ -758,4 +672,17 @@ impl Overlay {
             layer.borrow().hide();
         }));
     }
+}
+
+fn animation_enabled() -> bool {
+    let mut enabled = 1i32;
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            (&mut enabled as *mut i32).cast(),
+            0,
+        )
+    };
+    enabled != 0
 }

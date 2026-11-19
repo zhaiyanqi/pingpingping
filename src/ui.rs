@@ -17,7 +17,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
-use crate::assets::{EMOTES, PINGS};
+use crate::assets::{EMOTE_WHEEL, EMOTES, PINGS};
 use crate::gesture::{GestureEvent, Wheel};
 use crate::model::{Body, Message, Model, Profile};
 use crate::platform::{self, InputMonitor, Overlay};
@@ -37,7 +37,7 @@ struct Desktop {
     chat: Option<AnyWindowHandle>,
     history: Option<AnyWindowHandle>,
     settings: Option<AnyWindowHandle>,
-    emotes: [Arc<Image>; 8],
+    emotes: [Arc<Image>; EMOTES.len()],
     pings: [Arc<Image>; 9],
 }
 
@@ -210,12 +210,17 @@ fn handle_gesture(event: GestureEvent, cx: &mut App) {
     let (enabled, sound) = (profile.gestures, profile.sound);
     cx.update_global::<Desktop, _>(|desktop, cx| match event {
         GestureEvent::Open(kind, origin, selected) if enabled => {
-            desktop.overlay.open(kind, origin, selected)
+            desktop.overlay.open(kind, origin, selected, sound, cx)
         }
-        GestureEvent::Select(index) if enabled => desktop.overlay.select(index),
+        GestureEvent::Select(index) if enabled => desktop.overlay.select(index, sound, cx),
         GestureEvent::Finish(choice) => {
-            desktop.overlay.hide();
+            desktop.overlay.close(cx);
             if let Some((kind, index, origin)) = choice.filter(|_| enabled) {
+                let index = if kind == Wheel::Emote {
+                    EMOTE_WHEEL[index]
+                } else {
+                    index
+                };
                 let location = platform::normalized(origin);
                 let body = match kind {
                     Wheel::Ping => Body::Ping { index, location },
