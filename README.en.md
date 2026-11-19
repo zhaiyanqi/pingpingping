@@ -42,7 +42,7 @@ open dist/PingPingPing.app
 open dist/debug/PingPingPing.app
 ```
 
-You can also run `cargo run --release --locked`. Request Input Monitoring through Settings for global gestures. Restart the app if gestures remain unavailable after granting access.
+You can also run `cargo run --release --locked`. Request Input Monitoring through Settings for global gestures. When using a side-button binding, also grant PingPingPing Accessibility access in Privacy & Security. Restart the app if gestures remain unavailable after granting access.
 
 ## Connect on a LAN
 
@@ -60,12 +60,16 @@ Under **Settings → Desktop animations**, set the size and timeout for pings an
 
 | Action | Windows | macOS |
 | --- | --- | --- |
-| Ping wheel | Hold Alt and move the pointer | Hold Option and move the pointer |
-| Emote wheel | Hold Ctrl and move the pointer | Hold Control and move the pointer |
-| Quick ping | Alt-click | Option-click |
+| Ping wheel | Hold Alt and left-drag | Hold Option and left-drag |
+| Emote wheel | Hold Ctrl and left-drag | Hold Control and left-drag |
+| Quick ping (off by default) | Alt-click | Option-click |
 | Chat / History / Settings | Ctrl+1 / Ctrl+2 / Ctrl+, | ⌘1 / ⌘2 / ⌘, |
 
-Release the key to confirm the selected sector. Return to the center before releasing to cancel. The latest 600 text messages, pings, and emotes are stored locally as JSON in `%LOCALAPPDATA%\PingPingPing` on Windows or `~/Library/Application Support/PingPingPing` on macOS.
+In **Settings → Desktop wheel**, turn each wheel on or off independently. Click the current binding, press a keyboard key or mouse button 4 (Back) or 5 (Forward), then save. Esc cancels recording. Enabled wheels must use different bindings.
+
+For a keyboard binding, hold the key and left-drag. Releasing the key first cancels. For a side-button binding, hold that button, drag, then release it to confirm. Returning to the center cancels either gesture. A plain side-button click goes to the current app on release. Once the wheel opens, the drag consumes the click, including when you return to the center to cancel. If quick ping is enabled, a click of the ping wheel’s bound side button sends a marker.
+
+The latest 600 text messages, pings, and emotes are stored locally as JSON in `%LOCALAPPDATA%\PingPingPing` on Windows or `~/Library/Application Support/PingPingPing` on macOS.
 
 ## Development
 

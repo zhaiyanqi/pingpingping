@@ -168,6 +168,8 @@ pub(crate) struct Profile {
     pub(crate) endpoint: Option<RoomConfig>,
     pub(crate) sound: bool,
     pub(crate) gestures: bool,
+    #[serde(default)]
+    pub(crate) triggers: crate::gesture::Triggers,
     pub(crate) remote_overlay: bool,
     #[serde(default)]
     pub(crate) overlay: OverlaySettings,
@@ -181,6 +183,7 @@ impl Default for Profile {
             endpoint: None,
             sound: true,
             gestures: true,
+            triggers: Default::default(),
             remote_overlay: true,
             overlay: OverlaySettings::default(),
         }
@@ -344,6 +347,15 @@ impl Model {
                     .all(|character| !character.is_control()),
             "请输入昵称（最多 64 字节）"
         );
+        ensure!(
+            !(profile.triggers.ping_enabled
+                && profile.triggers.emote_enabled
+                && profile
+                    .triggers
+                    .ping_key
+                    .same_key(&profile.triggers.emote_key)),
+            "信号和表情同时启用时，请选择不同的快捷键"
+        );
         profile.overlay.normalize();
         save_json(&self.data_dir.join("settings.json"), &profile).context("无法保存设置")?;
         self.profile = profile;
@@ -432,6 +444,23 @@ mod tests {
         let loaded: Profile = serde_json::from_value(legacy).unwrap();
         assert_eq!(loaded.overlay, OverlaySettings::default());
         assert!(loaded.overlay.with_sound(loaded.sound).volume().is_none());
+    }
+
+    #[test]
+    fn side_binding_survives_save_and_conflicts_leave_the_saved_profile_intact() {
+        use crate::gesture::TriggerKey;
+        let folder = std::env::temp_dir().join(format!("pingpingping-bindings-{}", Uuid::new_v4()));
+        let mut model = Model::load(folder.clone()).unwrap();
+        let mut profile = model.profile.clone();
+        profile.triggers.emote_key = TriggerKey::Mouse5;
+        model.apply(profile.clone()).unwrap();
+        profile.triggers.ping_key = TriggerKey::Mouse5;
+        assert!(model.apply(profile).is_err());
+        let saved: Profile = load_json(&folder.join("settings.json")).unwrap().unwrap();
+        assert_eq!(saved.triggers.emote_key, TriggerKey::Mouse5);
+        assert_eq!(saved.triggers.ping_key, TriggerKey::Alt);
+        model.finish_writes().unwrap().join().unwrap();
+        fs::remove_dir_all(folder).unwrap();
     }
 
     #[test]

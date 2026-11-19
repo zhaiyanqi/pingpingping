@@ -20,7 +20,7 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
 use crate::assets::{EMOTE_WHEEL, EMOTES, PINGS};
-use crate::gesture::{GestureEvent, Wheel};
+use crate::gesture::{GestureEvent, TriggerKey, Triggers, Wheel};
 use crate::model::{
     ANIMATION_TIMEOUT, Body, EMOTE_SIZE, Message, Model, OverlaySettings, PING_SIZE, Profile,
     SOUND_VOLUME,
@@ -36,9 +36,8 @@ struct Desktop {
     tray: Option<tray_icon::TrayIcon>,
     model: Entity<Model>,
     incoming: Sender<RoomEvent>,
-    gestures: Sender<GestureEvent>,
-    enabled: Arc<AtomicBool>,
-    monitor: Option<InputMonitor>,
+    capture_paused: Arc<AtomicBool>,
+    monitor: Option<(InputMonitor, Task<()>)>,
     overlay: Overlay,
     chat: Option<AnyWindowHandle>,
     history: Option<AnyWindowHandle>,
@@ -52,7 +51,6 @@ impl Global for Desktop {}
 pub(crate) fn start(cx: &mut App) {
     gpui_kit::init(cx);
     let (incoming, receiver) = async_channel::bounded(128);
-    let (gestures, gesture_receiver) = async_channel::unbounded();
     let data_dir = std::env::var_os("PINGPINGPING_DATA_DIR")
         .map(PathBuf::from)
         .or_else(default_data_dir);
@@ -69,17 +67,16 @@ pub(crate) fn start(cx: &mut App) {
             return;
         }
     };
-    let enabled = Arc::new(AtomicBool::new(model.profile.gestures));
-    let monitor = InputMonitor::start(gestures.clone(), enabled.clone());
+    let capture_paused = Arc::new(AtomicBool::new(false));
+    let monitor = start_input(&model.profile, capture_paused.clone(), cx);
     model.input_ready = monitor.is_some();
     let model = cx.new(|_| model);
     let desktop = Desktop {
         tray: None,
         model,
         incoming,
-        gestures,
-        enabled,
         monitor,
+        capture_paused,
         overlay: Overlay::new(),
         chat: None,
         history: None,
@@ -124,12 +121,6 @@ pub(crate) fn start(cx: &mut App) {
                     }),
                 }
             });
-        }
-    })
-    .detach();
-    cx.spawn(async move |cx| {
-        while let Ok(event) = gesture_receiver.recv().await {
-            cx.update(|cx| handle_gesture(event, cx));
         }
     })
     .detach();
@@ -234,6 +225,25 @@ fn play(body: &Body, cx: &mut App) {
             .overlay
             .play(kind, index, None, body.location(), settings, cx);
     });
+}
+
+fn start_input(
+    profile: &Profile,
+    paused: Arc<AtomicBool>,
+    cx: &mut App,
+) -> Option<(InputMonitor, Task<()>)> {
+    let (sender, receiver) = async_channel::unbounded();
+    let monitor = InputMonitor::start(
+        sender,
+        profile.gestures.then(|| profile.triggers.clone()),
+        paused,
+    )?;
+    let task = cx.spawn(async move |cx| {
+        while let Ok(event) = receiver.recv().await {
+            cx.update(|cx| handle_gesture(event, cx));
+        }
+    });
+    Some((monitor, task))
 }
 
 fn handle_gesture(event: GestureEvent, cx: &mut App) {
@@ -840,6 +850,10 @@ struct Settings {
     port: Entity<InputState>,
     sound: bool,
     gestures: bool,
+    triggers: Triggers,
+    recording: Option<Wheel>,
+    capture_focus: FocusHandle,
+    capture_paused: Arc<AtomicBool>,
     remote_overlay: bool,
     ping_size: Entity<SliderState>,
     emote_size: Entity<SliderState>,
@@ -854,6 +868,12 @@ struct Settings {
     _subscriptions: Vec<Subscription>,
 }
 
+impl Drop for Settings {
+    fn drop(&mut self) {
+        self.capture_paused.store(false, Ordering::Relaxed);
+    }
+}
+
 impl Settings {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         close_to_tray(window, cx);
@@ -863,6 +883,7 @@ impl Settings {
             endpoint,
             sound,
             gestures,
+            triggers,
             remote_overlay,
             overlay,
             ..
@@ -892,7 +913,21 @@ impl Settings {
         let emote_timeout =
             cx.new(|_| setting_slider(ANIMATION_TIMEOUT, 100, overlay.emote_timeout_ms));
         let volume = cx.new(|_| setting_slider(SOUND_VOLUME, 1, overlay.volume));
+        let capture_focus = cx.focus_handle();
         let mut subscriptions = vec![
+            cx.on_blur(&capture_focus, window, |this: &mut Self, _, cx| {
+                this.end_capture(cx)
+            }),
+            cx.observe_window_visibility(window, |this: &mut Self, visibility, _, cx| {
+                if !visibility.is_visible() {
+                    this.end_capture(cx);
+                }
+            }),
+            cx.observe_window_activation(window, |this: &mut Self, window, cx| {
+                if !window.is_window_active() {
+                    this.end_capture(cx);
+                }
+            }),
             cx.observe(&model, |_, _, cx| cx.notify()),
             cx.subscribe_in(&ip, window, |this, _, event, _, cx| {
                 if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
@@ -923,6 +958,10 @@ impl Settings {
             port,
             sound,
             gestures,
+            triggers,
+            recording: None,
+            capture_focus,
+            capture_paused: cx.global::<Desktop>().capture_paused.clone(),
             remote_overlay,
             ping_size,
             emote_size,
@@ -936,6 +975,70 @@ impl Settings {
             connecting: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    fn end_capture(&mut self, cx: &mut Context<Self>) {
+        if self.recording.take().is_some() {
+            self.capture_paused.store(false, Ordering::Relaxed);
+            cx.notify();
+        }
+    }
+
+    fn record_key(&mut self, key: TriggerKey, cx: &mut Context<Self>) {
+        match self.recording {
+            Some(Wheel::Ping) => self.triggers.ping_key = key,
+            Some(Wheel::Emote) => self.triggers.emote_key = key,
+            None => return,
+        }
+        self.feedback = None;
+        self.end_capture(cx);
+    }
+
+    fn trigger_row(&self, wheel: Wheel, cx: &Context<Self>) -> impl IntoElement + use<> {
+        let (id, label, enabled, selected) = match wheel {
+            Wheel::Ping => (
+                "ping-trigger",
+                "信号快捷键",
+                self.triggers.ping_enabled,
+                &self.triggers.ping_key,
+            ),
+            Wheel::Emote => (
+                "emote-trigger",
+                "表情快捷键",
+                self.triggers.emote_enabled,
+                &self.triggers.emote_key,
+            ),
+        };
+        let row = div().flex().items_center().gap_2().child(
+            Switch::new(id)
+                .label(label)
+                .checked(enabled)
+                .disabled(!self.gestures)
+                .on_change(cx.listener(move |this, value, _, cx| {
+                    match wheel {
+                        Wheel::Ping => this.triggers.ping_enabled = *value,
+                        Wheel::Emote => this.triggers.emote_enabled = *value,
+                    }
+                    cx.notify();
+                })),
+        );
+        let listening = self.recording == Some(wheel);
+        row.child(
+            Button::new(SharedString::from(format!("{id}-record")))
+                .label(if listening {
+                    "请按键或鼠标侧键 · Esc 取消".to_owned()
+                } else {
+                    format!("{} · 重新录入", selected.label())
+                })
+                .when(listening, |button| button.primary())
+                .disabled(!self.gestures || !enabled)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.recording = Some(wheel);
+                    this.capture_paused.store(true, Ordering::Relaxed);
+                    this.capture_focus.focus(window, cx);
+                    cx.notify();
+                })),
+        )
     }
 
     fn overlay_settings(&self, cx: &App) -> OverlaySettings {
@@ -961,7 +1064,9 @@ impl Settings {
         let mut profile = self.model.read(cx).profile.clone();
         profile.name = self.name.read(cx).value().trim().to_owned();
         profile.sound = self.sound;
+        let input_changed = profile.gestures != self.gestures || profile.triggers != self.triggers;
         profile.gestures = self.gestures;
+        profile.triggers = self.triggers.clone();
         profile.remote_overlay = self.remote_overlay;
         profile.overlay = self.overlay_settings(cx);
         let result = self.model.update(cx, |model, cx| {
@@ -971,12 +1076,19 @@ impl Settings {
         });
         self.feedback = Some(match result {
             Ok(()) => {
-                cx.update_global::<Desktop, _>(|desktop, _| {
-                    desktop.enabled.store(profile.gestures, Ordering::Relaxed);
-                    if !profile.gestures {
+                if input_changed {
+                    cx.update_global::<Desktop, _>(|desktop, _| {
+                        desktop.monitor = None;
                         desktop.overlay.hide();
+                    });
+                    self.retry_input(cx);
+                    if !self.model.read(cx).input_ready {
+                        self.feedback =
+                            Some((false, "设置已保存，全局监听未启动，请重新检测。".into()));
+                        cx.notify();
+                        return;
                     }
-                });
+                }
                 (true, "设置已保存".into())
             }
             Err(error) => (false, format!("{error:#}")),
@@ -1028,10 +1140,13 @@ impl Settings {
     }
 
     fn retry_input(&mut self, cx: &mut Context<Self>) {
-        let ready = cx.update_global::<Desktop, _>(|desktop, _| {
+        let ready = cx.update_global::<Desktop, _>(|desktop, cx| {
             if desktop.monitor.is_none() {
-                desktop.monitor =
-                    InputMonitor::start(desktop.gestures.clone(), desktop.enabled.clone());
+                desktop.monitor = start_input(
+                    &desktop.model.read(cx).profile.clone(),
+                    desktop.capture_paused.clone(),
+                    cx,
+                );
             }
             desktop.monitor.is_some()
         });
@@ -1084,6 +1199,16 @@ impl Render for Settings {
             .clone()
             .or_else(|| (!busy).then(|| model.room_error.clone()).flatten());
         let active = model.input_ready;
+        #[cfg(target_os = "macos")]
+        let side_access = model.profile.gestures && model.profile.triggers.uses_side_button();
+        #[cfg(target_os = "macos")]
+        let permission_hint = if side_access {
+            "侧键拦截需要「隐私与安全性 → 辅助功能」权限。授权后请重新检测。"
+        } else {
+            "请在系统设置的「隐私与安全性 → 输入监控」中授权，再重试。"
+        };
+        #[cfg(not(target_os = "macos"))]
+        let permission_hint = "全局输入监听未启动。";
         let theme = cx.theme().clone();
         let overlay = self.overlay_settings(cx);
         let content = div().id("settings-scroll").flex_1().min_h_0().overflow_y_scroll().p_5().flex().flex_col().gap_5()
@@ -1124,21 +1249,20 @@ impl Render for Settings {
                     .child(div().text_sm().text_color(theme.danger).child(error))))
             .child(div().flex().flex_col().gap_3().border_t_1().border_color(theme.border).pt_4()
                 .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child("桌面轮盘"))
-                .child(div().text_sm().text_color(theme.muted_foreground).child(if cfg!(target_os = "windows") {
-                    "按住 Alt 或 Ctrl 移动鼠标，分别打开信号或表情轮盘，松开按键确认。Alt + 单击发送普通标记。"
-                } else {
-                    "按住 ⌥ 或 ⌃ 移动鼠标，分别打开信号或表情轮盘，松开按键确认。⌥ 单击发送普通标记。"
-                }))
+                .child(div().text_sm().text_color(theme.muted_foreground).child("键盘触发时，按住快捷键并用左键拖动。鼠标侧键可直接按住拖动，松开确认；拖回中心可取消。"))
                 .child(Switch::new("gestures").label("启用全局轮盘").checked(self.gestures)
                     .on_change(cx.listener(|this, value, _, cx| { this.gestures = *value; cx.notify(); })))
+                .child(self.trigger_row(Wheel::Ping, cx))
+                .child(self.trigger_row(Wheel::Emote, cx))
+                .child(Switch::new("quick-ping").label("单击发送普通标记（侧键绑定时单击侧键）").checked(self.triggers.click_ping)
+                    .disabled(!self.gestures || !self.triggers.ping_enabled)
+                    .on_change(cx.listener(|this, value, _, cx| { this.triggers.click_ping = *value; cx.notify(); })))
                 .when(!active, |group| group
-                    .child(div().text_sm().text_color(theme.muted_foreground).child(if cfg!(target_os = "macos") {
-                        "请在系统设置的「隐私与安全性 → 输入监控」中授权，再重试。"
-                    } else { "全局输入监听未启动。" }))
+                    .child(div().text_sm().text_color(theme.muted_foreground).child(permission_hint))
                     .child({
                         let row = div().flex().gap_2();
                         #[cfg(target_os = "macos")]
-                        let row = row.child(Button::new("permission").label("请求输入监控权限…").on_click(|_, _, _| platform::request_input_access()));
+                        let row = row.child(Button::new("permission").label(if side_access { "请求辅助功能权限…" } else { "请求输入监控权限…" }).on_click(move |_, _, _| platform::request_input_access(side_access)));
                         row.child(Button::new("retry").ghost().label("重新检测").on_click(cx.listener(|this, _, _, cx| this.retry_input(cx))))
                     })))
             .child(div().flex().flex_col().gap_3().border_t_1().border_color(theme.border).pt_4()
@@ -1169,6 +1293,59 @@ impl Render for Settings {
                     .child(Switch::new("wheel-sound").label("轮盘提示音").checked(self.wheel_sound).disabled(!self.sound)
                         .on_change(cx.listener(|this, value, _, cx| { this.wheel_sound = *value; cx.notify(); })))));
         div()
+            .track_focus(&self.capture_focus)
+            .when(self.recording.is_some(), |root| {
+                root.capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    window.prevent_default();
+                    if event.is_held {
+                        return;
+                    }
+                    let stroke = &event.keystroke;
+                    if stroke.key == "escape" {
+                        this.end_capture(cx);
+                    } else if let Some(code) = platform::capture_key_code() {
+                        this.record_key(
+                            TriggerKey::Keyboard {
+                                code,
+                                label: stroke.key.to_uppercase(),
+                            },
+                            cx,
+                        );
+                    } else {
+                        this.feedback =
+                            Some((false, "无法识别此键，请按另一个键或鼠标侧键。".into()));
+                        cx.notify();
+                    }
+                }))
+                .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _, cx| {
+                    let key = match (event.alt, event.control, event.shift, event.platform) {
+                        (true, false, false, false) => TriggerKey::Alt,
+                        (false, true, false, false) => TriggerKey::Ctrl,
+                        (false, false, true, false) => TriggerKey::Shift,
+                        (false, false, false, true) => TriggerKey::Super,
+                        _ => return,
+                    };
+                    this.record_key(key, cx);
+                }))
+                .capture_any_mouse_down(cx.listener(
+                    |this, event: &MouseDownEvent, window, cx| {
+                        let key = match event.button {
+                            MouseButton::Navigate(NavigationDirection::Back) => TriggerKey::Mouse4,
+                            MouseButton::Navigate(NavigationDirection::Forward) => {
+                                TriggerKey::Mouse5
+                            }
+                            _ => {
+                                this.end_capture(cx);
+                                return;
+                            }
+                        };
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        this.record_key(key, cx);
+                    },
+                ))
+            })
             .size_full()
             .flex()
             .flex_col()

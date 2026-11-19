@@ -42,7 +42,7 @@ open dist/PingPingPing.app
 open dist/debug/PingPingPing.app
 ```
 
-也可以用 `cargo run --release --locked` 直接运行。首次使用全局轮盘时，在应用设置中请求输入监控权限。若授权后轮盘仍不可用，退出并重新打开应用。
+也可以用 `cargo run --release --locked` 直接运行。首次使用全局轮盘时，在应用设置中请求输入监控权限。绑定侧键后，还需在「隐私与安全性 → 辅助功能」中允许 PingPingPing 拦截侧键。若授权后轮盘仍不可用，退出并重新打开应用。
 
 ## 局域网连接
 
@@ -60,12 +60,16 @@ open dist/debug/PingPingPing.app
 
 | 操作 | Windows | macOS |
 | --- | --- | --- |
-| 信号轮盘 | 按住 Alt 移动鼠标 | 按住 Option 移动鼠标 |
-| 表情轮盘 | 按住 Ctrl 移动鼠标 | 按住 Control 移动鼠标 |
-| 普通标记 | Alt + 单击 | Option + 单击 |
+| 信号轮盘 | 按住 Alt 并用左键拖动 | 按住 Option 并用左键拖动 |
+| 表情轮盘 | 按住 Ctrl 并用左键拖动 | 按住 Control 并用左键拖动 |
+| 普通标记（默认关闭） | Alt + 单击 | Option + 单击 |
 | 聊天 / 历史 / 设置 | Ctrl+1 / Ctrl+2 / Ctrl+, | ⌘1 / ⌘2 / ⌘, |
 
-松开按键确认选中的扇区，移回中心再松开可取消。最近 600 条文字、信号和表情以 JSON 保存在本机。Windows 数据目录为 `%LOCALAPPDATA%\PingPingPing`，macOS 为 `~/Library/Application Support/PingPingPing`。
+在「设置 → 桌面轮盘」中可分别开关两个轮盘。点击信号或表情旁的「重新录入」，直接按一个键盘键或鼠标侧键 4 / 5，然后保存。按 Esc 可放弃录入。两个轮盘同时启用时需使用不同的键。
+
+键盘绑定使用左键拖动，先松开快捷键可取消。侧键绑定直接按住侧键拖动，松开同一侧键确认。两种方式都可以拖回中心取消。普通侧键单击在松开时交给当前应用；一旦拖出轮盘，即使拖回中心取消，也不会触发浏览器前进或后退。如果开启普通标记，单击绑定的信号侧键也会发送标记。
+
+最近 600 条文字、信号和表情以 JSON 保存在本机。Windows 数据目录为 `%LOCALAPPDATA%\PingPingPing`，macOS 为 `~/Library/Application Support/PingPingPing`。
 
 ## 开发和验证
 

@@ -1,7 +1,8 @@
-//! macOS desktop overlays and listen-only Quartz gesture input.
-//! macOS 桌面悬浮层和只读 Quartz 手势输入。
+//! macOS desktop overlays and Quartz gesture input.
+//! macOS 桌面悬浮层和Quartz 手势输入。
 
-use std::cell::{Cell, RefCell};
+use std::ffi::c_void;
+use std::mem::ManuallyDrop;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -10,13 +11,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use super::{AnimationOverlay, AudioCue, start_audio, wheel::WheelView};
 use async_channel::Sender;
 use core_foundation::base::TCFType;
-use core_foundation::mach_port::CFMachPortRef;
+use core_foundation::mach_port::{CFMachPort, CFMachPortInvalidate, CFMachPortRef};
 use core_foundation::runloop::{CFRunLoop, CFRunLoopSource, kCFRunLoopCommonModes};
 use core_graphics::color_space::CGColorSpace;
 use core_graphics::data_provider::CGDataProvider;
 use core_graphics::event::{
-    CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
-    CGEventType,
+    CGEvent, CGEventFlags, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
+    CGEventTapProxy, CGEventType, EventField,
 };
 use foreign_types::ForeignType;
 use gpui_kit::App;
@@ -30,129 +31,244 @@ use objc2_core_graphics::CGImage;
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use objc2_quartz_core::{CALayer, CATransaction};
 
-use crate::gesture::{Gesture, GestureEvent, Position, WHEEL_SIZE, Wheel};
+use crate::gesture::{
+    ALT, CTRL, GestureEvent, InputEvent, Position, SHIFT, SUPER, SideDelivery, Triggers,
+    WHEEL_SIZE, Wheel, WheelInput,
+};
 use crate::model::Location;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGRequestListenEventAccess() -> bool;
+    fn CGRequestPostEventAccess() -> bool;
+    fn CGEventTapCreate(
+        location: CGEventTapLocation,
+        placement: CGEventTapPlacement,
+        options: CGEventTapOptions,
+        mask: u64,
+        callback: unsafe extern "C" fn(
+            CGEventTapProxy,
+            CGEventType,
+            core_graphics::sys::CGEventRef,
+            *mut c_void,
+        ) -> core_graphics::sys::CGEventRef,
+        context: *mut c_void,
+    ) -> CFMachPortRef;
     fn CGEventTapEnable(tap: CFMachPortRef, enabled: bool);
 }
 
-pub(crate) fn request_input_access() {
-    unsafe { CGRequestListenEventAccess() };
+pub(crate) fn request_input_access(side_buttons: bool) {
+    if side_buttons {
+        unsafe { CGRequestPostEventAccess() };
+    } else {
+        unsafe { CGRequestListenEventAccess() };
+    }
+}
+
+pub(crate) fn capture_key_code() -> Option<u16> {
+    let app = objc2_app_kit::NSApplication::sharedApplication(MainThreadMarker::new()?);
+    let event = app.currentEvent()?;
+    (event.r#type() == objc2_app_kit::NSEventType::KeyDown).then(|| event.keyCode())
+}
+
+struct TapState {
+    gesture: WheelInput,
+    triggers: Option<Triggers>,
+    paused: Arc<AtomicBool>,
+    events: Sender<GestureEvent>,
+    port: CFMachPortRef,
+    function_held: bool,
+    side_down: Option<CGEvent>,
+}
+
+impl TapState {
+    fn dispatch(&mut self, kind: CGEventType, event: &CGEvent) -> SideDelivery {
+        use CGEventFlags as Flags;
+        use CGEventType as Kind;
+        let Some(config) = self.triggers.as_ref() else {
+            return SideDelivery::Pass;
+        };
+        let flags = event.get_flags();
+        let mut modifiers = 0;
+        for (flag, bit) in [
+            (Flags::CGEventFlagAlternate, ALT),
+            (Flags::CGEventFlagControl, CTRL),
+            (Flags::CGEventFlagShift, SHIFT),
+            (Flags::CGEventFlagCommand, SUPER),
+        ] {
+            if flags.intersects(flag) {
+                modifiers |= bit;
+            }
+        }
+        // Quartz also sets SecondaryFn on ordinary function-key events. Track the Fn key itself.
+        // Quartz 也会为普通功能键事件设置 SecondaryFn，这里只跟踪 Fn 键本身。
+        if matches!(kind, Kind::FlagsChanged)
+            && event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) == 63
+        {
+            self.function_held = flags.intersects(Flags::CGEventFlagSecondaryFn);
+        }
+        let input = match kind {
+            Kind::KeyDown | Kind::KeyUp => InputEvent::Key(
+                event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16,
+                matches!(kind, Kind::KeyDown),
+            ),
+            Kind::FlagsChanged => InputEvent::Modifier,
+            Kind::LeftMouseDown | Kind::LeftMouseUp => {
+                InputEvent::Left(matches!(kind, Kind::LeftMouseDown))
+            }
+            Kind::OtherMouseDown | Kind::OtherMouseUp => {
+                match event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER) {
+                    3 => InputEvent::Side(1, matches!(kind, Kind::OtherMouseDown)),
+                    4 => InputEvent::Side(2, matches!(kind, Kind::OtherMouseDown)),
+                    _ => InputEvent::Interrupt,
+                }
+            }
+            Kind::MouseMoved | Kind::LeftMouseDragged | Kind::OtherMouseDragged => InputEvent::Move,
+            _ => InputEvent::Interrupt,
+        };
+        let point = event.location();
+        let position = Position {
+            x: point.x,
+            y: point.y,
+        };
+        let (updates, delivery) = self.gesture.event(
+            config,
+            modifiers,
+            input,
+            position,
+            self.paused.load(Ordering::Relaxed) || self.function_held,
+            || 1.0,
+        );
+        for update in updates {
+            let _ = self.events.try_send(update);
+        }
+        delivery
+    }
+}
+
+// Quartz needs a null return to drop an event. The Rust convenience callback maps None to pass-through.
+// Quartz 要求返回空指针才能拦截事件，Rust 便捷接口的 None 会继续传递事件。
+unsafe extern "C" fn tap_callback(
+    proxy: CGEventTapProxy,
+    kind: CGEventType,
+    raw: core_graphics::sys::CGEventRef,
+    context: *mut c_void,
+) -> core_graphics::sys::CGEventRef {
+    let state = unsafe { &mut *context.cast::<TapState>() };
+    if matches!(
+        kind,
+        CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
+    ) {
+        state.gesture.reset_after_gap();
+        state.side_down = None;
+        state.function_held = false;
+        let _ = state.events.try_send(GestureEvent::Finish(None));
+        unsafe { CGEventTapEnable(state.port, true) };
+        return raw;
+    }
+    if raw.is_null() {
+        return raw;
+    }
+    let event = ManuallyDrop::new(unsafe { CGEvent::from_ptr(raw) });
+    match state.dispatch(kind, &event) {
+        SideDelivery::Pass => raw,
+        SideDelivery::HoldDown => {
+            state.side_down = Some(CGEvent::clone(&event));
+            ptr::null_mut()
+        }
+        SideDelivery::Swallow => {
+            if matches!(kind, CGEventType::OtherMouseUp) {
+                state.side_down = None;
+            }
+            ptr::null_mut()
+        }
+        SideDelivery::ReplayClick => {
+            // Posting from this tap places the original down before this up, without re-entering the tap.
+            // 从当前 tap 投递原始按下事件会排在这次松开之前，并跳过当前 tap。
+            if let Some(down) = state.side_down.take() {
+                down.post_from_tap(proxy);
+            }
+            raw
+        }
+    }
 }
 
 pub(crate) struct InputMonitor {
-    tap: CGEventTap<'static>,
+    tap: CFMachPort,
     source: CFRunLoopSource,
+    _state: Box<TapState>,
 }
 
 impl InputMonitor {
-    pub(crate) fn start(events: Sender<GestureEvent>, enabled: Arc<AtomicBool>) -> Option<Self> {
-        use CGEventFlags as Flags;
+    pub(crate) fn start(
+        events: Sender<GestureEvent>,
+        triggers: Option<Triggers>,
+        paused: Arc<AtomicBool>,
+    ) -> Option<Self> {
         use CGEventType as Kind;
-        let gesture = RefCell::new(Gesture::default());
-        let suppressed = Cell::new(false);
-        let port: Rc<Cell<CFMachPortRef>> = Rc::new(Cell::new(ptr::null_mut()));
-        let callback_port = port.clone();
-        let tap = CGEventTap::new(
-            CGEventTapLocation::Session,
-            CGEventTapPlacement::HeadInsertEventTap,
-            CGEventTapOptions::ListenOnly,
-            vec![
-                Kind::FlagsChanged,
-                Kind::KeyDown,
-                Kind::MouseMoved,
-                Kind::LeftMouseDragged,
-                Kind::RightMouseDragged,
-                Kind::OtherMouseDragged,
-                Kind::LeftMouseDown,
-                Kind::RightMouseDown,
-                Kind::OtherMouseDown,
-                Kind::ScrollWheel,
-            ],
-            move |_, kind, event| {
-                if matches!(
-                    kind,
-                    Kind::TapDisabledByTimeout | Kind::TapDisabledByUserInput
-                ) {
-                    *gesture.borrow_mut() = Gesture::default();
-                    suppressed.set(true);
-                    let _ = events.try_send(GestureEvent::Finish(None));
-                    let port = callback_port.get();
-                    if !port.is_null() {
-                        unsafe { CGEventTapEnable(port, true) };
-                    }
-                    return None;
-                }
-                let flags = event.get_flags();
-                let held = flags & (Flags::CGEventFlagAlternate | Flags::CGEventFlagControl);
-                let other = flags.intersects(
-                    Flags::CGEventFlagCommand
-                        | Flags::CGEventFlagShift
-                        | Flags::CGEventFlagSecondaryFn,
-                );
-                let chord =
-                    other || held == (Flags::CGEventFlagAlternate | Flags::CGEventFlagControl);
-                let interrupt = chord
-                    || !enabled.load(Ordering::Relaxed)
-                    || matches!(
-                        kind,
-                        Kind::KeyDown
-                            | Kind::ScrollWheel
-                            | Kind::RightMouseDown
-                            | Kind::OtherMouseDown
-                    );
-                if interrupt && !held.is_empty() {
-                    suppressed.set(true);
-                }
-                let cancel = interrupt || suppressed.get();
-                if held.is_empty() {
-                    suppressed.set(false);
-                }
-                let wheel = match held {
-                    Flags::CGEventFlagAlternate => Some(Wheel::Ping),
-                    Flags::CGEventFlagControl => Some(Wheel::Emote),
-                    _ => None,
-                };
-                if wheel.is_none() && !matches!(kind, Kind::FlagsChanged | Kind::KeyDown) {
-                    return None;
-                }
-                let point = event.location();
-                let position = Position {
-                    x: point.x,
-                    y: point.y,
-                };
-                let mut gesture = gesture.borrow_mut();
-                if matches!(kind, Kind::LeftMouseDown)
-                    && !cancel
-                    && wheel == Some(Wheel::Ping)
-                    && let Some(origin) = gesture.click(position)
-                {
-                    suppressed.set(true);
-                    let _ = events.try_send(GestureEvent::Finish(Some((Wheel::Ping, 8, origin))));
-                    return None;
-                }
-                for update in gesture.input(wheel, position, cancel, 1.0) {
-                    let _ = events.try_send(update);
-                }
-                None
-            },
-        )
-        .ok()?;
-        port.set(tap.mach_port.as_concrete_TypeRef());
-        let source = tap.mach_port.create_runloop_source(0).ok()?;
+        let options = if triggers.as_ref().is_some_and(Triggers::uses_side_button) {
+            CGEventTapOptions::Default
+        } else {
+            CGEventTapOptions::ListenOnly
+        };
+        let mask = [
+            Kind::FlagsChanged,
+            Kind::KeyDown,
+            Kind::KeyUp,
+            Kind::MouseMoved,
+            Kind::LeftMouseDragged,
+            Kind::RightMouseDragged,
+            Kind::OtherMouseDragged,
+            Kind::LeftMouseDown,
+            Kind::LeftMouseUp,
+            Kind::RightMouseDown,
+            Kind::OtherMouseDown,
+            Kind::OtherMouseUp,
+            Kind::ScrollWheel,
+        ]
+        .into_iter()
+        .fold(0, |mask, kind| mask | (1u64 << kind as u32));
+        let mut state = Box::new(TapState {
+            gesture: WheelInput::default(),
+            events,
+            triggers,
+            paused,
+            port: ptr::null_mut(),
+            function_held: false,
+            side_down: None,
+        });
+        let port = unsafe {
+            CGEventTapCreate(
+                CGEventTapLocation::Session,
+                CGEventTapPlacement::HeadInsertEventTap,
+                options,
+                mask,
+                tap_callback,
+                ptr::from_mut(&mut *state).cast(),
+            )
+        };
+        if port.is_null() {
+            return None;
+        }
+        state.port = port;
+        let tap = unsafe { CFMachPort::wrap_under_create_rule(port) };
+        let source = tap.create_runloop_source(0).ok()?;
         CFRunLoop::get_current().add_source(&source, unsafe { kCFRunLoopCommonModes });
-        tap.enable();
-        Some(Self { tap, source })
+        unsafe { CGEventTapEnable(port, true) };
+        Some(Self {
+            tap,
+            source,
+            _state: state,
+        })
     }
 }
 
 impl Drop for InputMonitor {
     fn drop(&mut self) {
-        unsafe { CGEventTapEnable(self.tap.mach_port.as_concrete_TypeRef(), false) };
+        let port = self.tap.as_concrete_TypeRef();
+        unsafe { CGEventTapEnable(port, false) };
         CFRunLoop::get_current().remove_source(&self.source, unsafe { kCFRunLoopCommonModes });
+        unsafe { CFMachPortInvalidate(port) };
     }
 }
 
