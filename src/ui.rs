@@ -33,7 +33,7 @@ gpui_kit::actions!([OpenChat, OpenHistory, OpenSettings, Quit]);
 // The GPUI thread owns window and overlay state. Workers send typed events.
 // GPUI 线程管理窗口与悬浮层状态，后台任务通过带类型的事件与其通信。
 struct Desktop {
-    tray: Option<tray_icon::TrayIcon>,
+    tray: Option<crate::tray::Tray>,
     model: Entity<Model>,
     incoming: Sender<RoomEvent>,
     capture_paused: Arc<AtomicBool>,
@@ -106,7 +106,7 @@ pub(crate) fn start(cx: &mut App) {
                         if model.update(cx, |model, cx| {
                             if model.receive(id, message) {
                                 cx.notify();
-                                model.profile.remote_overlay
+                                model.profile.plays_incoming_effects()
                             } else {
                                 false
                             }
@@ -147,7 +147,13 @@ pub(crate) fn start(cx: &mut App) {
         ],
     }]);
     let (sender, commands) = async_channel::unbounded();
-    match crate::tray::install(sender) {
+    let muted = cx
+        .global::<Desktop>()
+        .model
+        .read(cx)
+        .profile
+        .incoming_muted();
+    match crate::tray::install(sender, muted) {
         Ok(tray) => {
             cx.global_mut::<Desktop>().tray = Some(tray);
             #[cfg(target_os = "macos")]
@@ -159,6 +165,17 @@ pub(crate) fn start(cx: &mut App) {
                         crate::tray::Command::Chat => open_chat(cx),
                         crate::tray::Command::History => open_history(cx),
                         crate::tray::Command::Settings => open_settings(cx),
+                        crate::tray::Command::ToggleMute => {
+                            let muted = cx
+                                .global::<Desktop>()
+                                .model
+                                .read(cx)
+                                .profile
+                                .incoming_muted();
+                            if let Err(error) = set_incoming_muted(!muted, cx) {
+                                eprintln!("无法切换静音：{error:#}");
+                            }
+                        }
                         crate::tray::Command::Quit => cx.quit(),
                     });
                 }
@@ -170,6 +187,21 @@ pub(crate) fn start(cx: &mut App) {
             open_chat(cx);
         }
     }
+}
+
+fn set_incoming_muted(muted: bool, cx: &mut App) -> anyhow::Result<()> {
+    let model = cx.global::<Desktop>().model.clone();
+    let result = model.update(cx, |model, cx| {
+        model.set_incoming_muted(muted)?;
+        cx.notify();
+        Ok(())
+    });
+    // Native check items toggle on selection. Restore the saved check if the write fails.
+    // 原生菜单项会在选中时切换勾选。保存失败时恢复已保存的状态。
+    if let Some(tray) = &cx.global::<Desktop>().tray {
+        tray.set_incoming_muted(model.read(cx).profile.incoming_muted());
+    }
+    result
 }
 
 fn shortcut(key: &str) -> String {
@@ -1199,6 +1231,7 @@ impl Render for Settings {
             .clone()
             .or_else(|| (!busy).then(|| model.room_error.clone()).flatten());
         let active = model.input_ready;
+        let incoming_muted = model.profile.incoming_muted();
         #[cfg(target_os = "macos")]
         let side_access = model.profile.gestures && model.profile.triggers.uses_side_button();
         #[cfg(target_os = "macos")]
@@ -1281,7 +1314,17 @@ impl Render for Settings {
                     .child(slider_field("表情大小", format!("{} px", overlay.emote_size), Slider::new(&self.emote_size)))
                     .child(slider_field("表情停留时长", format!("{:.1} 秒", overlay.emote_timeout_ms as f32 / 1000.), Slider::new(&self.emote_timeout))))
                 .child(Switch::new("room-overlay").label("在桌面播放房间信号和表情").checked(self.remote_overlay)
-                    .on_change(cx.listener(|this, value, _, cx| { this.remote_overlay = *value; cx.notify(); }))))
+                    .on_change(cx.listener(|this, value, _, cx| { this.remote_overlay = *value; cx.notify(); })))
+                .child(div().flex().flex_col().gap_1()
+                    .child(Switch::new("incoming-mute").label("静音").checked(incoming_muted)
+                        .on_change(cx.listener(|this, value, _, cx| {
+                            this.feedback = set_incoming_muted(*value, cx)
+                                .err()
+                                .map(|error| (false, format!("无法切换静音：{error:#}")));
+                            cx.notify();
+                        })))
+                    .child(div().text_sm().text_color(theme.muted_foreground)
+                        .child("开启后立即生效，收到的内容仅显示在聊天和历史记录中。"))))
             .child(div().flex().flex_col().gap_3().border_t_1().border_color(theme.border).pt_4()
                 .child(div().font_weight(FontWeight::SEMIBOLD).child("音效"))
                 .child(Switch::new("sound").label("播放音效").checked(self.sound)

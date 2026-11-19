@@ -1,7 +1,7 @@
 use async_channel::Sender;
 use gpui_kit::Window;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 #[derive(Clone, Copy)]
@@ -9,30 +9,47 @@ pub(crate) enum Command {
     Chat,
     History,
     Settings,
+    ToggleMute,
     Quit,
 }
 
-pub(crate) fn install(sender: Sender<Command>) -> anyhow::Result<TrayIcon> {
-    let menu = Menu::new();
-    let items = [
-        (Command::Chat, "聊天"),
-        (Command::History, "历史记录"),
-        (Command::Settings, "设置"),
-        (Command::Quit, "退出"),
-    ];
-    let mut commands = Vec::new();
-    for (command, label) in items {
-        if matches!(command, Command::Quit) {
-            menu.append(&PredefinedMenuItem::separator())?;
-        }
-        let item = MenuItem::new(label, true, None);
-        commands.push((item.id().clone(), command));
-        menu.append(&item)?;
+pub(crate) struct Tray {
+    _icon: TrayIcon,
+    mute: CheckMenuItem,
+}
+
+impl Tray {
+    pub(crate) fn set_incoming_muted(&self, muted: bool) {
+        self.mute.set_checked(muted);
     }
+}
+
+pub(crate) fn install(sender: Sender<Command>, muted: bool) -> anyhow::Result<Tray> {
+    let menu = Menu::new();
+    let chat = MenuItem::new("聊天", true, None);
+    let history = MenuItem::new("历史记录", true, None);
+    let settings = MenuItem::new("设置", true, None);
+    let mute = CheckMenuItem::new("静音", true, muted, None);
+    let quit = MenuItem::new("退出", true, None);
+    menu.append_items(&[
+        &chat,
+        &history,
+        &settings,
+        &mute,
+        &PredefinedMenuItem::separator(),
+        &quit,
+    ])?;
+    let commands = [
+        (chat.id().clone(), Command::Chat),
+        (history.id().clone(), Command::History),
+        (settings.id().clone(), Command::Settings),
+        (mute.id().clone(), Command::ToggleMute),
+        (quit.id().clone(), Command::Quit),
+    ];
     let pixels = image::load_from_memory(include_bytes!("../assets/textures/omw_cyan.png"))?
         .resize_exact(32, 32, image::imageops::FilterType::Lanczos3)
         .into_rgba8();
-    let tray = TrayIconBuilder::new()
+    let icon = TrayIconBuilder::new()
         .with_tooltip("PingPingPing")
         .with_icon(Icon::from_rgba(pixels.into_raw(), 32, 32)?)
         .with_menu(Box::new(menu))
@@ -45,7 +62,7 @@ pub(crate) fn install(sender: Sender<Command>) -> anyhow::Result<TrayIcon> {
     // Only menu commands matter; do not queue unused pointer events.
     // 仅处理菜单命令，避免未消费的指针事件积压。
     TrayIconEvent::set_event_handler(Some(|_| {}));
-    Ok(tray)
+    Ok(Tray { _icon: icon, mute })
 }
 
 pub(crate) fn hide_window(window: &Window) -> bool {

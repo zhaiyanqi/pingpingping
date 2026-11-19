@@ -172,7 +172,19 @@ pub(crate) struct Profile {
     pub(crate) triggers: crate::gesture::Triggers,
     pub(crate) remote_overlay: bool,
     #[serde(default)]
+    incoming_muted: bool,
+    #[serde(default)]
     pub(crate) overlay: OverlaySettings,
+}
+
+impl Profile {
+    pub(crate) fn incoming_muted(&self) -> bool {
+        self.incoming_muted
+    }
+
+    pub(crate) fn plays_incoming_effects(&self) -> bool {
+        self.remote_overlay && !self.incoming_muted
+    }
 }
 
 impl Default for Profile {
@@ -185,6 +197,7 @@ impl Default for Profile {
             gestures: true,
             triggers: Default::default(),
             remote_overlay: true,
+            incoming_muted: false,
             overlay: OverlaySettings::default(),
         }
     }
@@ -337,6 +350,12 @@ impl Model {
         self.disk_thread.take()
     }
 
+    pub(crate) fn set_incoming_muted(&mut self, muted: bool) -> Result<()> {
+        let mut profile = self.profile.clone();
+        profile.incoming_muted = muted;
+        self.apply(profile)
+    }
+
     pub(crate) fn apply(&mut self, mut profile: Profile) -> Result<()> {
         ensure!(
             !profile.name.is_empty()
@@ -434,16 +453,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_profiles_use_defaults_for_overlay_settings() {
+    fn legacy_profiles_use_defaults_for_playback_settings() {
         let profile = Profile {
             sound: false,
             ..Profile::default()
         };
         let mut legacy = serde_json::to_value(&profile).unwrap();
-        legacy.as_object_mut().unwrap().remove("overlay");
+        let fields = legacy.as_object_mut().unwrap();
+        fields.remove("overlay");
+        fields.remove("incoming_muted");
         let loaded: Profile = serde_json::from_value(legacy).unwrap();
         assert_eq!(loaded.overlay, OverlaySettings::default());
         assert!(loaded.overlay.with_sound(loaded.sound).volume().is_none());
+        assert!(!loaded.incoming_muted());
+        assert!(loaded.plays_incoming_effects());
+    }
+
+    #[test]
+    fn incoming_mute_persists_and_preserves_the_room_overlay_preference() {
+        let folder = std::env::temp_dir().join(format!("pingpingping-mute-{}", Uuid::new_v4()));
+        let mut model = Model::load(folder.clone()).unwrap();
+        model.set_incoming_muted(true).unwrap();
+        assert!(!model.profile.plays_incoming_effects());
+        model.finish_writes().unwrap().join().unwrap();
+
+        let mut restored = Model::load(folder.clone()).unwrap();
+        assert!(restored.profile.incoming_muted());
+        assert!(!restored.profile.plays_incoming_effects());
+        restored.set_incoming_muted(false).unwrap();
+        assert!(restored.profile.plays_incoming_effects());
+
+        let mut profile = restored.profile.clone();
+        profile.remote_overlay = false;
+        restored.apply(profile).unwrap();
+        restored.set_incoming_muted(true).unwrap();
+        restored.set_incoming_muted(false).unwrap();
+        assert!(!restored.profile.plays_incoming_effects());
+
+        restored.finish_writes().unwrap().join().unwrap();
+        fs::remove_dir_all(folder).unwrap();
     }
 
     #[test]

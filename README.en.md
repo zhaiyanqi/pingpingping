@@ -56,6 +56,8 @@ The app accepts private, link-local, and loopback IPv4 addresses. LAN traffic is
 
 Under **Settings → Desktop animations**, set the size and timeout for pings and emotes separately and preview them before saving. Animations loop at their source frame rate and disappear at the configured timeout. **Sound** controls the volume and has separate switches for emote sounds and wheel ticks.
 
+Right-click the Windows system tray or macOS menu bar icon and select **Mute**. You can also toggle it under **Settings → Desktop animations**. Mute takes effect immediately and persists across restarts. Incoming content appears only in chat and history, and your own pings and emotes still play.
+
 ## Shortcuts and local data
 
 | Action | Windows | macOS |
