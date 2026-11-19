@@ -23,7 +23,7 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
 use crate::assets::{EMOTES, PINGS};
-use crate::emotes::{EmoteStore, LibraryEmote};
+use crate::emotes::{EmoteId, EmoteStore, LibraryEmote};
 use crate::gesture::{GestureEvent, TriggerKey, Triggers, Wheel};
 use crate::model::{
     ANIMATION_TIMEOUT, Body, EMOTE_SIZE, EmotePage, Message, Model, OverlaySettings, PING_SIZE,
@@ -499,21 +499,35 @@ impl LocalEmotes {
     }
 
     fn import(&mut self, cx: &mut Context<Self>) {
+        self.import_image(None, |_, _| {}, cx);
+    }
+
+    fn import_image(
+        &mut self,
+        path: Option<PathBuf>,
+        completed: impl FnOnce(Option<EmoteId>, &mut App) + 'static,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.task.is_some() {
-            return;
+            return false;
         }
         self.error = None;
-        let prompt = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("选择 GIF、PNG、JPEG 或 WebP 图片".into()),
+        let prompt = path.is_none().then(|| {
+            cx.prompt_for_paths(PathPromptOptions {
+                files: true,
+                directories: false,
+                multiple: false,
+                prompt: Some("选择 GIF、PNG、JPEG 或 WebP 图片".into()),
+            })
         });
         let store = self.store.clone();
         self.task = Some(cx.spawn(async move |weak, cx| {
             let result = async {
-                let paths = prompt.await??;
-                let Some(path) = paths.and_then(|paths| paths.into_iter().next()) else {
+                let path = match prompt {
+                    Some(prompt) => prompt.await??.and_then(|paths| paths.into_iter().next()),
+                    None => path,
+                };
+                let Some(path) = path else {
                     return Ok(None);
                 };
                 smol::unblock(move || store.import(&path)).await.map(Some)
@@ -521,18 +535,25 @@ impl LocalEmotes {
             .await;
             let _ = weak.update(cx, |this, cx| {
                 this.task.take();
-                match result {
+                let id = match result {
                     Ok(Some(emote)) => {
-                        this.entries.retain(|known| known.id() != emote.id());
+                        let id = emote.id();
+                        this.entries.retain(|known| known.id() != id);
                         this.entries.insert(0, emote);
+                        Some(id)
                     }
-                    Ok(None) => {}
-                    Err(error) => this.error = Some(format!("{error:#}")),
-                }
+                    Ok(None) => None,
+                    Err(error) => {
+                        this.error = Some(format!("{error:#}"));
+                        None
+                    }
+                };
+                completed(id, cx);
                 cx.notify();
             });
         }));
         cx.notify();
+        true
     }
 }
 
@@ -1154,6 +1175,66 @@ enum SettingsCategory {
 
 const SLOT_DIRECTIONS: [&str; 8] = ["上", "右上", "右", "右下", "下", "左下", "左", "左上"];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct WheelSlot {
+    page: usize,
+    sector: usize,
+}
+
+impl WheelSlot {
+    fn after_page_removed(self, removed: usize) -> Option<Self> {
+        (self.page != removed).then(|| Self {
+            page: self.page - usize::from(self.page > removed),
+            ..self
+        })
+    }
+}
+
+struct EmoteDragPreview {
+    image: ImageSource,
+    offset: Point<Pixels>,
+}
+
+impl Render for EmoteDragPreview {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let half = window.rem_size();
+        div()
+            .relative()
+            .left(self.offset.x - half)
+            .top(self.offset.y - half)
+            .size_8()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(theme.radius)
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.popover)
+            .child(
+                img(self.image.clone())
+                    .size_6()
+                    .object_fit(ObjectFit::Contain),
+            )
+    }
+}
+
+fn draggable_emote<T: 'static>(mut button: Button, value: T, image: ImageSource) -> Button {
+    button
+        .interactivity()
+        .on_drag(value, move |_, offset, _, cx| {
+            cx.new(|_| EmoteDragPreview {
+                image: image.clone(),
+                offset,
+            })
+        });
+    button.cursor_grab()
+}
+
+fn wheel_drop_style(style: StyleRefinement, cx: &App) -> StyleRefinement {
+    style.border_color(cx.theme().drag_border)
+}
+
 impl SettingsCategory {
     const ALL: [Self; 5] = [
         Self::General,
@@ -1186,7 +1267,8 @@ struct Settings {
     emote_pages: Vec<EmotePage>,
     wheel_page: usize,
     wheel_slot: usize,
-    swap_source: Option<(usize, usize)>,
+    swap_source: Option<WheelSlot>,
+    pending_image: Option<WheelSlot>,
     recording: Option<Wheel>,
     capture_focus: FocusHandle,
     capture_paused: Arc<AtomicBool>,
@@ -1216,23 +1298,89 @@ impl Settings {
         cx.notify();
     }
 
-    fn select_wheel_slot(&mut self, slot: usize, cx: &mut Context<Self>) {
-        if let Some((page, source)) = self.swap_source.take()
-            && (page, source) != (self.wheel_page, slot)
-        {
-            let emote = self.emote_pages[page][source].take();
-            let displaced = std::mem::replace(&mut self.emote_pages[self.wheel_page][slot], emote);
-            self.emote_pages[page][source] = displaced;
-            self.feedback = None;
+    fn selected_slot(&self) -> WheelSlot {
+        WheelSlot {
+            page: self.wheel_page,
+            sector: self.wheel_slot,
         }
-        self.wheel_slot = slot;
+    }
+
+    fn select_wheel_slot(&mut self, target: WheelSlot, cx: &mut Context<Self>) {
+        if let Some(source) = self.swap_source.take() {
+            self.swap_wheel_slots(source, target);
+        }
+        self.wheel_slot = target.sector;
         cx.notify();
     }
 
-    fn set_wheel_slot(&mut self, emote: Option<WheelEmote>, cx: &mut Context<Self>) {
-        self.emote_pages[self.wheel_page][self.wheel_slot] = emote;
+    fn swap_wheel_slots(&mut self, source: WheelSlot, target: WheelSlot) {
+        if source == target || source.page >= self.emote_pages.len() {
+            return;
+        }
+        if self
+            .pending_image
+            .is_some_and(|slot| slot == source || slot == target)
+        {
+            self.pending_image = None;
+        }
+        let emote = self.emote_pages[source.page][source.sector].take();
+        let displaced = std::mem::replace(&mut self.emote_pages[target.page][target.sector], emote);
+        self.emote_pages[source.page][source.sector] = displaced;
+        self.feedback = None;
+    }
+
+    fn set_wheel_slot(
+        &mut self,
+        target: WheelSlot,
+        emote: Option<WheelEmote>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pending_image == Some(target) {
+            self.pending_image = None;
+        }
+        self.emote_pages[target.page][target.sector] = emote;
         self.swap_source = None;
         self.feedback = None;
+        cx.notify();
+    }
+
+    fn drop_wheel_image(
+        &mut self,
+        target: WheelSlot,
+        paths: &ExternalPaths,
+        cx: &mut Context<Self>,
+    ) {
+        let [path] = paths.paths() else {
+            self.feedback = Some((false, "请一次拖入一张图片。".into()));
+            cx.notify();
+            return;
+        };
+        let library = cx.global::<Desktop>().library.clone();
+        let owner = cx.weak_entity();
+        let started = library.update(cx, |library, cx| {
+            library.import_image(
+                Some(path.clone()),
+                move |id, cx| {
+                    let _ = owner.update(cx, |this, cx| {
+                        // The target follows page deletion and is cleared if the slot is edited.
+                        // 删除页面时会更新目标索引，编辑目标槽位时则会取消自动填入。
+                        if let (Some(slot), Some(id)) = (this.pending_image.take(), id) {
+                            this.emote_pages[slot.page][slot.sector] = Some(WheelEmote::Custom(id));
+                        }
+                        cx.notify();
+                    });
+                },
+                cx,
+            )
+        });
+        if started {
+            self.pending_image = Some(target);
+            self.wheel_slot = target.sector;
+            self.swap_source = None;
+            self.feedback = None;
+        } else {
+            self.feedback = Some((false, "表情库正在处理图片，请稍后再拖入。".into()));
+        }
         cx.notify();
     }
 
@@ -1258,35 +1406,12 @@ impl Settings {
             .map(|row| {
                 div().flex().gap_2().children(row.map(|slot| {
                     div().flex_1().min_w_0().when_some(slot, |cell, slot| {
-                        let (name, image) = wheel_emote_preview(slots[slot], desktop, library);
-                        let direction = SLOT_DIRECTIONS[slot];
-                        let label = format!("{direction} · {name}");
-                        cell.child(
-                            Button::new(("wheel-slot", slot))
-                                .outline()
-                                .w_full()
-                                .h(rems(3.5))
-                                .selected(self.wheel_slot == slot)
-                                .toggled(self.wheel_slot == slot)
-                                .accessibility_label(label.clone())
-                                .tooltip(label)
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .items_center()
-                                        .gap_1()
-                                        .child(div().size_6().when_some(image, |preview, image| {
-                                            preview.child(
-                                                img(image).size_6().object_fit(ObjectFit::Contain),
-                                            )
-                                        }))
-                                        .child(div().text_xs().child(direction)),
-                                )
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.select_wheel_slot(slot, cx)
-                                })),
-                        )
+                        let preview = wheel_emote_preview(slots[slot], desktop, library);
+                        cell.child(self.wheel_slot_button(
+                            WheelSlot { page, sector: slot },
+                            preview,
+                            cx,
+                        ))
                     })
                 }))
             }),
@@ -1305,7 +1430,7 @@ impl Settings {
                 div()
                     .text_sm()
                     .text_color(theme.muted_foreground)
-                    .child("打开表情轮盘后，向下滚动翻到下一页，向上滚动返回上一页。"),
+                    .child("拖动槽位里的表情可换位。可将表情库中的表情或本地图片拖入槽位，也可点选表情填入当前槽位。"),
             )
             .child(
                 div()
@@ -1354,6 +1479,9 @@ impl Settings {
                             .disabled(count == 1)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.emote_pages.remove(this.wheel_page);
+                                this.pending_image = this
+                                    .pending_image
+                                    .and_then(|slot| slot.after_page_removed(this.wheel_page));
                                 this.swap_source = None;
                                 this.feedback = None;
                                 this.show_wheel_page(
@@ -1363,27 +1491,29 @@ impl Settings {
                             })),
                     ),
             )
-            .child(grid)
             .child(
                 div()
-                    .text_sm()
-                    .child(if let Some((page, slot)) = self.swap_source {
-                        format!(
-                            "已选中第 {} 页的「{}」，请选择目标槽位。",
-                            page + 1,
-                            SLOT_DIRECTIONS[slot]
-                        )
-                    } else {
-                        format!("{direction} · {name}")
-                    }),
+                    .flex()
+                    .items_start()
+                    .gap_4()
+                    .child(grid.flex_1().min_w_0())
+                    .child(self.wheel_emote_library(selected, cx)),
             )
+            .child(div().text_sm().child(if let Some(slot) = self.swap_source {
+                format!(
+                    "已选中第 {} 页的「{}」，请选择目标槽位。",
+                    slot.page + 1,
+                    SLOT_DIRECTIONS[slot.sector]
+                )
+            } else {
+                format!("{direction} · {name}")
+            }))
             .child(
                 div()
                     .flex()
                     .flex_wrap()
                     .items_center()
                     .gap_2()
-                    .child(self.wheel_emote_picker(selected, cx))
                     .child(
                         Button::new("swap-wheel-slots")
                             .small()
@@ -1396,7 +1526,7 @@ impl Settings {
                             .disabled(selected.is_none() && self.swap_source.is_none())
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if this.swap_source.take().is_none() {
-                                    this.swap_source = Some((this.wheel_page, this.wheel_slot));
+                                    this.swap_source = Some(this.selected_slot());
                                 }
                                 cx.notify();
                             })),
@@ -1407,7 +1537,9 @@ impl Settings {
                             .ghost()
                             .label("移出此槽位")
                             .disabled(selected.is_none())
-                            .on_click(cx.listener(|this, _, _, cx| this.set_wheel_slot(None, cx))),
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_wheel_slot(this.selected_slot(), None, cx)
+                            })),
                     )
                     .child(
                         Button::new("import-wheel-emote")
@@ -1426,84 +1558,126 @@ impl Settings {
             })
     }
 
-    fn wheel_emote_picker(&self, selected: Option<WheelEmote>, cx: &Context<Self>) -> Popover {
-        let owner = cx.weak_entity();
-        let page = self.wheel_page;
-        let slot = self.wheel_slot;
-        Popover::new("choose-wheel-emote")
-            .anchor(Anchor::BottomLeft)
-            .trigger(
-                Button::new("choose-wheel-emote")
-                    .small()
-                    .label(if selected.is_some() {
-                        "更换表情…"
-                    } else {
-                        "添加表情…"
-                    }),
-            )
-            .content(move |_, _, cx| {
-                let desktop = cx.global::<Desktop>();
-                let library = desktop.library.read(cx);
-                let popup = cx.weak_entity();
-                let button = |emote| {
-                    let (name, image) = wheel_emote_preview(Some(emote), desktop, library);
-                    let id: ElementId = match emote {
-                        WheelEmote::BuiltIn(index) => ("built-in", index).into(),
-                        WheelEmote::Custom(id) => SharedString::from(id.to_string()).into(),
-                    };
-                    let owner = owner.clone();
-                    let popup = popup.clone();
-                    Button::new(id)
-                        .ghost()
-                        .selected(selected == Some(emote))
-                        .accessibility_label(name.clone())
-                        .tooltip(name)
-                        .children(
-                            image.map(|image| img(image).size_6().object_fit(ObjectFit::Contain)),
-                        )
-                        .on_click(move |_, window, cx| {
-                            let _ = owner.update(cx, |this, cx| {
-                                if (this.wheel_page, this.wheel_slot) == (page, slot) {
-                                    this.set_wheel_slot(Some(emote), cx);
-                                }
-                            });
-                            let _ = popup.update(cx, |state, cx| state.dismiss(window, cx));
-                        })
-                };
+    fn wheel_slot_button(
+        &self,
+        target: WheelSlot,
+        (name, image): (String, Option<ImageSource>),
+        cx: &Context<Self>,
+    ) -> Button {
+        let sector = target.sector;
+        let direction = SLOT_DIRECTIONS[sector];
+        let label = format!("{direction} · {name}");
+        Button::new(("wheel-slot", sector))
+            .outline()
+            .w_full()
+            .h(rems(3.5))
+            .selected(self.wheel_slot == sector)
+            .toggled(self.wheel_slot == sector)
+            .accessibility_label(label.clone())
+            .tooltip(label)
+            .child(
                 div()
-                    .w_64()
                     .flex()
                     .flex_col()
-                    .gap_2()
-                    .child(div().text_sm().child("内置表情"))
-                    .child(div().flex().flex_wrap().gap_1().children(
-                        (0..EMOTES.len()).map(|index| button(WheelEmote::BuiltIn(index))),
-                    ))
-                    .when(!library.entries.is_empty(), |panel| {
-                        panel
-                            .child(
-                                div()
-                                    .border_t_1()
-                                    .border_color(cx.theme().border)
-                                    .pt_2()
-                                    .text_sm()
-                                    .child("已导入的表情"),
-                            )
-                            .child(
-                                div()
-                                    .id("wheel-custom-emotes")
-                                    .max_h(rems(8.))
-                                    .child(
-                                        div().flex().flex_wrap().gap_1().children(
-                                            library.entries.iter().map(|emote| {
-                                                button(WheelEmote::Custom(emote.id()))
-                                            }),
-                                        ),
-                                    )
-                                    .overflow_y_scrollbar(),
-                            )
-                    })
+                    .items_center()
+                    .gap_1()
+                    .child(div().size_6().when_some(image.clone(), |preview, image| {
+                        preview.child(img(image).size_6().object_fit(ObjectFit::Contain))
+                    }))
+                    .child(div().text_xs().child(direction)),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| this.select_wheel_slot(target, cx)))
+            .when_some(image, |button, image| {
+                draggable_emote(button, target, image)
             })
+            .drag_over(move |style, source: &WheelSlot, _, cx| {
+                if *source == target {
+                    style
+                } else {
+                    wheel_drop_style(style, cx)
+                }
+            })
+            .on_drop(cx.listener(move |this, source: &WheelSlot, _, cx| {
+                this.swap_source = None;
+                this.swap_wheel_slots(*source, target);
+                this.wheel_slot = target.sector;
+                cx.notify();
+            }))
+            .drag_over(|style, _: &WheelEmote, _, cx| wheel_drop_style(style, cx))
+            .on_drop(cx.listener(move |this, emote: &WheelEmote, _, cx| {
+                this.wheel_slot = target.sector;
+                this.set_wheel_slot(target, Some(*emote), cx);
+            }))
+            .drag_over(|style, paths: &ExternalPaths, _, cx| {
+                if paths.paths().len() == 1 {
+                    wheel_drop_style(style, cx)
+                } else {
+                    style
+                }
+            })
+            .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                this.drop_wheel_image(target, paths, cx)
+            }))
+    }
+
+    fn wheel_emote_library(&self, selected: Option<WheelEmote>, cx: &Context<Self>) -> Div {
+        let desktop = cx.global::<Desktop>();
+        let library = desktop.library.read(cx);
+        let target = self.selected_slot();
+        let button = |emote| {
+            let (name, image) = wheel_emote_preview(Some(emote), desktop, library);
+            let id: ElementId = match emote {
+                WheelEmote::BuiltIn(index) => ("built-in", index).into(),
+                WheelEmote::Custom(id) => SharedString::from(id.to_string()).into(),
+            };
+            Button::new(id)
+                .ghost()
+                .size_8()
+                .p_0()
+                .selected(selected == Some(emote))
+                .accessibility_label(name.clone())
+                .tooltip(name)
+                .on_click(
+                    cx.listener(move |this, _, _, cx| this.set_wheel_slot(target, Some(emote), cx)),
+                )
+                .when_some(image, |button, image| {
+                    draggable_emote(
+                        button.child(img(image.clone()).size_6().object_fit(ObjectFit::Contain)),
+                        emote,
+                        image,
+                    )
+                })
+        };
+        let preset = (0..EMOTES.len()).map(|index| button(WheelEmote::BuiltIn(index)));
+        let custom = library
+            .entries
+            .iter()
+            .map(|emote| button(WheelEmote::Custom(emote.id())));
+        div()
+            .w(rems(10.))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("表情库"),
+            )
+            .child(
+                div()
+                    .id("wheel-library")
+                    .max_h(rems(10.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_1()
+                            .children(preset.chain(custom)),
+                    )
+                    .overflow_y_scrollbar(),
+            )
     }
 
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -1598,6 +1772,7 @@ impl Settings {
             wheel_page: 0,
             wheel_slot: 0,
             swap_source: None,
+            pending_image: None,
             recording: None,
             capture_focus,
             capture_paused: cx.global::<Desktop>().capture_paused.clone(),
@@ -1916,7 +2091,7 @@ impl Settings {
         let theme = cx.theme();
         div().flex().flex_col().gap_3().border_t_1().border_color(theme.border).pt_4()
                 .child(div().font_weight(FontWeight::SEMIBOLD).child("轮盘快捷键"))
-                .child(div().text_sm().text_color(theme.muted_foreground).child("键盘触发时，按住快捷键并用左键拖动。鼠标侧键可直接按住拖动，松开确认；拖回中心可取消。"))
+                .child(div().text_sm().text_color(theme.muted_foreground).child("键盘触发时，按住快捷键并用左键拖动。鼠标侧键可直接按住拖动，松开确认。拖回中心可取消，表情轮盘打开时可用滚轮翻页。"))
                 .child(Switch::new("gestures").label("启用全局轮盘").checked(self.gestures)
                     .on_change(cx.listener(|this, value, _, cx| { this.gestures = *value; cx.notify(); })))
                 .child(self.trigger_row(Wheel::Ping, cx))
@@ -2221,22 +2396,27 @@ impl Render for Settings {
                     .px_5()
                     .py_3()
                     .flex_shrink_0()
-                    .child(div().flex_1().text_sm().when_some(
-                        self.feedback.clone(),
-                        |label, (ok, message)| {
-                            label
-                                .text_color(if ok {
-                                    theme.muted_foreground
-                                } else {
-                                    theme.danger
-                                })
-                                .child(message)
-                        },
-                    ))
+                    .child(
+                        div().flex_1().text_sm().when_some(
+                            self.feedback.clone().or_else(|| {
+                                self.pending_image.map(|_| (true, "正在导入图片…".into()))
+                            }),
+                            |label, (ok, message)| {
+                                label
+                                    .text_color(if ok {
+                                        theme.muted_foreground
+                                    } else {
+                                        theme.danger
+                                    })
+                                    .child(message)
+                            },
+                        ),
+                    )
                     .child(
                         Button::new("save")
                             .primary()
                             .label("保存设置")
+                            .disabled(self.pending_image.is_some())
                             .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
                     ),
             )
@@ -2245,7 +2425,15 @@ impl Render for Settings {
 
 #[cfg(test)]
 mod tests {
-    use super::{ANIMATION_TIMEOUT, setting_slider};
+    use super::{ANIMATION_TIMEOUT, WheelSlot, setting_slider};
+
+    #[test]
+    fn deleting_a_page_preserves_the_target_of_a_pending_wheel_drop() {
+        let target = WheelSlot { page: 2, sector: 5 };
+        assert!(target.after_page_removed(0) == Some(WheelSlot { page: 1, ..target }));
+        assert!(target.after_page_removed(2).is_none());
+        assert!(target.after_page_removed(3) == Some(target));
+    }
 
     #[test]
     fn timeout_slider_accepts_the_saved_millisecond_range() {
