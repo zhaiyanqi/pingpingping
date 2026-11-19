@@ -689,27 +689,38 @@ impl Conversation {
         self.rows = rows;
     }
 
-    fn send_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(input), Some(effect)) = (self.input.clone(), self.text_effect.clone()) else {
-            return;
-        };
-        let value = input.read(cx).value().trim().to_owned();
-        if value.is_empty() {
-            return;
+    fn text_draft(&self, cx: &App) -> Option<(Body, TextEffect)> {
+        let value = self.input.as_ref()?.read(cx).value();
+        let text = value.trim();
+        if text.is_empty() {
+            return None;
         }
-        let selected = effect
+        let effect = self
+            .text_effect
+            .as_ref()?
             .read(cx)
             .selected_value()
             .copied()
             .unwrap_or_default();
-        if self.send(Body::Text(value), selected, cx) {
-            effect.update(cx, |effect, cx| {
-                effect.set_selected_value(&TextEffect::Default, window, cx);
-            });
-            input.update(cx, |input, cx| {
-                input.set_value("", window, cx);
-                input.focus(window, cx);
-            });
+        Some((Body::Text(text.to_owned()), effect))
+    }
+
+    fn send_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((body, effect)) = self.text_draft(cx) else {
+            return;
+        };
+        if self.send(body, effect, cx) {
+            if let Some(effect) = &self.text_effect {
+                effect.update(cx, |effect, cx| {
+                    effect.set_selected_value(&TextEffect::Default, window, cx);
+                });
+            }
+            if let Some(input) = &self.input {
+                input.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                    input.focus(window, cx);
+                });
+            }
         }
     }
 
@@ -1149,6 +1160,7 @@ impl Render for Conversation {
         }
         view = view.child(feed);
         if let (Some(input), Some(effect)) = (&self.input, &self.text_effect) {
+            let empty = input.read(cx).value().trim().is_empty();
             view = view.child(
                 div()
                     .flex()
@@ -1174,6 +1186,7 @@ impl Render for Conversation {
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .justify_end()
                             .gap_2()
@@ -1184,11 +1197,23 @@ impl Render for Conversation {
                                     .w(rems(10.)),
                             )
                             .child(
+                                Button::new("preview-text-draft")
+                                    .ghost()
+                                    .label("预览")
+                                    .accessibility_label("预览文字动效")
+                                    .disabled(empty)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some((body, effect)) = this.text_draft(cx) {
+                                            play(&body, effect, cx);
+                                        }
+                                    })),
+                            )
+                            .child(
                                 Button::new("send")
                                     .primary()
                                     .label("发送")
                                     .tooltip("Enter 发送 · Shift+Enter 换行")
-                                    .disabled(input.read(cx).value().trim().is_empty())
+                                    .disabled(empty)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.send_text(window, cx)
                                     })),

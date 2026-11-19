@@ -83,7 +83,7 @@ Under **Settings → Desktop animations**, set the size and timeout for pings an
 
 Sent and received text appears in the bottom-right corner of the primary display by default. Under **Settings → Desktop animations → Text overlay**, set the position, hold time (four seconds by default), and default entrance and exit effects. Select **Preview text** to see the result before saving. New text replaces the message currently on screen, and chat and history retain the full message.
 
-Use **Effect** next to the chat composer to choose a shake, fly-in, bounce, fade, slide, or no animation for the current message. After a successful send, the next message uses the default effects. Each room member uses their own hold time. The room host and receiver both need per-message effect support for the selected effect to reach the receiver. Older versions can still exchange text.
+Use **Effect** next to the chat composer to choose a shake, fly-in, bounce, fade, slide, or no animation for the current message. Select **Preview** to play your draft with the selected effect on your desktop before sending. After a successful send, the next message uses the default effects. Each room member uses their own hold time. The room host and receiver both need per-message effect support for the selected effect to reach the receiver. Older versions can still exchange text.
 
 Right-click the Windows system tray or macOS menu bar icon and select **Mute**. You can also toggle it under **Settings → Desktop animations**. Mute takes effect immediately and persists across restarts. Incoming content appears only in chat and history, while your own text, pings, and emotes continue to appear on the desktop.
 
