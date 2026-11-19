@@ -9,9 +9,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::playback::{
-    FrameUpdate, SenderTag, TAG_BACKGROUND, TAG_FONT_SIZE, TAG_FOREGROUND, TAG_HEIGHT, TAG_PADDING,
-    TAG_RADIUS, TAG_WIDTH, TEXT_FONT_SIZE, TEXT_MARGIN, TEXT_MAX_LINES, TEXT_PADDING, TEXT_RADIUS,
-    TEXT_WIDTH, TextColors, TextFrame, text_anchor,
+    FrameSize, FrameUpdate, SenderTag, TAG_BACKGROUND, TAG_FONT_SIZE, TAG_FOREGROUND, TAG_HEIGHT,
+    TAG_PADDING, TAG_RADIUS, TAG_WIDTH, TEXT_FONT_SIZE, TEXT_MARGIN, TEXT_MAX_LINES, TEXT_PADDING,
+    TEXT_RADIUS, TEXT_WIDTH, TextColors, TextFrame, text_anchor,
 };
 use super::{
     AnimationOverlay, AnimationPosition, AudioCue, WheelContents, start_audio, wheel::WheelView,
@@ -691,7 +691,7 @@ pub(super) fn animation_presenter(
     size: u32,
     tag: SenderTag<'_>,
     position: AnimationPosition,
-) -> Option<(Option<u32>, impl FnMut(FrameUpdate) + use<>)> {
+) -> Option<(FrameSize, impl FnMut(FrameUpdate) + use<>)> {
     let mtm = MainThreadMarker::new()?;
     let center = match position {
         AnimationPosition::Local(local) => screen_for(local, mtm)?.0,
@@ -704,6 +704,13 @@ pub(super) fn animation_presenter(
         }
     };
     let size = f64::from(size);
+    // An overlay can straddle displays, so allow enough pixels for the highest backing scale.
+    // 浮层可能横跨显示器，按最高的屏幕缩放倍率保留足够像素。
+    let scale = NSScreen::screens(mtm)
+        .iter()
+        .map(|screen| screen.backingScaleFactor())
+        .fold(1.0, f64::max);
+    let frame_size = FrameSize::FitWithin((size * scale).ceil() as u32);
     let half = size / 2.0;
     // Keep the gesture anchor when the art or sender tag extends past the display.
     // 动画或昵称条超出显示器边缘时，保留手势锚点。
@@ -717,7 +724,7 @@ pub(super) fn animation_presenter(
         ));
     }
     let mut effect = None;
-    Some((None, move |update| {
+    Some((frame_size, move |update| {
         let window = effect.get_or_insert_with(|| {
             let (panel, art) = panel(NSSize::new(size, size), mtm, false);
             panel.setLevel(ANIMATION_WINDOW_LEVEL);

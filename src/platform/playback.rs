@@ -71,6 +71,31 @@ pub(super) enum FrameUpdate {
     Opacity(f32),
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum FrameSize {
+    #[cfg(any(target_os = "windows", test))]
+    Square(u32),
+    #[cfg(any(target_os = "macos", test))]
+    FitWithin(u32),
+    #[cfg(any(target_os = "macos", test))]
+    Original,
+}
+
+impl FrameSize {
+    fn prepare(self, image: RgbaImage) -> RgbaImage {
+        match self {
+            #[cfg(any(target_os = "windows", test))]
+            Self::Square(side) => prepare(image, Some(side)),
+            #[cfg(any(target_os = "macos", test))]
+            Self::FitWithin(side) if image.width().max(image.height()) > side => {
+                prepare(downsize(image, side), None)
+            }
+            #[cfg(any(target_os = "macos", test))]
+            Self::FitWithin(_) | Self::Original => prepare(image, None),
+        }
+    }
+}
+
 pub(crate) struct Animation {
     size: u32,
     source: AnimationSource,
@@ -351,6 +376,32 @@ impl TimedFrame {
     }
 }
 
+fn premultiply(value: u8, alpha: u8) -> u8 {
+    ((u16::from(value) * u16::from(alpha) + 127) / 255) as u8
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn downsize(mut image: RgbaImage, size: u32) -> RgbaImage {
+    // Filter premultiplied colors to keep transparent pixels from darkening the edges.
+    // 用预乘颜色缩放，避免透明像素压暗图像边缘。
+    for [r, g, b, alpha] in image.as_flat_samples_mut().samples.as_chunks_mut::<4>().0 {
+        if *alpha != 255 {
+            [*r, *g, *b] = [*r, *g, *b].map(|value| premultiply(value, *alpha));
+        }
+    }
+    let mut fitted = DynamicImage::ImageRgba8(image)
+        .resize(size, size, image::imageops::FilterType::Triangle)
+        .into_rgba8();
+    for [r, g, b, alpha] in fitted.as_flat_samples_mut().samples.as_chunks_mut::<4>().0 {
+        if *alpha > 0 && *alpha < 255 {
+            let alpha = u16::from(*alpha);
+            let restore = |value| ((u16::from(value) * 255 + alpha / 2) / alpha).min(255) as u8;
+            [*r, *g, *b] = [*r, *g, *b].map(restore);
+        }
+    }
+    fitted
+}
+
 pub(super) fn prepare(image: RgbaImage, size: Option<u32>) -> RgbaImage {
     let image = match size {
         Some(size) if image.width() != image.height() => {
@@ -378,8 +429,7 @@ pub(super) fn prepare(image: RgbaImage, size: Option<u32>) -> RgbaImage {
         let mut image = image;
         for pixel in image.as_flat_samples_mut().samples.as_chunks_mut::<4>().0 {
             let [r, g, b, a] = *pixel;
-            let premultiply = |v: u8| ((u16::from(v) * u16::from(a) + 127) / 255) as u8;
-            *pixel = [premultiply(b), premultiply(g), premultiply(r), a];
+            *pixel = [premultiply(b, a), premultiply(g, a), premultiply(r, a), a];
         }
         image
     }
@@ -398,7 +448,7 @@ fn webp(bytes: &[u8]) -> ImageResult<EmoteImage<'_>> {
     }
 }
 
-fn decode(animation: &Animation, size: Option<u32>, send: async_channel::Sender<TimedFrame>) {
+fn decode(animation: &Animation, size: FrameSize, send: async_channel::Sender<TimedFrame>) {
     let (bytes, custom) = match &animation.source {
         AnimationSource::WebP(bytes) => (Cow::Borrowed(bytes.as_ref()), false),
         AnimationSource::Custom(store, id) => {
@@ -406,8 +456,15 @@ fn decode(animation: &Animation, size: Option<u32>, send: async_channel::Sender<
             (Cow::Owned(bytes), true)
         }
     };
+    // Built-in art already has small canvases. Bound custom frames before queuing them for AppKit.
+    // 内置素材的画布已经较小，只在帧进入 AppKit 队列前缩限自定义表情。
+    #[cfg(any(target_os = "macos", test))]
+    let size = match size {
+        FrameSize::FitWithin(_) if !custom => FrameSize::Original,
+        size => size,
+    };
     let send_frame = |mut frame: TimedFrame| {
-        frame.image = prepare(frame.image, size);
+        frame.image = size.prepare(frame.image);
         send.send_blocking(frame).is_ok()
     };
     let mut sent = false;
@@ -479,7 +536,7 @@ fn decode(animation: &Animation, size: Option<u32>, send: async_channel::Sender<
 
 async fn run(
     animation: Animation,
-    size: Option<u32>,
+    size: FrameSize,
     reduce_motion: bool,
     mut present: impl FnMut(FrameUpdate),
 ) {
@@ -549,6 +606,25 @@ mod tests {
         let emote = SenderTag::new("队友", 150, Wheel::Emote);
         assert_eq!(ping.offset, 55.0);
         assert_eq!(emote.offset, 83.0);
+    }
+
+    #[test]
+    fn custom_frames_fit_the_display_without_upscaling_or_padding() {
+        let color = image::Rgba([255, 128, 0, 255]);
+        let frame_size = FrameSize::FitWithin(300);
+        let large = frame_size.prepare(RgbaImage::from_pixel(2048, 1024, color));
+        assert_eq!(large.dimensions(), (300, 150));
+        assert_eq!(large.get_pixel(0, 0)[3], 255);
+
+        let small = frame_size.prepare(RgbaImage::from_pixel(80, 40, color));
+        assert_eq!(small.dimensions(), (80, 40));
+
+        let mut edge = RgbaImage::new(2, 1);
+        edge.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        let fitted = downsize(edge, 1);
+        let [red, _, _, alpha] = fitted.get_pixel(0, 0).0;
+        assert_eq!(red, 255);
+        assert!((1..255).contains(&alpha));
     }
 
     #[test]
@@ -640,7 +716,7 @@ mod tests {
                             Animation::webp(clip.animation, 110, Duration::from_millis(400));
                         let mut frames = 0;
                         let mut first = None;
-                        run(animation, None, false, |update| {
+                        run(animation, FrameSize::Original, false, |update| {
                             if matches!(update, FrameUpdate::Image(_)) {
                                 first.get_or_insert_with(|| requested.elapsed());
                                 frames += 1;
@@ -679,22 +755,27 @@ mod tests {
         let count = &mut frames;
         let opacity_values = &mut opacities;
         let start = Instant::now();
-        smol::block_on(run(animation, Some(16), false, move |update| {
-            let _keep_alive = &presenter;
-            match update {
-                FrameUpdate::Image(image) => {
-                    assert!(opacity_values.is_empty());
-                    assert_eq!(image.dimensions(), (16, 16));
-                    assert_eq!(image.get_pixel(8, 0)[3], 0);
-                    assert_eq!(image.get_pixel(8, 8)[3], 255);
-                    *count += 1;
+        smol::block_on(run(
+            animation,
+            FrameSize::Square(16),
+            false,
+            move |update| {
+                let _keep_alive = &presenter;
+                match update {
+                    FrameUpdate::Image(image) => {
+                        assert!(opacity_values.is_empty());
+                        assert_eq!(image.dimensions(), (16, 16));
+                        assert_eq!(image.get_pixel(8, 0)[3], 0);
+                        assert_eq!(image.get_pixel(8, 8)[3], 255);
+                        *count += 1;
+                    }
+                    FrameUpdate::Opacity(opacity) => {
+                        assert!(start.elapsed() >= timeout);
+                        opacity_values.push(opacity);
+                    }
                 }
-                FrameUpdate::Opacity(opacity) => {
-                    assert!(start.elapsed() >= timeout);
-                    opacity_values.push(opacity);
-                }
-            }
-        }));
+            },
+        ));
         std::fs::remove_dir_all(folder).unwrap();
         assert_eq!(frames, 1);
         assert!(opacities.first().unwrap() > &0.9);
@@ -714,7 +795,7 @@ mod tests {
             let animation = Animation::webp(clip.animation, 110, Duration::from_secs(8));
             smol::block_on(async {
                 let (send, receive) = async_channel::bounded(2);
-                let _worker = smol::unblock(move || decode(&animation, None, send));
+                let _worker = smol::unblock(move || decode(&animation, FrameSize::Original, send));
                 for _ in 0..2 {
                     let frames = WebPDecoder::new(Cursor::new(clip.animation))
                         .unwrap()
@@ -740,7 +821,7 @@ mod tests {
         let animation = Animation::webp(&b"broken"[..], 110, Duration::from_millis(100))
             .with_poster(PINGS[0].image);
         let mut frames = 0;
-        smol::block_on(run(animation, Some(110), false, |update| {
+        smol::block_on(run(animation, FrameSize::Square(110), false, |update| {
             let FrameUpdate::Image(image) = update else {
                 panic!("pings do not fade");
             };
@@ -779,7 +860,7 @@ mod tests {
         let animation = Animation::custom(store, emote.id(), 4, Duration::from_secs(1));
         smol::block_on(async {
             let (send, receive) = async_channel::bounded(2);
-            let worker = smol::unblock(move || decode(&animation, None, send));
+            let worker = smol::unblock(move || decode(&animation, FrameSize::Original, send));
             for image in [first.clone(), second, first] {
                 let frame = receive.recv().await.unwrap();
                 assert_eq!(frame.image, prepare(image, None));
@@ -818,13 +899,18 @@ mod tests {
         let start = Instant::now();
         let mut last_image = None;
         let mut opacities = Vec::new();
-        smol::block_on(run(animation, Some(4), false, |update| match update {
-            FrameUpdate::Image(image) => last_image = Some(image),
-            FrameUpdate::Opacity(opacity) => {
-                assert!(start.elapsed() >= timeout);
-                opacities.push(opacity);
-            }
-        }));
+        smol::block_on(run(
+            animation,
+            FrameSize::Square(4),
+            false,
+            |update| match update {
+                FrameUpdate::Image(image) => last_image = Some(image),
+                FrameUpdate::Opacity(opacity) => {
+                    assert!(start.elapsed() >= timeout);
+                    opacities.push(opacity);
+                }
+            },
+        ));
         std::fs::remove_dir_all(folder).unwrap();
         assert_eq!(last_image, Some(prepare(visible, None)));
         assert!(

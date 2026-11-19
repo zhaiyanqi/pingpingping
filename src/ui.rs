@@ -755,7 +755,8 @@ struct Conversation {
     room_key: String,
     filter: Filter,
     messages: ListState,
-    rows: Vec<(usize, Uuid)>,
+    rows: Rc<Vec<(usize, Uuid)>>,
+    history_revision: u64,
     error: Option<String>,
     emote_save: Option<(Uuid, EmoteSaveStatus)>,
     _subscriptions: Vec<Subscription>,
@@ -779,8 +780,11 @@ impl Conversation {
         messages.set_follow_mode(FollowMode::Tail);
         let room_key = model.read(cx).room_key().to_owned();
         let mut subscriptions = vec![cx.observe_in(&model, window, |this, model, window, cx| {
-            let room_key = model.read(cx).room_key();
-            if this.room_key != room_key {
+            let state = model.read(cx);
+            let room_key = state.room_key();
+            let room_changed = this.room_key != room_key;
+            let history_changed = this.history_revision != state.history_revision();
+            if room_changed {
                 this.room_key = room_key.to_owned();
                 this.error = None;
                 if let Some(input) = &this.input {
@@ -792,7 +796,9 @@ impl Conversation {
                     });
                 }
             }
-            this.refresh_messages(cx);
+            if history_changed || (room_changed && !this.all_rooms) {
+                this.refresh_messages(cx);
+            }
             cx.notify();
         })];
         if !history {
@@ -823,7 +829,8 @@ impl Conversation {
             room_key,
             filter: Filter::All,
             messages,
-            rows: Vec::new(),
+            rows: Rc::default(),
+            history_revision: 0,
             error: None,
             emote_save: None,
             _subscriptions: subscriptions,
@@ -836,6 +843,7 @@ impl Conversation {
     // 历史记录裁剪后，按消息 ID 保留仍存在的行及滚动位置。
     fn refresh_messages(&mut self, cx: &App) {
         let model = self.model.read(cx);
+        self.history_revision = model.history_revision();
         let rows: Vec<_> = model
             .archive()
             .enumerate()
@@ -845,6 +853,9 @@ impl Conversation {
             })
             .map(|(index, (_, message))| (index, message.id))
             .collect();
+        if rows == *self.rows {
+            return;
+        }
         let first = rows
             .first()
             .and_then(|(_, id)| self.rows.iter().position(|(_, previous)| previous == id));
@@ -853,11 +864,15 @@ impl Conversation {
             if remaining.len() <= rows.len()
                 && remaining.iter().zip(&rows).all(|(old, new)| old.1 == new.1)
             {
-                self.messages.splice(0..first, 0);
-                self.messages.splice(
-                    remaining.len()..remaining.len(),
-                    rows.len() - remaining.len(),
-                );
+                if first > 0 {
+                    self.messages.splice(0..first, 0);
+                }
+                if remaining.len() < rows.len() {
+                    self.messages.splice(
+                        remaining.len()..remaining.len(),
+                        rows.len() - remaining.len(),
+                    );
+                }
             } else {
                 self.messages.reset(rows.len());
                 self.messages.set_follow_mode(FollowMode::Tail);
@@ -866,7 +881,7 @@ impl Conversation {
             self.messages.reset(rows.len());
             self.messages.set_follow_mode(FollowMode::Tail);
         }
-        self.rows = rows;
+        self.rows = Rc::new(rows);
     }
 
     fn text_draft(&self, cx: &App) -> Option<(Body, TextEffect)> {
@@ -3134,6 +3149,7 @@ impl Render for Settings {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::rc::Rc;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -3150,11 +3166,11 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        ANIMATION_TIMEOUT, Desktop, Settings, SettingsCategory, WheelSlot, open_chat,
+        ANIMATION_TIMEOUT, Conversation, Desktop, Settings, SettingsCategory, WheelSlot, open_chat,
         open_settings, register_window_actions, setting_slider, shortcut,
     };
     use crate::emotes::EmoteId;
-    use crate::model::{Model, WheelEmote};
+    use crate::model::{Body, Model, TextEffect, WheelEmote};
 
     fn settings_desktop(cx: &mut TestAppContext) -> (AnyWindowHandle, AnyWindowHandle, PathBuf) {
         // The production emote library and wheel previews finish on smol workers.
@@ -3187,6 +3203,50 @@ mod tests {
                 .unwrap();
             (chat, settings, data)
         })
+    }
+
+    #[gpui_kit::test]
+    fn chat_reuses_rows_until_bounded_history_changes(cx: &mut TestAppContext) {
+        let (chat, _, _) = settings_desktop(cx);
+        let model = cx.update(|cx| cx.global::<Desktop>().model.clone());
+        let send = |model: &mut Model| {
+            model
+                .send(Body::Text("你好".into()), TextEffect::Default, None)
+                .unwrap();
+        };
+        model.update(cx, |model, cx| {
+            model.finish_writes().unwrap().join().unwrap();
+            for _ in 0..650 {
+                send(model);
+            }
+            cx.notify();
+        });
+        let rows = |cx: &mut TestAppContext| {
+            cx.update_window(chat, |_, window, cx| {
+                let chat = Root::read(window, cx)
+                    .view()
+                    .clone()
+                    .downcast::<Conversation>()
+                    .unwrap();
+                chat.read(cx).rows.clone()
+            })
+            .unwrap()
+        };
+        let before = rows(cx);
+        model.update(cx, |model, cx| {
+            model.set_incoming_muted(true).unwrap();
+            cx.notify();
+        });
+        assert!(Rc::ptr_eq(&before, &rows(cx)));
+
+        model.update(cx, |model, cx| {
+            send(model);
+            cx.notify();
+        });
+        let after = rows(cx);
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after[0].1, before[1].1);
+        assert_ne!(after.last().unwrap().1, before.last().unwrap().1);
     }
 
     fn start_shortcut_recording(

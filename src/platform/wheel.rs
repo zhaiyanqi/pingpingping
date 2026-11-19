@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path as FilePath, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use gpui_kit::{App, Asset, RenderImage, Task, Window};
@@ -552,10 +552,41 @@ struct WheelArt {
     background: Pixmap,
     foreground: [Pixmap; 2],
     wedges: [Path; 8],
+}
+
+struct WheelAssets {
+    hub_icons: [Pixmap; 2],
     ping_icons: [(Pixmap, Pixmap); 8],
     emote_icons: [Pixmap; EMOTES.len()],
-    font: Option<Vec<u8>>,
+    font: Option<ttf_parser::Face<'static>>,
 }
+
+static WHEEL_FONT: LazyLock<Option<Vec<u8>>> = LazyLock::new(|| {
+    if cfg!(target_os = "windows") {
+        std::env::var_os("WINDIR")
+            .map(PathBuf::from)
+            .and_then(|directory| std::fs::read(directory.join("Fonts/seguisb.ttf")).ok())
+    } else {
+        std::fs::read("/System/Library/Fonts/HelveticaNeue.ttc").ok()
+    }
+});
+
+// Native and preview wheels share source-resolution assets across display scales.
+// 原生轮盘和设置页预览在不同缩放倍率下共用原始尺寸素材。
+static WHEEL_ASSETS: LazyLock<WheelAssets> = LazyLock::new(|| WheelAssets {
+    hub_icons: [
+        asset(PINGS[8].image, false, false),
+        asset(EMOTES[EMOTE_HUB].image, true, false),
+    ],
+    ping_icons: std::array::from_fn(|index| {
+        let bytes = PINGS[index].image;
+        (asset(bytes, false, true), asset(bytes, false, false))
+    }),
+    emote_icons: EMOTES.map(|clip| asset(clip.image, true, false)),
+    font: WHEEL_FONT
+        .as_deref()
+        .and_then(|font| ttf_parser::Face::parse(font, 0).ok()),
+});
 
 fn square(size: u32) -> Pixmap {
     Pixmap::new(size, size).expect("valid wheel dimensions")
@@ -700,6 +731,9 @@ pub(crate) fn load_wheel_posters(
     store: &EmoteStore,
     pages: &[EmotePage],
 ) -> HashMap<EmoteId, Pixmap> {
+    // The caller already loads posters on a worker, so warm the shared art there too.
+    // 调用方已在后台加载预览图，同时在此预热共用的轮盘素材。
+    LazyLock::force(&WHEEL_ASSETS);
     let ids: HashSet<_> = pages
         .iter()
         .flatten()
@@ -829,16 +863,7 @@ impl WheelArt {
             ),
             transform,
         );
-        let font = if cfg!(target_os = "windows") {
-            std::env::var_os("WINDIR")
-                .map(std::path::PathBuf::from)
-                .and_then(|directory| std::fs::read(directory.join("Fonts/seguisb.ttf")).ok())
-        } else {
-            std::fs::read("/System/Library/Fonts/HelveticaNeue.ttc").ok()
-        };
-        let face = font
-            .as_deref()
-            .and_then(|font| ttf_parser::Face::parse(font, 0).ok());
+        let assets = &*WHEEL_ASSETS;
         let foreground = std::array::from_fn(|kind| {
             let mut image = square(size);
             for index in 0..8 {
@@ -887,20 +912,15 @@ impl WheelArt {
                 1.0,
                 transform,
             );
-            let hub = if kind == 0 {
-                PINGS[8].image
-            } else {
-                EMOTES[EMOTE_HUB].image
-            };
             sprite(
                 &mut image,
-                &asset(hub, kind == 1, false),
+                &assets.hub_icons[kind],
                 Point::from_xy(CENTER, CENTER - 38.0),
                 40.0,
                 dpi,
                 1.0,
             );
-            if let Some(face) = &face {
+            if let Some(face) = &assets.font {
                 text(
                     &mut image,
                     face,
@@ -942,18 +962,11 @@ impl WheelArt {
             image
         });
         let wedges = std::array::from_fn(|index| sector(INNER, wedge_extent(index), index));
-        let ping_icons = std::array::from_fn(|index| {
-            let bytes = PINGS[index].image;
-            (asset(bytes, false, true), asset(bytes, false, false))
-        });
         Self {
             size,
             background,
             foreground,
             wedges,
-            ping_icons,
-            emote_icons: EMOTES.map(|clip| asset(clip.image, true, false)),
-            font,
         }
     }
 
@@ -995,12 +1008,10 @@ impl WheelArt {
             Transform::identity(),
             None,
         );
-        let face = self
-            .font
-            .as_deref()
-            .and_then(|font| ttf_parser::Face::parse(font, 0).ok());
+        let assets = &*WHEEL_ASSETS;
+        let face = assets.font.as_ref();
         if wheel.page_count > 1
-            && let Some(face) = &face
+            && let Some(face) = face
         {
             text(
                 target,
@@ -1017,19 +1028,19 @@ impl WheelArt {
             let center = icon_center(index);
             let edge = 48.0 * (1.0 + 0.18 * active);
             if wheel.kind == Wheel::Ping {
-                let (normal, hot) = &self.ping_icons[index];
+                let (normal, hot) = &assets.ping_icons[index];
                 if active < 1.0 {
                     sprite(target, normal, center, edge, dpi, 1.0);
                 }
                 sprite(target, hot, center, edge, dpi, active);
             } else if let Some(emote) = wheel.slots[index] {
                 let icon = match emote {
-                    WheelEmote::BuiltIn(id) => self.emote_icons.get(id),
+                    WheelEmote::BuiltIn(id) => assets.emote_icons.get(id),
                     WheelEmote::Custom(id) => poster(index, id),
                 };
                 if let Some(icon) = icon {
                     sprite(target, icon, center, edge, dpi, 1.0);
-                } else if let Some(face) = &face {
+                } else if let Some(face) = face {
                     text(
                         target,
                         face,

@@ -3,10 +3,10 @@
 
 use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write as _};
+use std::io::{self, BufWriter, Write as _};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, ensure};
@@ -372,7 +372,7 @@ impl Default for Profile {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct Entry {
     room_key: String,
     message: Message,
@@ -385,8 +385,9 @@ pub(crate) struct Model {
     data_dir: PathBuf,
     room: Option<Room>,
     room_key: String,
-    history: VecDeque<Entry>,
-    disk: Option<mpsc::Sender<Entry>>,
+    history: VecDeque<Arc<Entry>>,
+    history_revision: u64,
+    disk: Option<mpsc::Sender<Arc<Entry>>>,
     disk_thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -410,10 +411,11 @@ fn save_json(path: &Path, data: &impl Serialize) -> Result<()> {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
         }
-        let mut file = options.open(&temporary)?;
+        let mut file = BufWriter::new(options.open(&temporary)?);
         serde_json::to_writer(&mut file, data)?;
         file.flush()?;
-        file.sync_all()?;
+        file.get_ref().sync_all()?;
+        drop(file);
         fs::rename(&temporary, path)?;
         Ok(())
     })();
@@ -423,7 +425,7 @@ fn save_json(path: &Path, data: &impl Serialize) -> Result<()> {
     result
 }
 
-fn append(history: &mut VecDeque<Entry>, entry: Entry) {
+fn append(history: &mut VecDeque<Arc<Entry>>, entry: Arc<Entry>) {
     while history.len() >= HISTORY_LIMIT {
         history.pop_front();
     }
@@ -444,7 +446,7 @@ impl Model {
             }
         };
         profile.normalize();
-        let mut history: VecDeque<Entry> = load_json(&history_path)
+        let mut history: VecDeque<Arc<Entry>> = load_json(&history_path)
             .context("无法读取历史记录")?
             .unwrap_or_default();
         history.retain(|entry| entry.message.valid_body());
@@ -452,8 +454,8 @@ impl Model {
             history.pop_front();
         }
         let mut snapshot = history.clone();
-        // Batch pending history writes on a worker to keep disk I/O out of gesture handling.
-        // 由后台线程批量写入历史，避免磁盘 I/O 阻塞手势处理。
+        // Share immutable entries with the disk worker, which batches pending writes.
+        // 与磁盘线程共享不可变的历史条目，由后台线程批量写入。
         let (disk, writes) = mpsc::channel();
         let disk_thread = std::thread::Builder::new()
             .name("history-storage".into())
@@ -476,6 +478,7 @@ impl Model {
             input_ready: false,
             profile,
             history,
+            history_revision: 0,
             disk: Some(disk),
             disk_thread: Some(disk_thread),
         })
@@ -519,6 +522,10 @@ impl Model {
         self.history
             .iter()
             .map(|entry| (entry.room_key.as_str(), &entry.message))
+    }
+
+    pub(crate) fn history_revision(&self) -> u64 {
+        self.history_revision
     }
 
     pub(crate) fn entry(&self, index: usize) -> Option<(&str, &Message)> {
@@ -630,14 +637,15 @@ impl Model {
     }
 
     fn record(&mut self, message: Message) {
-        let entry = Entry {
+        let entry = Arc::new(Entry {
             room_key: self.room_key.clone(),
             message,
-        };
+        });
         if let Some(disk) = &self.disk {
             let _ = disk.send(entry.clone());
         }
         append(&mut self.history, entry);
+        self.history_revision += 1;
     }
 }
 

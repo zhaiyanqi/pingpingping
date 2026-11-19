@@ -29,9 +29,9 @@ use windows_sys::Win32::{
 };
 
 use super::playback::{
-    FrameUpdate, SenderTag, TAG_BACKGROUND, TAG_FONT_SIZE, TAG_FOREGROUND, TAG_HEIGHT, TAG_PADDING,
-    TAG_RADIUS, TAG_WIDTH, TEXT_FONT_SIZE, TEXT_MARGIN, TEXT_MAX_LINES, TEXT_PADDING, TEXT_RADIUS,
-    TEXT_WIDTH, TextColors, TextFrame, text_anchor,
+    FrameSize, FrameUpdate, SenderTag, TAG_BACKGROUND, TAG_FONT_SIZE, TAG_FOREGROUND, TAG_HEIGHT,
+    TAG_PADDING, TAG_RADIUS, TAG_WIDTH, TEXT_FONT_SIZE, TEXT_MARGIN, TEXT_MAX_LINES, TEXT_PADDING,
+    TEXT_RADIUS, TEXT_WIDTH, TextColors, TextFrame, text_anchor,
 };
 use super::{
     AnimationOverlay, AnimationPosition, AudioCue, WheelContents, start_audio, wheel::WheelView,
@@ -1063,7 +1063,7 @@ pub(super) fn animation_presenter(
     size: u32,
     tag: SenderTag<'_>,
     position: AnimationPosition,
-) -> Option<(Option<u32>, impl FnMut(FrameUpdate) + use<>)> {
+) -> Option<(FrameSize, impl FnMut(FrameUpdate) + use<>)> {
     let (center, dpi) = match position {
         AnimationPosition::Local(local) => {
             let point = point(local);
@@ -1098,7 +1098,7 @@ pub(super) fn animation_presenter(
         (layer, point)
     });
     let mut layer = None;
-    Some((Some(size), move |update| {
+    Some((FrameSize::Square(size), move |update| {
         let first_frame = layer.is_none();
         let layer = layer.get_or_insert_with(|| Layer::new(false));
         match update {
