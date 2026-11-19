@@ -28,6 +28,27 @@ rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
 
 素材和程序图标已嵌入 exe。程序、通知区域、任务栏和窗口使用「敌人消失」信号的金色问号图案。若脚本找不到 `fxc.exe`，在 Visual Studio Installer 中检查 SDK 是否已安装，或把环境变量 `GPUI_FXC_PATH` 设为该文件的完整路径。
 
+### Windows 打包
+
+在项目根目录的 PowerShell 中运行以下命令。生成安装包需要 Inno Setup 6.3 或更新版本。脚本会从 PATH 和常见安装目录查找 `ISCC.exe`，也可以通过 `-IsccPath` 指定完整路径。 [Inno Setup 下载](https://jrsoftware.org/isdl.php)
+
+```powershell
+# 同时生成 Setup 和便携 ZIP，默认开启体积优化
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\script\package-windows.ps1
+
+# 只生成便携 ZIP，无需安装 Inno Setup
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\script\package-windows.ps1 -Package Portable
+
+# 只生成 Setup，使用普通 Release
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\script\package-windows.ps1 -Package Setup -StandardRelease
+```
+
+产物位于 `dist/windows/`，文件名包含 `Cargo.toml` 中的版本号。使用 `-StandardRelease` 时，文件名会多一个 `-release`，方便同时保留两种构建的包。
+
+安装包 `*-setup.exe` 无需管理员权限，为当前用户安装并添加开始菜单入口和卸载项。便携包 `*-portable.zip` 解压后双击 `Launch-PingPingPing.bat`，设置、历史和自定义表情会保存在同目录的 `data` 文件夹中。
+
+若只需编译体积优化版 exe，运行 `.\script\build-windows-release.bat --size --no-pause`，产物位于 `target/x86_64-pc-windows-msvc/release-small/`。该配置优先优化体积，使用 Thin LTO 并剥离符号。安装包使用 LZMA2 压缩，便携包使用 Windows 可直接解压的 ZIP。打包完成后会显示各产物的大小。
+
 ## macOS 编译
 
 安装稳定版 Rust 和 Xcode Command Line Tools。在项目根目录运行：

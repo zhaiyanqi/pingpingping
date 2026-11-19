@@ -28,6 +28,27 @@ Double-click the [Release script](script/build-windows-release.bat) or the [Debu
 
 The executable, notification area, taskbar, and windows use the gold question mark from the Enemy Missing ping. The executable embeds its icon and media. If `fxc.exe` is missing, check the SDK installation or set `GPUI_FXC_PATH` to the compiler's absolute path.
 
+### Package for Windows
+
+Run these commands from the repository root in PowerShell. Building Setup requires Inno Setup 6.3 or later. The script looks for `ISCC.exe` on PATH and in common installation directories. Use `-IsccPath` to supply the full path if needed. [Download Inno Setup](https://jrsoftware.org/isdl.php)
+
+```powershell
+# Build Setup and the portable ZIP with size optimization
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\script\package-windows.ps1
+
+# Build only the portable ZIP, which requires no Inno Setup installation
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\script\package-windows.ps1 -Package Portable
+
+# Build only Setup with the standard Release profile
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\script\package-windows.ps1 -Package Setup -StandardRelease
+```
+
+Packages appear under `dist/windows/` with the version from `Cargo.toml` in their names. With `-StandardRelease`, the filenames include `-release` so you can keep both builds.
+
+The `*-setup.exe` installer adds Start menu and uninstall entries for the current user without requiring admin rights. To use the `*-portable.zip` package, extract it and double-click `Launch-PingPingPing.bat`. Settings, history, and custom emotes go in the `data` folder next to the launcher.
+
+To build only the size-optimized executable, run `.\script\build-windows-release.bat --size --no-pause`. The executable goes into `target/x86_64-pc-windows-msvc/release-small/`. The profile optimizes for size, enables Thin LTO, and strips symbols. Setup uses LZMA2 compression, and Windows can extract the portable ZIP directly. The packaging script prints the size of each finished package.
+
 ## Build on macOS
 
 Install stable Rust and Xcode Command Line Tools, then run:

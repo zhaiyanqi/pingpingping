@@ -5,10 +5,16 @@ rem ZH: 从任意工作目录构建 x64 MSVC 可执行文件。
 
 set "BUILD_PROFILE=release"
 set "CARGO_PROFILE=--release"
+rem Preserve the script path when consuming a profile flag.
+rem 处理构建选项时保留脚本自身的路径。
 if /i "%~1"=="--debug" (
     set "BUILD_PROFILE=debug"
     set "CARGO_PROFILE="
-    shift
+    shift /1
+) else if /i "%~1"=="--size" (
+    set "BUILD_PROFILE=release-small"
+    set "CARGO_PROFILE=--profile release-small"
+    shift /1
 )
 
 set "EXIT_CODE=1"
@@ -75,7 +81,9 @@ if not defined GPUI_FXC_PATH (
 )
 
 :build
-rustup run "%RUST_TOOLCHAIN%" cargo build %CARGO_PROFILE% --locked --target "%RUST_TARGET%" --target-dir target
+rem Link the C runtime into the executable for clean Windows installations.
+rem 将 C 运行库静态链接到 exe，方便在未装开发工具的 Windows 上运行。
+rustup run "%RUST_TOOLCHAIN%" cargo build %CARGO_PROFILE% --locked --target "%RUST_TARGET%" --target-dir target --config "target.%RUST_TARGET%.rustflags=['-C','target-feature=+crt-static']"
 set "EXIT_CODE=%ERRORLEVEL%"
 if not "%EXIT_CODE%"=="0" goto finish
 echo.
@@ -87,7 +95,7 @@ echo Install the Visual Studio Build Tools workload "Desktop development with C+
 goto finish
 
 :usage
-echo Usage: %~nx0 [--debug] [--no-pause]
+echo Usage: %~nx0 [--debug ^| --size] [--no-pause]
 set "PAUSE_AT_END="
 set "EXIT_CODE=2"
 
