@@ -4,6 +4,8 @@
 
 PingPingPing is a Rust desktop app for pings, emotes, and LAN chat on Windows and macOS. It uses GPUI Kit for settings, chat, and history, with Win32 or AppKit rendering for desktop overlays.
 
+PingPingPing starts in the background. Click its icon in the Windows notification area or macOS menu bar to open chat, history, or settings. Closing a window hides it without losing your draft or disconnecting from the room. Select **退出** (Quit) in the tray menu to exit.
+
 ## Build on Windows
 
 On Windows 11 x64, install [Rustup](https://rustup.rs/) and the **Desktop development with C++** workload in [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/). Include the MSVC x64 tools and a Windows 10 or 11 SDK. If the Rust MSVC toolchain is missing, install it with:

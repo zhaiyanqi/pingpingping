@@ -14,6 +14,7 @@ mod gesture;
 mod model;
 mod platform;
 mod room;
+mod tray;
 mod ui;
 
 fn main() {

@@ -28,6 +28,7 @@ gpui_kit::actions!([OpenChat, OpenHistory, OpenSettings, Quit]);
 // The GPUI thread owns window and overlay state. Workers send typed events.
 // GPUI 线程管理窗口与悬浮层状态，后台任务通过带类型的事件与其通信。
 struct Desktop {
+    tray: Option<tray_icon::TrayIcon>,
     model: Entity<Model>,
     incoming: Sender<RoomEvent>,
     gestures: Sender<GestureEvent>,
@@ -68,6 +69,7 @@ pub(crate) fn start(cx: &mut App) {
     model.input_ready = monitor.is_some();
     let model = cx.new(|_| model);
     let desktop = Desktop {
+        tray: None,
         model,
         incoming,
         gestures,
@@ -148,7 +150,30 @@ pub(crate) fn start(cx: &mut App) {
             MenuItem::action("退出", Quit),
         ],
     }]);
-    open_chat(cx);
+    let (sender, commands) = async_channel::unbounded();
+    match crate::tray::install(sender) {
+        Ok(tray) => {
+            cx.global_mut::<Desktop>().tray = Some(tray);
+            #[cfg(target_os = "macos")]
+            cx.set_activation_policy(ActivationPolicy::Accessory);
+            cx.set_quit_mode(QuitMode::Explicit);
+            cx.spawn(async move |cx| {
+                while let Ok(command) = commands.recv().await {
+                    cx.update(|cx| match command {
+                        crate::tray::Command::Chat => open_chat(cx),
+                        crate::tray::Command::History => open_history(cx),
+                        crate::tray::Command::Settings => open_settings(cx),
+                        crate::tray::Command::Quit => cx.quit(),
+                    });
+                }
+            })
+            .detach();
+        }
+        Err(error) => {
+            eprintln!("托盘不可用：{error:#}");
+            open_chat(cx);
+        }
+    }
 }
 
 fn shortcut(key: &str) -> String {
@@ -256,10 +281,16 @@ fn options(title: &str, width: f32, height: f32, cx: &App) -> WindowOptions {
     }
 }
 
+fn close_to_tray(window: &Window, cx: &App) {
+    if cx.global::<Desktop>().tray.is_some() {
+        window.on_window_should_close(cx, |window, _| !crate::tray::hide_window(window));
+    }
+}
+
 fn focus_window(handle: Option<AnyWindowHandle>, cx: &mut App) -> bool {
     if handle.is_some_and(|handle| {
         handle
-            .update(cx, |_, window, _| window.activate_window())
+            .update(cx, |_, window, _| crate::tray::restore_window(window))
             .is_ok()
     }) {
         cx.activate(true);
@@ -333,6 +364,7 @@ struct Conversation {
 
 impl Conversation {
     fn new(history: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        close_to_tray(window, cx);
         let input =
             (!history).then(|| cx.new(|cx| InputState::new(window, cx).placeholder("输入消息")));
         let model = cx.global::<Desktop>().model.clone();
@@ -807,6 +839,7 @@ struct Settings {
 
 impl Settings {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        close_to_tray(window, cx);
         let model = cx.global::<Desktop>().model.clone();
         let Profile {
             name,

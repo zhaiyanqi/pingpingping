@@ -8,6 +8,8 @@ anyhow = "1"
 async-channel = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 gpui-kit = "=0.7.1"
+raw-window-handle = "0.6"
+tray-icon = { version = "0.21.3", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png", "webp"] }
 rodio = { version = "0.22", default-features = false, features = ["playback", "wav"] }
 serde = { version = "1", features = ["derive"] }

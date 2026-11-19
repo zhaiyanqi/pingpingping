@@ -4,6 +4,8 @@
 
 PingPingPing 是用 Rust 编写的 Windows 和 macOS 桌面信号、表情轮盘与局域网聊天工具。设置、聊天和历史记录使用 GPUI Kit。轮盘、信号和表情由 Win32 或 AppKit 原生绘制。
 
+启动后默认在后台运行。点击 Windows 通知区域或 macOS 菜单栏中的 PingPingPing 图标，可打开聊天、历史记录或设置。关闭窗口只会将其隐藏，草稿和房间连接都会保留；要结束程序，请在托盘菜单中选择「退出」。
+
 ## Windows 编译
 
 适用环境为 Windows 11 x64。安装 [Rustup](https://rustup.rs/) 和 [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/) 中的 **使用 C++ 的桌面开发**工作负载，包含 MSVC x64 工具和 Windows 10/11 SDK。如果初次安装时选择了其他 Rust 工具链，请运行：
