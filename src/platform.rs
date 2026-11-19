@@ -11,7 +11,9 @@ use rodio::{Decoder, DeviceSinkBuilder, Player};
 use crate::assets::{EMOTES, PINGS, WHEEL_TICK};
 use crate::emotes::{EmoteId, EmoteStore};
 use crate::gesture::{Position, Wheel};
-use crate::model::{Body, EmotePage, OverlaySettings, TextEffect, TextOverlaySettings, WheelEmote};
+use crate::model::{
+    Body, EmotePage, Location, OverlaySettings, TextEffect, TextOverlaySettings, WheelEmote,
+};
 
 mod playback;
 use playback::SenderTag;
@@ -22,6 +24,11 @@ pub(crate) use wheel::{WheelFrame, WheelPreview, editor_sector, load_wheel_poste
 pub(crate) enum WheelContents {
     Ping,
     Emote(Vec<EmotePage>),
+}
+
+pub(crate) enum AnimationPosition {
+    Local(Position),
+    Relative(Location),
 }
 
 impl WheelContents {
@@ -88,7 +95,7 @@ impl Overlay {
         &mut self,
         body: &Body,
         name: &str,
-        local: Option<Position>,
+        position: AnimationPosition,
         store: &EmoteStore,
         settings: OverlaySettings,
         cx: &gpui_kit::App,
@@ -101,7 +108,7 @@ impl Overlay {
                 let timeout = Duration::from_millis(u64::from(settings.emote_timeout_ms));
                 let animation = Animation::custom(store.clone(), id, size, timeout);
                 let tag = SenderTag::new(name, size, Wheel::Emote);
-                self.animations.play(animation, tag, local, None, cx);
+                self.animations.play(animation, tag, position, cx);
                 return;
             }
             Body::Text(_) => return,
@@ -127,8 +134,7 @@ impl Overlay {
             Wheel::Emote => animation.with_fade_out(),
         };
         let tag = SenderTag::new(name, size, kind);
-        self.animations
-            .play(animation, tag, local, body.location(), cx);
+        self.animations.play(animation, tag, position, cx);
         if let Some(volume) = settings
             .volume()
             .filter(|_| kind != Wheel::Emote || settings.emote_sound)

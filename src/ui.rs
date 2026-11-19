@@ -29,13 +29,15 @@ use gpui_kit::*;
 
 use crate::assets::{EMOTES, PINGS};
 use crate::emotes::{EmoteId, EmoteStore, LibraryEmote};
-use crate::gesture::{GestureEvent, Position, TriggerKey, Triggers, Wheel};
+use crate::gesture::{GestureEvent, TriggerKey, Triggers, Wheel};
 use crate::model::{
-    ANIMATION_TIMEOUT, Body, EMOTE_SIZE, EmotePage, Message, Model, OverlaySettings, PING_SIZE,
-    Profile, SOUND_VOLUME, TextEffect, TextMotion, TextOverlaySettings, TextPosition, WheelEmote,
-    append_wheel_emote, wheel_has_emote,
+    ANIMATION_TIMEOUT, Body, EMOTE_SIZE, EmotePage, Location, Message, Model, OverlaySettings,
+    PING_SIZE, Profile, SOUND_VOLUME, TextEffect, TextMotion, TextOverlaySettings, TextPosition,
+    WheelEmote, append_wheel_emote, wheel_has_emote,
 };
-use crate::platform::{self, InputMonitor, Overlay, WheelContents, WheelFrame, WheelPreview};
+use crate::platform::{
+    self, AnimationPosition, InputMonitor, Overlay, WheelContents, WheelFrame, WheelPreview,
+};
 use crate::room::{DEFAULT_PORT, Room, RoomConfig, RoomEvent};
 
 gpui_kit::actions!([OpenChat, OpenHistory, OpenSettings, Quit]);
@@ -130,7 +132,13 @@ pub(crate) fn start(cx: &mut App) {
                                 false
                             }
                         }) {
-                            play(&message.body, message.text_effect, Some(&message.name), cx);
+                            play(
+                                &message.body,
+                                message.text_effect,
+                                Some(&message.name),
+                                message.location(),
+                                cx,
+                            );
                         }
                     }
                     RoomEvent::Members(id, members) => model.update(cx, |model, cx| {
@@ -268,9 +276,16 @@ impl Render for StartupError {
     }
 }
 
-fn play(body: &Body, text_effect: TextEffect, sender: Option<&str>, cx: &mut App) {
+fn play(
+    body: &Body,
+    text_effect: TextEffect,
+    sender: Option<&str>,
+    location: Option<Location>,
+    cx: &mut App,
+) {
     cx.update_global::<Desktop, _>(|desktop, cx| {
-        desktop.play(body, text_effect, sender, None, cx);
+        let position = AnimationPosition::Relative(location.unwrap_or(Location::CENTER));
+        desktop.play(body, text_effect, sender, position, cx);
     });
 }
 
@@ -280,7 +295,7 @@ impl Desktop {
         body: &Body,
         text_effect: TextEffect,
         sender: Option<&str>,
-        local: Option<Position>,
+        position: AnimationPosition,
         cx: &App,
     ) {
         let model = self.model.read(cx);
@@ -290,7 +305,7 @@ impl Desktop {
             _ => self.overlay.play(
                 body,
                 sender.unwrap_or(&model.profile.name),
-                local,
+                position,
                 &model.emotes(),
                 settings,
                 cx,
@@ -358,14 +373,16 @@ fn handle_gesture(event: GestureEvent, cx: &mut App) {
             // Resolve the slot against the page shown by this gesture before closing it.
             // 关闭轮盘前，按本次手势显示的当前页解析槽位。
             let message = choice.filter(|_| enabled).and_then(|(kind, slot, origin)| {
-                let location = Some(platform::normalized(origin));
                 let body = match kind {
                     Wheel::Ping => Body::Ping {
                         index: slot,
-                        location,
+                        location: None,
                     },
                     Wheel::Emote => match desktop.overlay.wheel_emote(slot)? {
-                        WheelEmote::BuiltIn(index) => Body::Emote { index, location },
+                        WheelEmote::BuiltIn(index) => Body::Emote {
+                            index,
+                            location: None,
+                        },
                         WheelEmote::Custom(id) => Body::CustomEmote(id),
                     },
                 };
@@ -373,9 +390,16 @@ fn handle_gesture(event: GestureEvent, cx: &mut App) {
             });
             desktop.overlay.close(cx);
             if let Some((body, origin)) = message {
-                desktop.play(&body, TextEffect::Default, None, Some(origin), cx);
+                let location = platform::normalized(origin);
+                desktop.play(
+                    &body,
+                    TextEffect::Default,
+                    None,
+                    AnimationPosition::Local(origin),
+                    cx,
+                );
                 desktop.model.update(cx, |model, cx| {
-                    match model.send(body, TextEffect::Default) {
+                    match model.send(body, TextEffect::Default, Some(location)) {
                         Ok(()) => cx.notify(),
                         Err(error) => eprintln!("无法记录或发送手势：{error:#}"),
                     }
@@ -775,7 +799,7 @@ impl Conversation {
 
     fn send(&mut self, body: Body, text_effect: TextEffect, cx: &mut Context<Self>) -> bool {
         let result = self.model.update(cx, |model, cx| {
-            let result = model.send(body.clone(), text_effect);
+            let result = model.send(body.clone(), text_effect, None);
             if result.is_ok() {
                 cx.notify();
             }
@@ -785,7 +809,7 @@ impl Conversation {
         self.error = result.err().map(|error| format!("{error:#}"));
         if sent {
             self.messages.set_follow_mode(FollowMode::Tail);
-            play(&body, text_effect, None, cx);
+            play(&body, text_effect, None, None, cx);
         }
         cx.notify();
         sent
@@ -1038,7 +1062,13 @@ fn bubble(message: &Message, mine: bool, action: Option<Div>, cx: &App) -> impl 
                         .with_fallback(|| div().text_xs().child("图片不可用").into_any_element()),
                 )
                 .on_click(move |_, _, cx| {
-                    play(&Body::CustomEmote(id), TextEffect::Default, Some(&name), cx)
+                    play(
+                        &Body::CustomEmote(id),
+                        TextEffect::Default,
+                        Some(&name),
+                        None,
+                        cx,
+                    )
                 })
                 .into_any_element()
         }
@@ -1351,7 +1381,7 @@ impl Render for Conversation {
                                     .disabled(empty)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         if let Some((body, effect)) = this.text_draft(cx) {
-                                            play(&body, effect, None, cx);
+                                            play(&body, effect, None, None, cx);
                                         }
                                     })),
                             )
@@ -2267,7 +2297,7 @@ impl Settings {
             desktop.overlay.play(
                 &body,
                 &model.profile.name,
-                None,
+                AnimationPosition::Relative(Location::CENTER),
                 &model.emotes(),
                 settings,
                 cx,

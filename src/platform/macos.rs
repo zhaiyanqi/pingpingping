@@ -11,9 +11,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use super::playback::{
     FrameUpdate, SenderTag, TAG_BACKGROUND, TAG_FONT_SIZE, TAG_FOREGROUND, TAG_HEIGHT, TAG_PADDING,
     TAG_RADIUS, TAG_WIDTH, TEXT_FONT_SIZE, TEXT_MARGIN, TEXT_MAX_LINES, TEXT_PADDING, TEXT_RADIUS,
-    TEXT_WIDTH, TextColors, TextFrame, animation_top, centered_overlay, text_anchor,
+    TEXT_WIDTH, TextColors, TextFrame, text_anchor,
 };
-use super::{AnimationOverlay, AudioCue, WheelContents, start_audio, wheel::WheelView};
+use super::{
+    AnimationOverlay, AnimationPosition, AudioCue, WheelContents, start_audio, wheel::WheelView,
+};
 use async_channel::Sender;
 use core_foundation::base::TCFType;
 use core_foundation::mach_port::{CFMachPort, CFMachPortInvalidate, CFMachPortRef};
@@ -32,8 +34,8 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApplication, NSBackingStoreType, NSColor, NSFloatingWindowLevel, NSFont,
-    NSFontWeightSemibold, NSLineBreakMode, NSPanel, NSScreen, NSTextField, NSWindow,
-    NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
+    NSFontWeightSemibold, NSLineBreakMode, NSPanel, NSScreen, NSStatusWindowLevel, NSTextField,
+    NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_core_graphics::CGImage;
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
@@ -44,6 +46,10 @@ use crate::gesture::{
     Triggers, WHEEL_SIZE, WheelInput,
 };
 use crate::model::{Location, TextPosition};
+
+// Keep animations above menu bar items and the Dock while leaving pop-up menus above them.
+// 动画显示在菜单栏项目和程序坞上方，弹出菜单仍在更上层。
+const ANIMATION_WINDOW_LEVEL: isize = NSStatusWindowLevel + 1;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -342,7 +348,7 @@ fn screen_for(position: Position, mtm: MainThreadMarker) -> Option<(NSPoint, NSR
 pub(crate) fn normalized(position: Position) -> Location {
     let mtm = MainThreadMarker::new().expect("GUI must use the main thread");
     let Some((point, screen)) = screen_for(position, mtm) else {
-        return Location { x: 0.5, y: 0.5 };
+        return Location::CENTER;
     };
     Location {
         x: ((point.x - screen.origin.x) / screen.size.width).clamp(0.0, 1.0),
@@ -552,45 +558,37 @@ impl Drop for Overlay {
 pub(super) fn animation_presenter(
     size: u32,
     tag: SenderTag<'_>,
-    local: Option<Position>,
-    location: Option<Location>,
+    position: AnimationPosition,
 ) -> Option<(Option<u32>, impl FnMut(FrameUpdate) + use<>)> {
     let mtm = MainThreadMarker::new()?;
-    let (point, screen) = local.and_then(|point| screen_for(point, mtm)).or_else(|| {
-        let screen = NSScreen::screens(mtm).firstObject()?.frame();
-        let location = location.unwrap_or(Location { x: 0.5, y: 0.5 });
-        Some((
+    let center = match position {
+        AnimationPosition::Local(local) => screen_for(local, mtm)?.0,
+        AnimationPosition::Relative(location) => {
+            let screen = NSScreen::screens(mtm).firstObject()?.frame();
             NSPoint::new(
                 screen.origin.x + location.x * screen.size.width,
                 screen.origin.y + (1.0 - location.y) * screen.size.height,
-            ),
-            screen,
-        ))
-    })?;
+            )
+        }
+    };
     let size = f64::from(size);
-    let name = sender_tag(tag.name, screen.size.width, mtm);
-    let tag_height = f64::from(TAG_HEIGHT);
-    let screen_top = screen.origin.y + screen.size.height;
-    let left = centered_overlay(point.x - screen.origin.x, size, screen.size.width);
-    let top = animation_top(
-        screen_top - point.y,
-        size,
-        screen.size.height,
-        tag.offset + tag_height,
-    );
-    let origin = NSPoint::new(screen.origin.x + left, screen_top - top - size);
+    let half = size / 2.0;
+    // Keep the gesture anchor when the art or sender tag extends past the display.
+    // 动画或昵称条超出显示器边缘时，保留手势锚点。
+    let origin = NSPoint::new(center.x - half, center.y - half);
+    let name = sender_tag(tag.name, mtm);
     if let Some(name) = &name {
-        let width = name.panel.frame().size.width;
-        let tag_left = centered_overlay(left + size / 2.0, width, screen.size.width);
+        let size = name.panel.frame().size;
         name.panel.setFrameOrigin(NSPoint::new(
-            screen.origin.x + tag_left,
-            screen_top - (top + size / 2.0 + tag.offset + tag_height),
+            center.x - size.width / 2.0,
+            center.y - tag.offset - size.height,
         ));
     }
     let mut effect = None;
     Some((None, move |update| {
         let window = effect.get_or_insert_with(|| {
             let (panel, art) = panel(NSSize::new(size, size), mtm, false);
+            panel.setLevel(ANIMATION_WINDOW_LEVEL);
             art.setContentsGravity(unsafe { objc2_quartz_core::kCAGravityResizeAspect });
             Effect { panel, art }
         });
@@ -623,7 +621,7 @@ pub(super) fn animation_presenter(
     }))
 }
 
-fn sender_tag(name: &str, screen_width: f64, mtm: MainThreadMarker) -> Option<Effect> {
+fn sender_tag(name: &str, mtm: MainThreadMarker) -> Option<Effect> {
     let label = NSTextField::labelWithString(&NSString::from_str(name), mtm);
     label.setSelectable(false);
     let weight = unsafe { NSFontWeightSemibold };
@@ -637,14 +635,13 @@ fn sender_tag(name: &str, screen_width: f64, mtm: MainThreadMarker) -> Option<Ef
         .setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
     let text = label.fittingSize();
     let padding = f64::from(TAG_PADDING);
-    let width = (text.width.ceil() + 2.0 * padding)
-        .min(f64::from(TAG_WIDTH))
-        .min(screen_width);
+    let width = (text.width.ceil() + 2.0 * padding).min(f64::from(TAG_WIDTH));
     if width <= 2.0 * padding {
         return None;
     }
     let height = f64::from(TAG_HEIGHT);
     let (panel, art) = panel(NSSize::new(width, height), mtm, false);
+    panel.setLevel(ANIMATION_WINDOW_LEVEL);
     let view = panel.contentView()?;
     art.setCornerRadius(f64::from(TAG_RADIUS));
     art.setBackgroundColor(Some(&text_color(gpui_kit::rgba(TAG_BACKGROUND)).CGColor()));

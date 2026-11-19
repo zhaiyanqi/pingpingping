@@ -22,9 +22,11 @@ use windows_sys::Win32::{
 use super::playback::{
     FrameUpdate, SenderTag, TAG_BACKGROUND, TAG_FONT_SIZE, TAG_FOREGROUND, TAG_HEIGHT, TAG_PADDING,
     TAG_RADIUS, TAG_WIDTH, TEXT_FONT_SIZE, TEXT_MARGIN, TEXT_MAX_LINES, TEXT_PADDING, TEXT_RADIUS,
-    TEXT_WIDTH, TextColors, TextFrame, animation_top, centered_overlay, text_anchor,
+    TEXT_WIDTH, TextColors, TextFrame, text_anchor,
 };
-use super::{AnimationOverlay, AudioCue, WheelContents, start_audio, wheel::WheelView};
+use super::{
+    AnimationOverlay, AnimationPosition, AudioCue, WheelContents, start_audio, wheel::WheelView,
+};
 use crate::gesture::{
     ALT, CTRL, GestureEvent, InputEvent, MouseDelivery, Position, SHIFT, SUPER, Triggers,
     WHEEL_SIZE, WheelInput,
@@ -787,52 +789,36 @@ impl Overlay {
 pub(super) fn animation_presenter(
     size: u32,
     tag: SenderTag<'_>,
-    local: Option<Position>,
-    location: Option<Location>,
+    position: AnimationPosition,
 ) -> Option<(Option<u32>, impl FnMut(FrameUpdate) + use<>)> {
-    let (point, bounds, dpi) = if let Some(local) = local {
-        let point = point(local);
-        let (bounds, dpi) = screen(point, false);
-        (point, bounds, dpi)
-    } else {
-        let (bounds, dpi) = screen(POINT::default(), true);
-        let location = location.unwrap_or(Location { x: 0.5, y: 0.5 });
-        let point = POINT {
-            x: bounds.left + (location.x * f64::from(bounds.right - bounds.left)) as i32,
-            y: bounds.top + (location.y * f64::from(bounds.bottom - bounds.top)) as i32,
-        };
-        (point, bounds, dpi)
+    let (center, dpi) = match position {
+        AnimationPosition::Local(local) => {
+            let point = point(local);
+            let (_, dpi) = screen(point, false);
+            (point, dpi)
+        }
+        AnimationPosition::Relative(location) => {
+            let (bounds, dpi) = screen(POINT::default(), true);
+            let point = POINT {
+                x: bounds.left + (location.x * f64::from(bounds.right - bounds.left)) as i32,
+                y: bounds.top + (location.y * f64::from(bounds.bottom - bounds.top)) as i32,
+            };
+            (point, dpi)
+        }
     };
     let size = pixels(size, dpi);
-    let canvas = f64::from(size);
-    let scale = f64::from(dpi) / 96.0;
-    let offset = tag.offset * scale;
-    let screen_width = (bounds.right - bounds.left).max(0) as u32;
-    let screen_height = f64::from(bounds.bottom - bounds.top);
-    let left = centered_overlay(
-        f64::from(point.x - bounds.left),
-        canvas,
-        f64::from(screen_width),
-    );
-    let top = animation_top(
-        f64::from(point.y - bounds.top),
-        canvas,
-        screen_height,
-        offset + f64::from(pixels(TAG_HEIGHT, dpi)),
-    );
+    let half = f64::from(size) / 2.0;
+    let offset = tag.offset * f64::from(dpi) / 96.0;
+    // Keep the gesture anchor when the art or sender tag extends past the display.
+    // 动画或昵称条超出显示器边缘时，保留手势锚点。
     let origin = POINT {
-        x: bounds.left + left.round() as i32,
-        y: bounds.top + top.round() as i32,
+        x: (f64::from(center.x) - half).round() as i32,
+        y: (f64::from(center.y) - half).round() as i32,
     };
-    let name = tag_surface(tag.name, dpi, screen_width).map(|surface| {
-        let left = centered_overlay(
-            left + canvas / 2.0,
-            f64::from(surface.width),
-            f64::from(screen_width),
-        );
+    let name = tag_surface(tag.name, dpi).map(|surface| {
         let point = POINT {
-            x: bounds.left + left.round() as i32,
-            y: bounds.top + (top + canvas / 2.0 + offset).round() as i32,
+            x: (f64::from(center.x) - f64::from(surface.width) / 2.0).round() as i32,
+            y: center.y + offset.round() as i32,
         };
         let mut layer = Layer::new(false);
         layer.surface = Some(surface);
@@ -861,12 +847,9 @@ pub(super) fn animation_presenter(
     }))
 }
 
-fn tag_surface(name: &str, dpi: u32, screen_width: u32) -> Option<Surface> {
+fn tag_surface(name: &str, dpi: u32) -> Option<Surface> {
     let padding = pixels(TAG_PADDING, dpi);
-    let max_width = pixels(TAG_WIDTH, dpi).min(screen_width);
-    if max_width <= 2 * padding {
-        return None;
-    }
+    let max_width = pixels(TAG_WIDTH, dpi);
     let text: Vec<u16> = name.encode_utf16().collect();
     let measure = Surface::new(1, 1)?;
     let font = unsafe {

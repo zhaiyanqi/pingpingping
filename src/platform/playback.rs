@@ -12,10 +12,10 @@ use gpui_kit::{App, Rgba, Task, component::ActiveTheme};
 use image::{AnimationDecoder, DynamicImage, ImageResult, RgbaImage, codecs::webp::WebPDecoder};
 
 use crate::emotes::{self, EmoteId, EmoteImage, EmoteStore, has_visible_pixels};
-use crate::gesture::{Position, Wheel};
-use crate::model::{Location, TextEffect, TextMotion, TextOverlaySettings, TextPosition};
+use crate::gesture::Wheel;
+use crate::model::{TextEffect, TextMotion, TextOverlaySettings, TextPosition};
 
-use super::{animation_presenter, system_reduces_motion, text_presenter};
+use super::{AnimationPosition, animation_presenter, system_reduces_motion, text_presenter};
 
 pub(super) const MAX_ACTIVE: usize = 16;
 const TRANSITION_DURATION: Duration = Duration::from_millis(180);
@@ -53,17 +53,6 @@ impl<'a> SenderTag<'a> {
             offset: f64::from(art_size) / 2.0 + gap,
         }
     }
-}
-
-pub(super) fn centered_overlay(center: f64, width: f64, screen_width: f64) -> f64 {
-    (center - width / 2.0).clamp(0.0, (screen_width - width).max(0.0))
-}
-
-pub(super) fn animation_top(center: f64, canvas: f64, screen_height: f64, tag_bottom: f64) -> f64 {
-    // Reserve space below the art when the tag extends past the canvas at the screen edge.
-    // 名字条超出画布时，在屏幕边缘为图案下方预留空间。
-    let half = canvas / 2.0;
-    (center - half).clamp(0.0, (screen_height - half - half.max(tag_bottom)).max(0.0))
 }
 
 pub(super) struct TextColors {
@@ -141,12 +130,10 @@ impl AnimationOverlay {
         &mut self,
         animation: Animation,
         tag: SenderTag<'_>,
-        local: Option<Position>,
-        location: Option<Location>,
+        position: AnimationPosition,
         cx: &App,
     ) {
-        let Some((output_pixels, mut present)) =
-            animation_presenter(animation.size, tag, local, location)
+        let Some((output_pixels, mut present)) = animation_presenter(animation.size, tag, position)
         else {
             return;
         };
@@ -557,27 +544,11 @@ mod tests {
     use crate::assets::{EMOTES, PINGS};
 
     #[test]
-    fn sender_tag_follows_the_art_size_and_fits_at_screen_edges() {
+    fn sender_tag_follows_the_art_size() {
         let ping = SenderTag::new("队友", 110, Wheel::Ping);
         let emote = SenderTag::new("队友", 150, Wheel::Emote);
         assert_eq!(ping.offset, 55.0);
         assert_eq!(emote.offset, 83.0);
-
-        let tag_height = f64::from(TAG_HEIGHT);
-        assert_eq!(
-            animation_top(300.0, 188.0, 600.0, emote.offset + tag_height),
-            206.0
-        );
-        assert_eq!(
-            animation_top(600.0, 188.0, 600.0, emote.offset + tag_height),
-            403.0
-        );
-        assert_eq!(
-            animation_top(600.0, 256.0, 600.0, ping.offset + tag_height),
-            344.0
-        );
-        assert_eq!(centered_overlay(60.0, 220.0, 800.0), 0.0);
-        assert_eq!(centered_overlay(740.0, 220.0, 800.0), 580.0);
     }
 
     #[test]

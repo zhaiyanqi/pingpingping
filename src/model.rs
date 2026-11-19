@@ -19,10 +19,18 @@ use crate::room::{Room, RoomConfig, RoomMember};
 
 const HISTORY_LIMIT: usize = 600;
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Location {
     pub(crate) x: f64,
     pub(crate) y: f64,
+}
+
+impl Location {
+    pub(crate) const CENTER: Self = Self { x: 0.5, y: 0.5 };
+
+    fn valid(self) -> bool {
+        (0.0..=1.0).contains(&self.x) && (0.0..=1.0).contains(&self.y)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -44,24 +52,13 @@ impl Body {
         matches!(self, Self::Emote { .. } | Self::CustomEmote(_))
     }
 
-    pub(crate) fn location(&self) -> Option<Location> {
-        match *self {
-            Self::Emote { location, .. } | Self::Ping { location, .. } => location,
-            Self::Text(_) | Self::CustomEmote(_) => None,
-        }
-    }
-
     fn valid(&self) -> bool {
-        let valid_content = match self {
+        match self {
             Self::Text(text) => !text.trim().is_empty() && text.len() <= 600,
             Self::CustomEmote(_) => true,
             Self::Emote { index, .. } => *index < EMOTES.len(),
             Self::Ping { index, .. } => *index < PINGS.len(),
-        };
-        valid_content
-            && self.location().is_none_or(|location| {
-                (0.0..=1.0).contains(&location.x) && (0.0..=1.0).contains(&location.y)
-            })
+        }
     }
 }
 
@@ -76,6 +73,10 @@ pub(crate) struct Message {
     // 保留文字消息体的格式，旧版房间客户端和历史读取器仍可读取。
     #[serde(default, skip_serializing_if = "TextEffect::uses_default")]
     pub(crate) text_effect: TextEffect,
+    // Keep the custom emote body readable as a bare image ID by older clients.
+    // 保留自定义表情原有的图片 ID 消息体格式，旧客户端仍可读取。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    custom_emote_location: Option<Location>,
 }
 
 impl Message {
@@ -87,13 +88,44 @@ impl Message {
             time: now(),
             body,
             text_effect: TextEffect::default(),
+            custom_emote_location: None,
         }
+    }
+
+    pub(crate) fn with_location(mut self, location: Location) -> Self {
+        match &mut self.body {
+            Body::Emote {
+                location: stored, ..
+            }
+            | Body::Ping {
+                location: stored, ..
+            } => {
+                *stored = Some(location);
+            }
+            Body::CustomEmote(_) => self.custom_emote_location = Some(location),
+            Body::Text(_) => {}
+        }
+        self
+    }
+
+    pub(crate) fn location(&self) -> Option<Location> {
+        match self.body {
+            Body::Emote { location, .. } | Body::Ping { location, .. } => location,
+            Body::CustomEmote(_) => self.custom_emote_location,
+            Body::Text(_) => None,
+        }
+    }
+
+    fn valid_body(&self) -> bool {
+        self.body.valid()
+            && (self.custom_emote_location.is_none() || matches!(self.body, Body::CustomEmote(_)))
+            && self.location().is_none_or(Location::valid)
     }
 
     pub(crate) fn valid(&self) -> bool {
         i64::try_from(self.time).is_ok()
             && valid_nickname(&self.name)
-            && self.body.valid()
+            && self.valid_body()
             && (self.text_effect.uses_default() || matches!(self.body, Body::Text(_)))
     }
 }
@@ -405,7 +437,7 @@ impl Model {
         let mut history: VecDeque<Entry> = load_json(&history_path)
             .context("无法读取历史记录")?
             .unwrap_or_default();
-        history.retain(|entry| entry.message.body.valid());
+        history.retain(|entry| entry.message.valid_body());
         while history.len() > HISTORY_LIMIT {
             history.pop_front();
         }
@@ -555,9 +587,17 @@ impl Model {
         true
     }
 
-    pub(crate) fn send(&mut self, body: Body, text_effect: TextEffect) -> Result<()> {
+    pub(crate) fn send(
+        &mut self,
+        body: Body,
+        text_effect: TextEffect,
+        location: Option<Location>,
+    ) -> Result<()> {
         let mut message = Message::new(self.profile.id, self.profile.name.clone(), body);
         message.text_effect = text_effect;
+        if let Some(location) = location {
+            message = message.with_location(location);
+        }
         ensure!(message.valid(), "请发送非空消息，最多 600 字节");
         if let Some(room) = &self.room {
             room.send(message.clone()).context("未能发送到局域网")?;
@@ -595,12 +635,22 @@ impl Model {
 mod tests {
     use super::*;
 
+    #[derive(Deserialize, Serialize)]
+    struct LegacyMessage {
+        id: Uuid,
+        sender: Uuid,
+        name: String,
+        time: u64,
+        body: Body,
+    }
+
     #[test]
     fn historical_pings_keep_their_location() {
         let body: Body =
             serde_json::from_str(r#"{"Ping":{"index":0,"location":{"x":0.1,"y":0.2}}}"#).unwrap();
-        assert!(body.valid());
-        let location = body.location().unwrap();
+        let message = Message::new(Uuid::new_v4(), "甲".into(), body);
+        assert!(message.valid());
+        let location = message.location().unwrap();
         assert_eq!((location.x, location.y), (0.1, 0.2));
         assert!(
             Body::Ping {
@@ -609,6 +659,39 @@ mod tests {
             }
             .valid()
         );
+    }
+
+    #[test]
+    fn custom_emote_location_preserves_the_legacy_message_body() {
+        let id = serde_json::from_value(serde_json::to_value([1_u8; 32]).unwrap()).unwrap();
+        let chat = Message::new(Uuid::new_v4(), "甲".into(), Body::CustomEmote(id));
+        let wire = serde_json::to_vec(&chat).unwrap();
+        let old: Message = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(old.location(), None);
+
+        let location = Location { x: 0.75, y: 1.0 };
+        let wheel = chat.with_location(location);
+        let wire = serde_json::to_vec(&wheel).unwrap();
+        let received: Message = serde_json::from_slice(&wire).unwrap();
+        assert!(received.valid());
+        assert_eq!(received.location(), Some(location));
+
+        let legacy: LegacyMessage = serde_json::from_slice(&wire).unwrap();
+        assert!(matches!(legacy.body, Body::CustomEmote(received_id) if received_id == id));
+        let forwarded: Message =
+            serde_json::from_slice(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(forwarded.valid());
+        assert_eq!(forwarded.location(), None);
+
+        assert!(
+            !wheel
+                .clone()
+                .with_location(Location { x: 0.0, y: 1.01 })
+                .valid()
+        );
+        let mut mismatched = wheel;
+        mismatched.body = Body::Text("你好".into());
+        assert!(!mismatched.valid());
     }
 
     #[test]
@@ -636,15 +719,6 @@ mod tests {
 
     #[test]
     fn text_effect_extends_the_message_without_changing_its_body() {
-        #[derive(Deserialize, Serialize)]
-        struct LegacyMessage {
-            id: Uuid,
-            sender: Uuid,
-            name: String,
-            time: u64,
-            body: Body,
-        }
-
         let mut message = Message::new(Uuid::new_v4(), "甲".into(), Body::Text("你好".into()));
         message.text_effect = TextEffect::Shake;
         let wire = serde_json::to_vec(&message).unwrap();
@@ -781,8 +855,9 @@ mod tests {
         let mut original = Model::load(folder.clone()).unwrap();
         let text = "你好\n第二行";
         original
-            .send(Body::Text(text.into()), TextEffect::FlyIn)
+            .send(Body::Text(text.into()), TextEffect::FlyIn, None)
             .unwrap();
+        let location = Location { x: 0.25, y: 0.75 };
         original
             .send(
                 Body::Emote {
@@ -790,6 +865,7 @@ mod tests {
                     location: None,
                 },
                 TextEffect::Default,
+                Some(location),
             )
             .unwrap();
         let message = original.messages().next_back().unwrap().clone();
@@ -799,7 +875,9 @@ mod tests {
         let restored_text = restored.messages().next().unwrap();
         assert!(matches!(&restored_text.body, Body::Text(saved) if saved == text));
         assert_eq!(restored_text.text_effect, TextEffect::FlyIn);
-        assert_eq!(restored.messages().next_back().unwrap().id, message.id);
+        let restored_emote = restored.messages().next_back().unwrap();
+        assert_eq!(restored_emote.id, message.id);
+        assert_eq!(restored_emote.location(), Some(location));
         restored.finish_writes().unwrap().join().unwrap();
         fs::remove_dir_all(folder).unwrap();
     }

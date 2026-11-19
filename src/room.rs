@@ -995,27 +995,30 @@ mod tests {
 
                 let local_emote =
                     Message::new(Uuid::new_v4(), "主机".into(), Body::CustomEmote(local_id));
+                let location = crate::model::Location { x: 0.75, y: 1.0 };
                 let guest_emote =
-                    Message::new(Uuid::new_v4(), "访客".into(), Body::CustomEmote(guest_id));
+                    Message::new(Uuid::new_v4(), "访客".into(), Body::CustomEmote(guest_id))
+                        .with_location(location);
                 host.send(local_emote.clone()).unwrap();
                 first.send(guest_emote.clone()).unwrap();
                 assert!(
                     matches!(first_inbox.recv().await.unwrap(), RoomEvent::Message(_, received) if received.id == emote.id)
                 );
                 assert!(
-                    matches!(first_inbox.recv().await.unwrap(), RoomEvent::Message(_, received) if received.id == local_emote.id)
+                    matches!(first_inbox.recv().await.unwrap(), RoomEvent::Message(_, received) if received.id == local_emote.id && received.location().is_none())
                 );
                 assert!(
-                    matches!(host_inbox.recv().await.unwrap(), RoomEvent::Message(_, received) if received.id == guest_emote.id)
+                    matches!(host_inbox.recv().await.unwrap(), RoomEvent::Message(_, received) if received.id == guest_emote.id && received.location() == Some(location))
                 );
                 let mut forwarded = Vec::new();
                 for _ in 0..2 {
                     let RoomEvent::Message(_, message) = second_inbox.recv().await.unwrap() else {
                         panic!("expected a forwarded custom emote");
                     };
-                    forwarded.push(message.id);
+                    forwarded.push((message.id, message.location()));
                 }
-                assert!(forwarded.contains(&local_emote.id) && forwarded.contains(&guest_emote.id));
+                assert!(forwarded.contains(&(local_emote.id, None)));
+                assert!(forwarded.contains(&(guest_emote.id, Some(location))));
                 assert_eq!(host_store.read(guest_id).unwrap(), EMOTES[0].image);
                 assert_eq!(first_store.read(local_id).unwrap(), PINGS[0].image);
                 assert_eq!(second_store.read(guest_id).unwrap(), EMOTES[0].image);
