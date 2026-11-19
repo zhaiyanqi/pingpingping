@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub(crate) const MAX_EMOTE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_EMOTE_NAME_CHARS: usize = 64;
 const MAX_SIDE: u32 = 2048;
 const MAX_FRAMES: usize = 240;
 const MAX_ANIMATION_PIXELS: u64 = 64 * 1024 * 1024;
@@ -69,6 +70,13 @@ impl LibraryEmote {
     }
 }
 
+pub(crate) fn valid_emote_name(name: &str) -> bool {
+    let name = name.trim();
+    !name.is_empty()
+        && name.chars().count() <= MAX_EMOTE_NAME_CHARS
+        && !name.chars().any(char::is_control)
+}
+
 impl EmoteStore {
     pub(crate) fn new(data_dir: &Path) -> Self {
         Self(data_dir.join("emotes"))
@@ -119,7 +127,7 @@ impl EmoteStore {
             .to_string_lossy()
             .chars()
             .filter(|character| !character.is_control())
-            .take(64)
+            .take(MAX_EMOTE_NAME_CHARS)
             .collect();
         if name.trim().is_empty() {
             name = "自定义表情".into();
@@ -143,6 +151,33 @@ impl EmoteStore {
             Err(error) => return Err(error).context("无法读取表情名称"),
         };
         Ok(LibraryEmote { id, name })
+    }
+
+    pub(crate) fn rename(&self, id: EmoteId, name: &str) -> Result<LibraryEmote> {
+        let name = name.trim();
+        ensure!(
+            valid_emote_name(name),
+            "请输入有效的表情名称（最多 {MAX_EMOTE_NAME_CHARS} 个字符）"
+        );
+        let path = self.path(id, "name");
+        ensure!(
+            path.try_exists().context("无法读取表情名称")?,
+            "表情已从库中删除"
+        );
+        write_atomic(&path, name.as_bytes()).context("无法保存表情名称")?;
+        Ok(LibraryEmote {
+            id,
+            name: name.to_owned(),
+        })
+    }
+
+    pub(crate) fn remove_from_library(&self, id: EmoteId) -> Result<()> {
+        // History and wheel slots reference the cached media by content ID.
+        // 历史记录和轮盘槽位通过内容 ID 引用缓存的媒体文件。
+        match fs::remove_file(self.path(id, "name")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            result => result.context("无法从表情库删除表情"),
+        }
     }
 
     pub(crate) fn library(&self) -> Result<Vec<LibraryEmote>> {

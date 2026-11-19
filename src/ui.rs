@@ -40,9 +40,17 @@ use crate::platform::{
 };
 use crate::room::{DEFAULT_PORT, Room, RoomConfig, RoomEvent};
 
+mod emote_library;
 mod palette;
 
-gpui_kit::actions!([OpenChat, OpenHistory, OpenSettings, CloseWindow, Quit]);
+gpui_kit::actions!([
+    OpenChat,
+    OpenHistory,
+    OpenSettings,
+    CloseWindow,
+    Quit,
+    ClearWheelSlot
+]);
 
 struct WheelEmoteAdded(WheelEmote);
 
@@ -200,6 +208,8 @@ fn register_window_actions(cx: &mut App) {
         KeyBinding::new(shortcut(",").as_str(), OpenSettings, None),
         KeyBinding::new(shortcut("w").as_str(), CloseWindow, None),
         KeyBinding::new(shortcut("q").as_str(), Quit, None),
+        KeyBinding::new("delete", ClearWheelSlot, Some("SettingsWheelSlot")),
+        KeyBinding::new("backspace", ClearWheelSlot, Some("SettingsWheelSlot")),
     ]);
     #[cfg(target_os = "macos")]
     cx.set_menus([Menu {
@@ -546,6 +556,11 @@ struct LocalEmotes {
     error: Option<String>,
 }
 
+enum LibraryEdit {
+    Rename(String),
+    Remove,
+}
+
 impl LocalEmotes {
     fn new(store: EmoteStore, cx: &mut Context<Self>) -> Self {
         let local = store.clone();
@@ -581,6 +596,45 @@ impl LocalEmotes {
         self.entries.retain(|known| known.id() != id);
         self.entries.insert(0, emote);
         id
+    }
+
+    fn edit(
+        &mut self,
+        id: EmoteId,
+        edit: LibraryEdit,
+        completed: impl FnOnce(bool, &mut App) + 'static,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.task.is_some() || !self.contains(id) {
+            return false;
+        }
+        self.error = None;
+        let store = self.store.clone();
+        self.task = Some(cx.spawn(async move |weak, cx| {
+            let result = smol::unblock(move || match edit {
+                LibraryEdit::Rename(name) => store.rename(id, &name).map(Some),
+                LibraryEdit::Remove => store.remove_from_library(id).map(|()| None),
+            })
+            .await;
+            let _ = weak.update(cx, |this, cx| {
+                this.task.take();
+                let saved = result.is_ok();
+                match result {
+                    Ok(Some(updated)) => {
+                        if let Some(entry) = this.entries.iter_mut().find(|entry| entry.id() == id)
+                        {
+                            *entry = updated;
+                        }
+                    }
+                    Ok(None) => this.entries.retain(|entry| entry.id() != id),
+                    Err(error) => this.error = Some(format!("{error:#}")),
+                }
+                completed(saved, cx);
+                cx.notify();
+            });
+        }));
+        cx.notify();
+        true
     }
 
     fn import_image(
@@ -1468,6 +1522,7 @@ enum SettingsCategory {
     General,
     Room,
     Wheel,
+    Library,
     Animation,
     Sound,
 }
@@ -1544,10 +1599,11 @@ fn wheel_sector_at(bounds: Bounds<Pixels>, position: Point<Pixels>) -> Option<us
 }
 
 impl SettingsCategory {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::General,
         Self::Room,
         Self::Wheel,
+        Self::Library,
         Self::Animation,
         Self::Sound,
     ];
@@ -1557,6 +1613,7 @@ impl SettingsCategory {
             Self::General => "常规",
             Self::Room => "局域网房间",
             Self::Wheel => "桌面轮盘",
+            Self::Library => "表情库",
             Self::Animation => "桌面动画",
             Self::Sound => "音效",
         }
@@ -1651,6 +1708,7 @@ struct Settings {
     wheel_slot: usize,
     wheel_preview: Rc<RefCell<WheelPreview>>,
     wheel_library_scroll: ScrollHandle,
+    emote_library: Entity<emote_library::EmoteLibrary>,
     swap_source: Option<WheelSlot>,
     pending_image: Option<WheelSlot>,
     recording: Option<Wheel>,
@@ -1684,6 +1742,15 @@ impl Settings {
     fn show_wheel_page(&mut self, page: usize, cx: &mut Context<Self>) {
         self.wheel_page = page;
         cx.notify();
+    }
+
+    fn show_category(&mut self, category: SettingsCategory, cx: &mut Context<Self>) {
+        self.end_capture(cx);
+        if self.category != category {
+            self.swap_source = None;
+            self.category = category;
+            cx.notify();
+        }
     }
 
     fn selected_slot(&self) -> WheelSlot {
@@ -1857,14 +1924,6 @@ impl Settings {
                             })),
                     ),
             )
-            .child(
-                div()
-                    .flex()
-                    .items_start()
-                    .gap_4()
-                    .child(self.wheel_surface(cx))
-                    .child(self.wheel_emote_library(selected, cx)),
-            )
             .child(div().text_sm().child(if let Some(slot) = self.swap_source {
                 format!(
                     "已选中第 {} 页的「{}」，请选择目标槽位。",
@@ -1900,8 +1959,8 @@ impl Settings {
                     .child(
                         Button::new("remove-wheel-emote")
                             .small()
-                            .ghost()
-                            .label("移出此槽位")
+                            .outline()
+                            .label("清空槽位")
                             .disabled(selected.is_none())
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.set_wheel_slot(this.selected_slot(), None, cx)
@@ -1918,6 +1977,14 @@ impl Settings {
                                 move |_, _, cx| library.update(cx, LocalEmotes::import)
                             }),
                     ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_4()
+                    .child(self.wheel_surface(cx))
+                    .child(self.wheel_emote_library(selected, cx)),
             )
             .when_some(library.error.clone(), |panel, error| {
                 panel.child(div().text_sm().text_color(theme.danger).child(error))
@@ -2027,6 +2094,13 @@ impl Settings {
         let theme = cx.theme();
         let focus_ring = theme.ring;
         BaseButton::new(("wheel-slot", sector))
+            .key_context("SettingsWheelSlot")
+            .on_action(cx.listener(move |this, _: &ClearWheelSlot, _, cx| {
+                if this.emote_pages[target.page][target.sector].is_some() {
+                    this.wheel_slot = target.sector;
+                    this.set_wheel_slot(target, None, cx);
+                }
+            }))
             .absolute()
             .left(relative(x - edge / 2.))
             .top(relative(y - edge / 2.))
@@ -2093,9 +2167,25 @@ impl Settings {
             .gap_2()
             .child(
                 div()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("表情库"),
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("表情库"),
+                    )
+                    .child(
+                        Button::new("manage-emote-library")
+                            .xsmall()
+                            .ghost()
+                            .label("管理")
+                            .accessibility_label("管理表情库")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_category(SettingsCategory::Library, cx);
+                            })),
+                    ),
             )
             .child(
                 div()
@@ -2170,6 +2260,8 @@ impl Settings {
         let volume = cx.new(|_| setting_slider(SOUND_VOLUME, 1, overlay.volume));
         let capture_focus = cx.focus_handle();
         let library = cx.global::<Desktop>().library.clone();
+        let emote_library =
+            cx.new(|cx| emote_library::EmoteLibrary::new(library.clone(), window, cx));
         let mut subscriptions = vec![
             cx.on_blur(&capture_focus, window, |this: &mut Self, _, cx| {
                 this.end_capture(cx)
@@ -2230,6 +2322,7 @@ impl Settings {
             wheel_slot: 0,
             wheel_preview: Rc::default(),
             wheel_library_scroll: ScrollHandle::new(),
+            emote_library,
             swap_source: None,
             pending_image: None,
             recording: None,
@@ -2882,32 +2975,32 @@ impl Render for Settings {
                     .child(div().w_full().text_left().child(category.label()))
                     .w_full()
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.end_capture(cx);
-                        if this.category != category {
-                            this.swap_source = None;
-                        }
-                        this.category = category;
-                        cx.notify();
+                        this.show_category(category, cx);
                     }))
             }));
         let panel = match self.category {
-            SettingsCategory::General => div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(div().text_sm().child("昵称"))
-                .child(Input::new(&self.name).id("settings-name")),
-            SettingsCategory::Room => self.room_settings(cx),
-            SettingsCategory::Wheel => div()
-                .flex()
-                .flex_col()
-                .gap_5()
-                .child(self.wheel_layout(cx))
-                .child(self.wheel_shortcuts(cx)),
-            SettingsCategory::Animation => self.animation_settings(cx),
-            SettingsCategory::Sound => self.sound_settings(cx),
+            SettingsCategory::General => Some(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(div().text_sm().child("昵称"))
+                    .child(Input::new(&self.name).id("settings-name")),
+            ),
+            SettingsCategory::Room => Some(self.room_settings(cx)),
+            SettingsCategory::Wheel => Some(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_5()
+                    .child(self.wheel_layout(cx))
+                    .child(self.wheel_shortcuts(cx)),
+            ),
+            SettingsCategory::Library => None,
+            SettingsCategory::Animation => Some(self.animation_settings(cx)),
+            SettingsCategory::Sound => Some(self.sound_settings(cx)),
         };
-        let content = div().flex().flex_1().min_h_0().child(sidebar).child(
+        let panel = if let Some(panel) = panel {
             div()
                 .id(("settings-scroll", self.category as usize))
                 .flex_1()
@@ -2926,8 +3019,12 @@ impl Render for Settings {
                         )
                         .child(panel),
                 )
-                .overflow_y_scrollbar(),
-        );
+                .overflow_y_scrollbar()
+                .into_any_element()
+        } else {
+            self.emote_library.clone().into_any_element()
+        };
+        let content = div().flex().flex_1().min_h_0().child(sidebar).child(panel);
 
         div()
             .track_focus(&self.capture_focus)
@@ -3043,10 +3140,11 @@ mod tests {
     };
 
     use gpui_kit::base::Root;
+    use gpui_kit::component::WindowExt;
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
-        AnyWindowHandle, AppContext, QuitMode, ScrollDelta, SharedString, TestAppContext,
-        WindowVisibility, point, px, size,
+        AnyWindowHandle, AppContext, ElementId, QuitMode, ScrollDelta, SharedString,
+        TestAppContext, WindowVisibility, point, px, size,
     };
     use image::{Rgba, RgbaImage};
     use uuid::Uuid;
@@ -3055,6 +3153,7 @@ mod tests {
         ANIMATION_TIMEOUT, Desktop, Settings, SettingsCategory, WheelSlot, open_chat,
         open_settings, register_window_actions, setting_slider, shortcut,
     };
+    use crate::emotes::EmoteId;
     use crate::model::{Model, WheelEmote};
 
     fn settings_desktop(cx: &mut TestAppContext) -> (AnyWindowHandle, AnyWindowHandle, PathBuf) {
@@ -3104,6 +3203,33 @@ mod tests {
             paused
         })
         .unwrap()
+    }
+
+    fn populate_test_library(
+        cx: &mut TestAppContext,
+        data: &std::path::Path,
+        names: impl IntoIterator<Item = &'static str>,
+    ) -> Vec<EmoteId> {
+        let library = cx.update(|cx| cx.global::<Desktop>().library.clone());
+        let store = cx.read_entity(&library, |library, _| library.store.clone());
+        let entries: Vec<_> = names
+            .into_iter()
+            .zip(0u8..)
+            .map(|(name, color)| {
+                let path = data.join(format!("{name}.png"));
+                RgbaImage::from_pixel(1, 1, Rgba([color, 0, 0, 255]))
+                    .save(&path)
+                    .unwrap();
+                store.import(&path).unwrap()
+            })
+            .collect();
+        let ids = entries.iter().map(|entry| entry.id()).collect();
+        library.update(cx, |library, cx| {
+            library.task.take();
+            library.entries = entries;
+            cx.notify();
+        });
+        ids
     }
 
     #[gpui_kit::test]
@@ -3181,23 +3307,8 @@ mod tests {
     #[gpui_kit::test]
     fn settings_can_scroll_to_and_assign_the_last_library_emote(cx: &mut TestAppContext) {
         let (_, settings, data) = settings_desktop(cx);
-        let file = data.join("Test emote.png");
-        let library = cx.update(|cx| cx.global::<Desktop>().library.clone());
-        let store = cx.read_entity(&library, |library, _| library.store.clone());
-        let entries: Vec<_> = (0..24)
-            .map(|index| {
-                RgbaImage::from_pixel(1, 1, Rgba([index, 0, 0, 255]))
-                    .save(&file)
-                    .unwrap();
-                store.import(&file).unwrap()
-            })
-            .collect();
-        let last_emote = entries.last().unwrap().id();
-        library.update(cx, |library, cx| {
-            library.task.take();
-            library.entries = entries;
-            cx.notify();
-        });
+        let ids = populate_test_library(cx, &data, std::iter::repeat_n("Test emote", 24));
+        let last_emote = *ids.last().unwrap();
 
         cx.simulate_window_resize(settings, size(px(560.), px(400.)));
         cx.update_window(settings, |_, window, cx| {
@@ -3208,7 +3319,7 @@ mod tests {
             // 在最小窗口高度下，将整个表情库滚动到页脚上方。
             window.scroll(
                 "add-wheel-page",
-                ScrollDelta::Pixels(point(px(0.), px(-48.))),
+                ScrollDelta::Pixels(point(px(0.), px(-120.))),
                 cx,
             );
             let page_button = window.find("add-wheel-page").bounds();
@@ -3236,6 +3347,127 @@ mod tests {
             );
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn settings_clear_wheel_slots_and_save_the_layout(cx: &mut TestAppContext) {
+        let (_, settings, data) = settings_desktop(cx);
+        cx.simulate_window_resize(settings, size(px(560.), px(400.)));
+        cx.update_window(settings, |_, window, cx| {
+            window.render_frame(cx);
+            window.click(("settings-category", SettingsCategory::Wheel as usize), cx);
+            assert!(window.find("remove-wheel-emote").visible());
+            window.click("remove-wheel-emote", cx);
+            assert_eq!(
+                window.find(("wheel-slot", 0usize)).label(),
+                Some("上 · 空槽位")
+            );
+            assert!(cx.global::<Desktop>().model.read(cx).profile.emote_pages[0][0].is_some());
+        })
+        .unwrap();
+        cx.simulate_window_resize(settings, size(px(700.), px(655.)));
+        cx.update_window(settings, |_, window, cx| {
+            window.render_frame(cx);
+            window.click(("wheel-slot", 1usize), cx);
+            window.press("backspace", cx);
+            assert_eq!(
+                window.find(("wheel-slot", 1usize)).label(),
+                Some("右上 · 空槽位")
+            );
+            window.click("save", cx);
+            // The headless test exercises saving without opening a native overlay.
+            // 无界面测试验证保存流程，不打开原生悬浮层。
+            cx.global_mut::<Desktop>().wheel_posters.take();
+        })
+        .unwrap();
+        let mut reloaded = Model::load(data).unwrap();
+        assert_eq!(reloaded.profile.emote_pages[0][0], None);
+        assert_eq!(reloaded.profile.emote_pages[0][1], None);
+        assert!(reloaded.profile.emote_pages[0][2].is_some());
+        reloaded.finish_writes().unwrap().join().unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn settings_import_search_rename_and_delete_custom_emotes(cx: &mut TestAppContext) {
+        let (_, settings, data) = settings_desktop(cx);
+        let coffee = populate_test_library(cx, &data, ["Coffee"])[0];
+        let library = cx.update(|cx| cx.global::<Desktop>().library.clone());
+        let file = data.join("Tea Time.png");
+        RgbaImage::from_pixel(1, 1, Rgba([1, 0, 0, 255]))
+            .save(&file)
+            .unwrap();
+        cx.update_window(settings, |_, window, cx| {
+            window.render_frame(cx);
+            window.click(("settings-category", SettingsCategory::Wheel as usize), cx);
+            window.click("manage-emote-library", cx);
+            window.click("library-import", cx);
+        })
+        .unwrap();
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(|_| Some(vec![file]));
+        cx.condition(&library, |library, _| library.task.is_none())
+            .await;
+        let tea = cx.read_entity(&library, |library, _| {
+            assert_eq!(library.entries[0].name(), "Tea Time");
+            library.entries[0].id()
+        });
+        let tea_id = SharedString::from(tea.to_string());
+        let rename = |id| (ElementId::from("rename-library-emote"), id);
+        let delete = (ElementId::from("delete-library-emote"), tea_id.clone());
+        cx.update_window(settings, |_, window, cx| {
+            window.click("library-search", cx);
+            window.input("TEA", cx);
+            assert!(window.find(rename(tea_id.clone())).visible());
+            assert!(
+                window
+                    .try_find(rename(SharedString::from(coffee.to_string())))
+                    .is_none()
+            );
+            window.click(rename(tea_id.clone()), cx);
+            assert_eq!(window.find("library-rename-name").value(), Some("Tea Time"));
+            window.press(&shortcut("a"), cx);
+            window.press("backspace", cx);
+            window.press("enter", cx);
+            assert_eq!(window.find("library-rename-name").value(), Some(""));
+            window.input("Tea break", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.condition(&library, |library, _| library.task.is_none())
+            .await;
+        let store = cx.read_entity(&library, |library, _| library.store.clone());
+        assert!(
+            store
+                .library()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.id() == tea && entry.name() == "Tea break")
+        );
+        cx.update_window(settings, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find(rename(tea_id.clone())).label(),
+                Some("重命名「Tea break」")
+            );
+            window.click(delete.clone(), cx);
+            assert!(window.has_active_dialog(cx));
+            window.click("cancel", cx);
+            assert!(window.find(delete.clone()).visible());
+            window.click(delete.clone(), cx);
+            window.click("ok", cx);
+        })
+        .unwrap();
+        cx.condition(&library, |library, _| library.task.is_none())
+            .await;
+        cx.update_window(settings, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find(delete).is_none());
+        })
+        .unwrap();
+        let entries = store.library().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id(), coffee);
+        assert!(store.contains(tea));
     }
 
     #[test]
