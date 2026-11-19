@@ -9,8 +9,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::playback::{
-    FrameUpdate, TEXT_FONT_SIZE, TEXT_MARGIN, TEXT_MAX_LINES, TEXT_PADDING, TEXT_RADIUS,
-    TEXT_WIDTH, TextColors, TextFrame, text_anchor,
+    FrameUpdate, SenderTag, TAG_BACKGROUND, TAG_FONT_SIZE, TAG_FOREGROUND, TAG_HEIGHT, TAG_PADDING,
+    TAG_RADIUS, TAG_WIDTH, TEXT_FONT_SIZE, TEXT_MARGIN, TEXT_MAX_LINES, TEXT_PADDING, TEXT_RADIUS,
+    TEXT_WIDTH, TextColors, TextFrame, animation_top, centered_overlay, text_anchor,
 };
 use super::{AnimationOverlay, AudioCue, WheelContents, start_audio, wheel::WheelView};
 use async_channel::Sender;
@@ -30,8 +31,9 @@ use objc2::{
     MainThreadMarker, MainThreadOnly, define_class, msg_send, rc::Retained, runtime::AnyObject,
 };
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSColor, NSFloatingWindowLevel, NSFont, NSPanel, NSScreen,
-    NSTextField, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
+    NSApplication, NSBackingStoreType, NSColor, NSFloatingWindowLevel, NSFont,
+    NSFontWeightSemibold, NSLineBreakMode, NSPanel, NSScreen, NSTextField, NSWindow,
+    NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_core_graphics::CGImage;
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
@@ -419,19 +421,6 @@ fn update_layers(update: impl FnOnce()) {
     CATransaction::commit();
 }
 
-fn place(panel: &NSPanel, point: NSPoint, size: f64, screen: NSRect) {
-    let x = (point.x - size / 2.0).clamp(
-        screen.origin.x,
-        screen.origin.x + (screen.size.width - size).max(0.0),
-    );
-    let y = (point.y - size / 2.0).clamp(
-        screen.origin.y,
-        screen.origin.y + (screen.size.height - size).max(0.0),
-    );
-    panel.setFrameOrigin(NSPoint::new(x, y));
-    panel.orderFrontRegardless();
-}
-
 struct Effect {
     panel: Retained<NSPanel>,
     art: Retained<CALayer>,
@@ -562,9 +551,10 @@ impl Drop for Overlay {
 
 pub(super) fn animation_presenter(
     size: u32,
+    tag: SenderTag<'_>,
     local: Option<Position>,
     location: Option<Location>,
-) -> Option<(Option<u32>, impl FnMut(FrameUpdate))> {
+) -> Option<(Option<u32>, impl FnMut(FrameUpdate) + use<>)> {
     let mtm = MainThreadMarker::new()?;
     let (point, screen) = local.and_then(|point| screen_for(point, mtm)).or_else(|| {
         let screen = NSScreen::screens(mtm).firstObject()?.frame();
@@ -578,6 +568,25 @@ pub(super) fn animation_presenter(
         ))
     })?;
     let size = f64::from(size);
+    let name = sender_tag(tag.name, screen.size.width, mtm);
+    let tag_height = f64::from(TAG_HEIGHT);
+    let screen_top = screen.origin.y + screen.size.height;
+    let left = centered_overlay(point.x - screen.origin.x, size, screen.size.width);
+    let top = animation_top(
+        screen_top - point.y,
+        size,
+        screen.size.height,
+        tag.offset + tag_height,
+    );
+    let origin = NSPoint::new(screen.origin.x + left, screen_top - top - size);
+    if let Some(name) = &name {
+        let width = name.panel.frame().size.width;
+        let tag_left = centered_overlay(left + size / 2.0, width, screen.size.width);
+        name.panel.setFrameOrigin(NSPoint::new(
+            screen.origin.x + tag_left,
+            screen_top - (top + size / 2.0 + tag.offset + tag_height),
+        ));
+    }
     let mut effect = None;
     Some((None, move |update| {
         let window = effect.get_or_insert_with(|| {
@@ -597,12 +606,62 @@ pub(super) fn animation_presenter(
                     );
                 });
                 if !window.panel.isVisible() {
-                    place(&window.panel, point, size, screen);
+                    window.panel.setFrameOrigin(origin);
+                    window.panel.orderFrontRegardless();
+                    if let Some(name) = &name {
+                        name.panel.orderFrontRegardless();
+                    }
                 }
             }
-            FrameUpdate::Opacity(opacity) => window.panel.setAlphaValue(f64::from(opacity)),
+            FrameUpdate::Opacity(opacity) => {
+                window.panel.setAlphaValue(f64::from(opacity));
+                if let Some(name) = &name {
+                    name.panel.setAlphaValue(f64::from(opacity));
+                }
+            }
         }
     }))
+}
+
+fn sender_tag(name: &str, screen_width: f64, mtm: MainThreadMarker) -> Option<Effect> {
+    let label = NSTextField::labelWithString(&NSString::from_str(name), mtm);
+    label.setSelectable(false);
+    let weight = unsafe { NSFontWeightSemibold };
+    label.setFont(Some(&NSFont::systemFontOfSize_weight(
+        f64::from(TAG_FONT_SIZE),
+        weight,
+    )));
+    label.setTextColor(Some(&text_color(gpui_kit::rgba(TAG_FOREGROUND))));
+    label
+        .cell()?
+        .setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+    let text = label.fittingSize();
+    let padding = f64::from(TAG_PADDING);
+    let width = (text.width.ceil() + 2.0 * padding)
+        .min(f64::from(TAG_WIDTH))
+        .min(screen_width);
+    if width <= 2.0 * padding {
+        return None;
+    }
+    let height = f64::from(TAG_HEIGHT);
+    let (panel, art) = panel(NSSize::new(width, height), mtm, false);
+    let view = panel.contentView()?;
+    art.setCornerRadius(f64::from(TAG_RADIUS));
+    art.setBackgroundColor(Some(&text_color(gpui_kit::rgba(TAG_BACKGROUND)).CGColor()));
+    label.setFrame(rect(
+        padding,
+        (height - text.height) / 2.0,
+        width - 2.0 * padding,
+        text.height,
+    ));
+    label.setWantsLayer(true);
+    if let Some(layer) = label.layer() {
+        layer.setShadowOpacity(1.0);
+        layer.setShadowOffset(NSSize::new(0.0, -1.0));
+        layer.setShadowRadius(1.0);
+    }
+    view.addSubview(&label);
+    Some(Effect { panel, art })
 }
 
 pub(super) fn system_reduces_motion() -> bool {
@@ -660,7 +719,7 @@ fn text_color(color: gpui_kit::Rgba) -> Retained<NSColor> {
         f64::from(color.r),
         f64::from(color.g),
         f64::from(color.b),
-        1.0,
+        f64::from(color.a),
     )
 }
 

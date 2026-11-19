@@ -10,10 +10,11 @@ use rodio::{Decoder, DeviceSinkBuilder, Player};
 
 use crate::assets::{EMOTES, PINGS, WHEEL_TICK};
 use crate::emotes::{EmoteId, EmoteStore};
-use crate::gesture::Wheel;
-use crate::model::{EmotePage, OverlaySettings, TextEffect, TextOverlaySettings, WheelEmote};
+use crate::gesture::{Position, Wheel};
+use crate::model::{Body, EmotePage, OverlaySettings, TextEffect, TextOverlaySettings, WheelEmote};
 
 mod playback;
+use playback::SenderTag;
 pub(crate) use playback::{Animation, AnimationOverlay};
 mod wheel;
 pub(crate) use wheel::{WheelFrame, WheelPreview, editor_sector, load_wheel_posters, slot_center};
@@ -73,19 +74,6 @@ impl Overlay {
         self.wheel_view.emote(slot)
     }
 
-    pub(crate) fn play_custom(
-        &mut self,
-        store: EmoteStore,
-        id: EmoteId,
-        local: Option<crate::gesture::Position>,
-        settings: OverlaySettings,
-        cx: &gpui_kit::App,
-    ) {
-        let timeout = Duration::from_millis(u64::from(settings.emote_timeout_ms));
-        let animation = Animation::custom(store, id, settings.emote_size, timeout);
-        self.animations.play(animation, local, None, cx);
-    }
-
     pub(crate) fn play_text(
         &mut self,
         text: &str,
@@ -98,13 +86,26 @@ impl Overlay {
 
     pub(crate) fn play(
         &mut self,
-        kind: Wheel,
-        index: usize,
-        local: Option<crate::gesture::Position>,
-        location: Option<crate::model::Location>,
+        body: &Body,
+        name: &str,
+        local: Option<Position>,
+        store: &EmoteStore,
         settings: OverlaySettings,
         cx: &gpui_kit::App,
     ) {
+        let (kind, index) = match *body {
+            Body::Ping { index, .. } => (Wheel::Ping, index),
+            Body::Emote { index, .. } => (Wheel::Emote, index),
+            Body::CustomEmote(id) => {
+                let size = settings.emote_size;
+                let timeout = Duration::from_millis(u64::from(settings.emote_timeout_ms));
+                let animation = Animation::custom(store.clone(), id, size, timeout);
+                let tag = SenderTag::new(name, size, Wheel::Emote);
+                self.animations.play(animation, tag, local, None, cx);
+                return;
+            }
+            Body::Text(_) => return,
+        };
         let (clip, size, timeout_ms) = match kind {
             Wheel::Ping => (PINGS[index], settings.ping_size, settings.ping_timeout_ms),
             Wheel::Emote => (
@@ -125,7 +126,9 @@ impl Overlay {
             Wheel::Ping => animation,
             Wheel::Emote => animation.with_fade_out(),
         };
-        self.animations.play(animation, local, location, cx);
+        let tag = SenderTag::new(name, size, kind);
+        self.animations
+            .play(animation, tag, local, body.location(), cx);
         if let Some(volume) = settings
             .volume()
             .filter(|_| kind != Wheel::Emote || settings.emote_sound)

@@ -99,7 +99,7 @@ The app accepts private, link-local, and loopback IPv4 addresses. LAN traffic is
 
 The ping and emote wheels take keyboard focus when opened and release it on selection or cancellation. Playing, previewing, or replaying an animation leaves the current window focused.
 
-Under **Settings → Desktop animations**, set the size and timeout for pings and emotes separately and preview them before saving. Animations loop at their source frame rate, and emotes fade out once their timeout elapses. **Sound** controls the volume and has separate switches for emote sounds and wheel ticks.
+Under **Settings → Desktop animations**, set the size and timeout for pings and emotes separately and preview them before saving. The sender's nickname appears beneath pings, built-in emotes, and custom emotes. Animations loop at their source frame rate, and emotes fade out once their timeout elapses. **Sound** controls the volume and has separate switches for emote sounds and wheel ticks.
 
 Sent and received text appears in the bottom-right corner of the primary display by default. Under **Settings → Desktop animations → Text overlay**, set the position, hold time (four seconds by default), and default entrance and exit effects. Select **Preview text** to see the result before saving. New text replaces the message currently on screen, and chat and history retain the full message.
 

@@ -568,14 +568,14 @@ impl Model {
 
     // Events from a closed session may still be queued. Only accept the current session's events.
     // 已关闭会话的事件可能仍在队列里，只接收当前会话的事件。
-    pub(crate) fn receive(&mut self, id: Uuid, message: Message) -> bool {
+    pub(crate) fn receive(&mut self, id: Uuid, message: &Message) -> bool {
         if self.room.as_ref().map(Room::id) != Some(id)
             || message.sender == self.profile.id
             || self.messages().any(|entry| entry.id == message.id)
         {
             return false;
         }
-        self.record(message);
+        self.record(message.clone());
         true
     }
 

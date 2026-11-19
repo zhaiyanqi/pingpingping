@@ -12,7 +12,7 @@ use gpui_kit::{App, Rgba, Task, component::ActiveTheme};
 use image::{AnimationDecoder, DynamicImage, ImageResult, RgbaImage, codecs::webp::WebPDecoder};
 
 use crate::emotes::{self, EmoteId, EmoteImage, EmoteStore, has_visible_pixels};
-use crate::gesture::Position;
+use crate::gesture::{Position, Wheel};
 use crate::model::{Location, TextEffect, TextMotion, TextOverlaySettings, TextPosition};
 
 use super::{animation_presenter, system_reduces_motion, text_presenter};
@@ -27,6 +27,44 @@ pub(super) const TEXT_RADIUS: u32 = 12;
 pub(super) const TEXT_FONT_SIZE: u32 = 16;
 pub(super) const TEXT_MAX_LINES: u32 = 6;
 pub(super) const TEXT_MARGIN: u32 = 24;
+pub(super) const TAG_WIDTH: u32 = 220;
+pub(super) const TAG_HEIGHT: u32 = 20;
+pub(super) const TAG_PADDING: u32 = 7;
+pub(super) const TAG_RADIUS: u32 = 4;
+pub(super) const TAG_FONT_SIZE: u32 = 13;
+pub(super) const TAG_FOREGROUND: u32 = 0x4fc3f7ff;
+pub(super) const TAG_BACKGROUND: u32 = 0x080c109e;
+
+pub(super) struct SenderTag<'a> {
+    pub(super) name: &'a str,
+    pub(super) offset: f64,
+}
+
+impl<'a> SenderTag<'a> {
+    pub(super) fn new(name: &'a str, art_size: u32, kind: Wheel) -> Self {
+        // Match lolPing's placement against the art size, excluding the padded animation canvas.
+        // 按 lolPing 的位置以图案尺寸为基准，不计动画画布的留白。
+        let gap = match kind {
+            Wheel::Ping => 0.0,
+            Wheel::Emote => 8.0,
+        };
+        Self {
+            name,
+            offset: f64::from(art_size) / 2.0 + gap,
+        }
+    }
+}
+
+pub(super) fn centered_overlay(center: f64, width: f64, screen_width: f64) -> f64 {
+    (center - width / 2.0).clamp(0.0, (screen_width - width).max(0.0))
+}
+
+pub(super) fn animation_top(center: f64, canvas: f64, screen_height: f64, tag_bottom: f64) -> f64 {
+    // Reserve space below the art when the tag extends past the canvas at the screen edge.
+    // 名字条超出画布时，在屏幕边缘为图案下方预留空间。
+    let half = canvas / 2.0;
+    (center - half).clamp(0.0, (screen_height - half - half.max(tag_bottom)).max(0.0))
+}
 
 pub(super) struct TextColors {
     pub(super) background: Rgba,
@@ -99,15 +137,16 @@ pub(crate) struct AnimationOverlay {
 }
 
 impl AnimationOverlay {
-    pub(crate) fn play(
+    pub(super) fn play(
         &mut self,
         animation: Animation,
+        tag: SenderTag<'_>,
         local: Option<Position>,
         location: Option<Location>,
         cx: &App,
     ) {
         let Some((output_pixels, mut present)) =
-            animation_presenter(animation.size, local, location)
+            animation_presenter(animation.size, tag, local, location)
         else {
             return;
         };
@@ -516,6 +555,30 @@ async fn run(
 mod tests {
     use super::*;
     use crate::assets::{EMOTES, PINGS};
+
+    #[test]
+    fn sender_tag_follows_the_art_size_and_fits_at_screen_edges() {
+        let ping = SenderTag::new("队友", 110, Wheel::Ping);
+        let emote = SenderTag::new("队友", 150, Wheel::Emote);
+        assert_eq!(ping.offset, 55.0);
+        assert_eq!(emote.offset, 83.0);
+
+        let tag_height = f64::from(TAG_HEIGHT);
+        assert_eq!(
+            animation_top(300.0, 188.0, 600.0, emote.offset + tag_height),
+            206.0
+        );
+        assert_eq!(
+            animation_top(600.0, 188.0, 600.0, emote.offset + tag_height),
+            403.0
+        );
+        assert_eq!(
+            animation_top(600.0, 256.0, 600.0, ping.offset + tag_height),
+            344.0
+        );
+        assert_eq!(centered_overlay(60.0, 220.0, 800.0), 0.0);
+        assert_eq!(centered_overlay(740.0, 220.0, 800.0), 580.0);
+    }
 
     #[test]
     fn text_overlay_anchors_to_all_four_work_area_corners() {

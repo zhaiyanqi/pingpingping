@@ -29,7 +29,7 @@ use gpui_kit::*;
 
 use crate::assets::{EMOTES, PINGS};
 use crate::emotes::{EmoteId, EmoteStore, LibraryEmote};
-use crate::gesture::{GestureEvent, TriggerKey, Triggers, Wheel};
+use crate::gesture::{GestureEvent, Position, TriggerKey, Triggers, Wheel};
 use crate::model::{
     ANIMATION_TIMEOUT, Body, EMOTE_SIZE, EmotePage, Message, Model, OverlaySettings, PING_SIZE,
     Profile, SOUND_VOLUME, TextEffect, TextMotion, TextOverlaySettings, TextPosition, WheelEmote,
@@ -122,17 +122,15 @@ pub(crate) fn start(cx: &mut App) {
                 let model = cx.global::<Desktop>().model.clone();
                 match event {
                     RoomEvent::Message(id, message) => {
-                        let body = message.body.clone();
-                        let text_effect = message.text_effect;
                         if model.update(cx, |model, cx| {
-                            if model.receive(id, message) {
+                            if model.receive(id, &message) {
                                 cx.notify();
                                 model.profile.plays_incoming_effects()
                             } else {
                                 false
                             }
                         }) {
-                            play(&body, text_effect, cx);
+                            play(&message.body, message.text_effect, Some(&message.name), cx);
                         }
                     }
                     RoomEvent::Members(id, members) => model.update(cx, |model, cx| {
@@ -270,32 +268,35 @@ impl Render for StartupError {
     }
 }
 
-fn play(body: &Body, text_effect: TextEffect, cx: &mut App) {
+fn play(body: &Body, text_effect: TextEffect, sender: Option<&str>, cx: &mut App) {
     cx.update_global::<Desktop, _>(|desktop, cx| {
-        let model = desktop.model.read(cx);
-        let settings = model.profile.overlay.with_sound(model.profile.sound);
-        let location = body.location();
-        match *body {
-            Body::Emote { index, .. } => {
-                desktop
-                    .overlay
-                    .play(Wheel::Emote, index, None, location, settings, cx)
-            }
-            Body::Ping { index, .. } => {
-                desktop
-                    .overlay
-                    .play(Wheel::Ping, index, None, location, settings, cx)
-            }
-            Body::CustomEmote(id) => {
-                desktop
-                    .overlay
-                    .play_custom(model.emotes(), id, None, settings, cx)
-            }
-            Body::Text(ref text) => desktop
-                .overlay
-                .play_text(text, settings.text, text_effect, cx),
-        }
+        desktop.play(body, text_effect, sender, None, cx);
     });
+}
+
+impl Desktop {
+    fn play(
+        &mut self,
+        body: &Body,
+        text_effect: TextEffect,
+        sender: Option<&str>,
+        local: Option<Position>,
+        cx: &App,
+    ) {
+        let model = self.model.read(cx);
+        let settings = model.profile.overlay.with_sound(model.profile.sound);
+        match body {
+            Body::Text(text) => self.overlay.play_text(text, settings.text, text_effect, cx),
+            _ => self.overlay.play(
+                body,
+                sender.unwrap_or(&model.profile.name),
+                local,
+                &model.emotes(),
+                settings,
+                cx,
+            ),
+        }
+    }
 }
 
 fn refresh_wheel_posters(cx: &mut App) {
@@ -372,33 +373,7 @@ fn handle_gesture(event: GestureEvent, cx: &mut App) {
             });
             desktop.overlay.close(cx);
             if let Some((body, origin)) = message {
-                let location = body.location();
-                match body {
-                    Body::Ping { index, .. } => desktop.overlay.play(
-                        Wheel::Ping,
-                        index,
-                        Some(origin),
-                        location,
-                        settings,
-                        cx,
-                    ),
-                    Body::Emote { index, .. } => desktop.overlay.play(
-                        Wheel::Emote,
-                        index,
-                        Some(origin),
-                        location,
-                        settings,
-                        cx,
-                    ),
-                    Body::CustomEmote(id) => desktop.overlay.play_custom(
-                        desktop.model.read(cx).emotes(),
-                        id,
-                        Some(origin),
-                        settings,
-                        cx,
-                    ),
-                    Body::Text(_) => {}
-                }
+                desktop.play(&body, TextEffect::Default, None, Some(origin), cx);
                 desktop.model.update(cx, |model, cx| {
                     match model.send(body, TextEffect::Default) {
                         Ok(()) => cx.notify(),
@@ -810,7 +785,7 @@ impl Conversation {
         self.error = result.err().map(|error| format!("{error:#}"));
         if sent {
             self.messages.set_follow_mode(FollowMode::Tail);
-            play(&body, text_effect, cx);
+            play(&body, text_effect, None, cx);
         }
         cx.notify();
         sent
@@ -1049,6 +1024,7 @@ fn bubble(message: &Message, mine: bool, action: Option<Div>, cx: &App) -> impl 
             .into_any_element(),
         Body::CustomEmote(id) => {
             let id = *id;
+            let name = message.name.clone();
             let store = desktop.model.read(cx).emotes();
             Button::new("play-custom")
                 .ghost()
@@ -1061,7 +1037,9 @@ fn bubble(message: &Message, mine: bool, action: Option<Div>, cx: &App) -> impl 
                         .object_fit(ObjectFit::Contain)
                         .with_fallback(|| div().text_xs().child("图片不可用").into_any_element()),
                 )
-                .on_click(move |_, _, cx| play(&Body::CustomEmote(id), TextEffect::Default, cx))
+                .on_click(move |_, _, cx| {
+                    play(&Body::CustomEmote(id), TextEffect::Default, Some(&name), cx)
+                })
                 .into_any_element()
         }
     };
@@ -1373,7 +1351,7 @@ impl Render for Conversation {
                                     .disabled(empty)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         if let Some((body, effect)) = this.text_draft(cx) {
-                                            play(&body, effect, cx);
+                                            play(&body, effect, None, cx);
                                         }
                                     })),
                             )
@@ -2274,8 +2252,26 @@ impl Settings {
 
     fn preview(&self, kind: Wheel, cx: &mut App) {
         let settings = self.overlay_settings(cx).with_sound(self.sound);
+        let body = match kind {
+            Wheel::Ping => Body::Ping {
+                index: 0,
+                location: None,
+            },
+            Wheel::Emote => Body::Emote {
+                index: 0,
+                location: None,
+            },
+        };
         cx.update_global::<Desktop, _>(|desktop, cx| {
-            desktop.overlay.play(kind, 0, None, None, settings, cx);
+            let model = desktop.model.read(cx);
+            desktop.overlay.play(
+                &body,
+                &model.profile.name,
+                None,
+                &model.emotes(),
+                settings,
+                cx,
+            );
         });
     }
 

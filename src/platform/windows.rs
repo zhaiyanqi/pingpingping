@@ -20,8 +20,9 @@ use windows_sys::Win32::{
 };
 
 use super::playback::{
-    FrameUpdate, TEXT_FONT_SIZE, TEXT_MARGIN, TEXT_MAX_LINES, TEXT_PADDING, TEXT_RADIUS,
-    TEXT_WIDTH, TextColors, TextFrame, text_anchor,
+    FrameUpdate, SenderTag, TAG_BACKGROUND, TAG_FONT_SIZE, TAG_FOREGROUND, TAG_HEIGHT, TAG_PADDING,
+    TAG_RADIUS, TAG_WIDTH, TEXT_FONT_SIZE, TEXT_MARGIN, TEXT_MAX_LINES, TEXT_PADDING, TEXT_RADIUS,
+    TEXT_WIDTH, TextColors, TextFrame, animation_top, centered_overlay, text_anchor,
 };
 use super::{AnimationOverlay, AudioCue, WheelContents, start_audio, wheel::WheelView};
 use crate::gesture::{
@@ -370,14 +371,6 @@ pub(crate) fn normalized(position: Position) -> Location {
             .clamp(0.0, 1.0),
         y: (f64::from(point.y - bounds.top) / f64::from((bounds.bottom - bounds.top).max(1)))
             .clamp(0.0, 1.0),
-    }
-}
-
-fn fit(point: POINT, bounds: RECT, size: u32) -> POINT {
-    let edge = size as i32;
-    POINT {
-        x: (point.x - edge / 2).clamp(bounds.left, (bounds.right - edge).max(bounds.left)),
-        y: (point.y - edge / 2).clamp(bounds.top, (bounds.bottom - edge).max(bounds.top)),
     }
 }
 
@@ -793,9 +786,10 @@ impl Overlay {
 
 pub(super) fn animation_presenter(
     size: u32,
+    tag: SenderTag<'_>,
     local: Option<Position>,
     location: Option<Location>,
-) -> Option<(Option<u32>, impl FnMut(FrameUpdate))> {
+) -> Option<(Option<u32>, impl FnMut(FrameUpdate) + use<>)> {
     let (point, bounds, dpi) = if let Some(local) = local {
         let point = point(local);
         let (bounds, dpi) = screen(point, false);
@@ -810,18 +804,168 @@ pub(super) fn animation_presenter(
         (point, bounds, dpi)
     };
     let size = pixels(size, dpi);
-    let origin = fit(point, bounds, size);
+    let canvas = f64::from(size);
+    let scale = f64::from(dpi) / 96.0;
+    let offset = tag.offset * scale;
+    let screen_width = (bounds.right - bounds.left).max(0) as u32;
+    let screen_height = f64::from(bounds.bottom - bounds.top);
+    let left = centered_overlay(
+        f64::from(point.x - bounds.left),
+        canvas,
+        f64::from(screen_width),
+    );
+    let top = animation_top(
+        f64::from(point.y - bounds.top),
+        canvas,
+        screen_height,
+        offset + f64::from(pixels(TAG_HEIGHT, dpi)),
+    );
+    let origin = POINT {
+        x: bounds.left + left.round() as i32,
+        y: bounds.top + top.round() as i32,
+    };
+    let name = tag_surface(tag.name, dpi, screen_width).map(|surface| {
+        let left = centered_overlay(
+            left + canvas / 2.0,
+            f64::from(surface.width),
+            f64::from(screen_width),
+        );
+        let point = POINT {
+            x: bounds.left + left.round() as i32,
+            y: bounds.top + (top + canvas / 2.0 + offset).round() as i32,
+        };
+        let mut layer = Layer::new(false);
+        layer.surface = Some(surface);
+        (layer, point)
+    });
     let mut layer = None;
     Some((Some(size), move |update| {
+        let first_frame = layer.is_none();
         let layer = layer.get_or_insert_with(|| Layer::new(false));
         match update {
             FrameUpdate::Image(frame) => {
                 layer.frame(&frame);
                 layer.present(origin, 255);
+                if first_frame && let Some((layer, point)) = &name {
+                    layer.present(*point, 255);
+                }
             }
-            FrameUpdate::Opacity(opacity) => layer.present(origin, alpha_byte(opacity)),
+            FrameUpdate::Opacity(opacity) => {
+                let alpha = alpha_byte(opacity);
+                layer.present(origin, alpha);
+                if let Some((layer, point)) = &name {
+                    layer.present(*point, alpha);
+                }
+            }
         }
     }))
+}
+
+fn tag_surface(name: &str, dpi: u32, screen_width: u32) -> Option<Surface> {
+    let padding = pixels(TAG_PADDING, dpi);
+    let max_width = pixels(TAG_WIDTH, dpi).min(screen_width);
+    if max_width <= 2 * padding {
+        return None;
+    }
+    let text: Vec<u16> = name.encode_utf16().collect();
+    let measure = Surface::new(1, 1)?;
+    let font = unsafe {
+        CreateFontW(
+            -(pixels(TAG_FONT_SIZE, dpi) as i32),
+            0,
+            0,
+            0,
+            FW_SEMIBOLD as i32,
+            0,
+            0,
+            0,
+            u32::from(DEFAULT_CHARSET),
+            0,
+            0,
+            u32::from(ANTIALIASED_QUALITY),
+            0,
+            windows_sys::w!("Segoe UI"),
+        )
+    };
+    if font.is_null() {
+        return None;
+    }
+    let surface = (|| {
+        let flags = DT_NOPREFIX | DT_SINGLELINE;
+        let mut bounds = RECT::default();
+        unsafe {
+            let old_font = SelectObject(measure.dc, font);
+            DrawTextW(
+                measure.dc,
+                text.as_ptr(),
+                text.len() as i32,
+                &mut bounds,
+                flags | DT_CALCRECT,
+            );
+            SelectObject(measure.dc, old_font);
+        }
+        let width = (bounds.right.max(0) as u32 + 2 * padding).min(max_width);
+        let height = pixels(TAG_HEIGHT, dpi);
+        let mut surface = Surface::new(width, height)?;
+        surface.bytes_mut().fill(0);
+        let mut bounds = RECT {
+            left: padding as i32,
+            top: 0,
+            right: (width - padding) as i32,
+            bottom: height as i32,
+        };
+        unsafe {
+            let old_font = SelectObject(surface.dc, font);
+            SetTextColor(surface.dc, 0xffffff);
+            SetBkMode(surface.dc, TRANSPARENT as i32);
+            DrawTextW(
+                surface.dc,
+                text.as_ptr(),
+                text.len() as i32,
+                &mut bounds,
+                flags | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS,
+            );
+            SelectObject(surface.dc, old_font);
+            GdiFlush();
+        }
+
+        // GDI leaves alpha unset. Use the grayscale glyphs as coverage over the translucent card.
+        // GDI 不写入透明度，将灰度字形用作半透明底色上的覆盖率。
+        let mask: Vec<_> = surface
+            .bytes_mut()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|pixel| pixel[0])
+            .collect();
+        fill_text_card(
+            &mut surface,
+            pixels(TAG_RADIUS, dpi),
+            gpui_kit::rgba(TAG_BACKGROUND),
+        );
+        let color = gpui_kit::rgba(TAG_FOREGROUND);
+        let shadow_offset = (width * pixels(1, dpi)) as usize;
+        for (i, [b, g, r, a]) in surface
+            .bytes_mut()
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .enumerate()
+        {
+            let ink = f32::from(mask[i]) / 255.0;
+            let shadow = i
+                .checked_sub(shadow_offset)
+                .map_or(0.0, |i| f32::from(mask[i]) / 255.0);
+            let background = (1.0 - ink) * (1.0 - shadow);
+            *b = alpha_byte(ink * color.b + background * f32::from(*b) / 255.0);
+            *g = alpha_byte(ink * color.g + background * f32::from(*g) / 255.0);
+            *r = alpha_byte(ink * color.r + background * f32::from(*r) / 255.0);
+            *a = alpha_byte(1.0 - background * (1.0 - f32::from(*a) / 255.0));
+        }
+        Some(surface)
+    })();
+    unsafe { DeleteObject(font) };
+    surface
 }
 
 fn alpha_byte(opacity: f32) -> u8 {
@@ -935,7 +1079,14 @@ fn text_surface(
             return None;
         }
         let mut card = Surface::new(width, (height + 2 * padding) as u32)?;
-        fill_text_card(&mut card, pixels(TEXT_RADIUS, dpi), colors.background);
+        fill_text_card(
+            &mut card,
+            pixels(TEXT_RADIUS, dpi),
+            gpui_kit::Rgba {
+                a: 1.0,
+                ..colors.background
+            },
+        );
         let mut bounds = RECT {
             left: padding,
             top: padding,
@@ -997,6 +1148,7 @@ fn fill_text_card(surface: &mut Surface, radius: u32, color: gpui_kit::Rgba) {
             } else {
                 1.0
             };
+            let alpha = alpha * color.a;
             *pixel = [
                 alpha_byte(color.b * alpha),
                 alpha_byte(color.g * alpha),
