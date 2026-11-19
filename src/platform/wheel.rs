@@ -294,6 +294,7 @@ pub(super) struct WheelView {
     posters: Rc<HashMap<EmoteId, Pixmap>>,
     canvas: Option<Rc<RefCell<Canvas>>>,
     active: Option<Active>,
+    last_emote_page: usize,
     task: Option<Task<()>>,
 }
 
@@ -304,6 +305,7 @@ impl WheelView {
             posters: Rc::default(),
             canvas: None,
             active: None,
+            last_emote_page: 0,
             task: None,
         }
     }
@@ -321,26 +323,39 @@ impl WheelView {
             self.art = Rc::new(WheelArt::new(size));
             self.canvas = None;
         }
-        let now = Instant::now();
+        let selected = self.activate(contents, selected, present, Instant::now());
+        self.draw(cx);
+        selected
+    }
+
+    fn activate(
+        &mut self,
+        contents: WheelContents,
+        selected: Option<usize>,
+        present: Present,
+        now: Instant,
+    ) -> bool {
+        let previous = self.take_active();
         let mut motion = Motion::new(now);
-        if let Some(previous) = self
-            .active
-            .as_ref()
-            .filter(|previous| previous.contents.kind() == contents.kind())
+        if let Some(previous) =
+            previous.filter(|previous| previous.contents.kind() == contents.kind())
         {
-            motion = previous.motion.clone();
+            motion = previous.motion;
         }
         motion.visibility.animate(1.0, WHEEL_TIME, true, now);
+        let page = match &contents {
+            WheelContents::Ping => 0,
+            WheelContents::Emote(pages) => self.last_emote_page.min(pages.len() - 1),
+        };
         let mut active = Active {
             contents,
-            page: 0,
+            page,
             motion,
             present,
         };
         let selected = active.frame().occupied(selected);
         active.motion.select(selected, now);
         self.active = Some(active);
-        self.draw(cx);
         selected.is_some()
     }
 
@@ -401,9 +416,19 @@ impl WheelView {
     pub(super) fn hide(&mut self) {
         self.task.take();
         self.canvas = None;
-        if let Some(active) = self.active.take() {
+        if let Some(active) = self.take_active() {
             (active.present)(None);
         }
+    }
+
+    fn take_active(&mut self) -> Option<Active> {
+        let active = self.active.take()?;
+        // Remember the page when replacing or hiding the emote wheel, even after cancellation.
+        // 替换或隐藏表情轮盘时记住页码，即使本次手势已取消。
+        if active.contents.kind() == Wheel::Emote {
+            self.last_emote_page = active.page;
+        }
+        Some(active)
     }
 
     fn draw(&mut self, cx: &App) {
@@ -1068,6 +1093,39 @@ mod tests {
         assert_eq!(wheel.emote(0), None);
         assert!(wheel.active.as_mut().unwrap().turn_page(1));
         assert_eq!(wheel.emote(0), first[0]);
+    }
+
+    #[test]
+    fn reopened_emote_wheel_uses_the_last_displayed_page() {
+        let mut wheel = WheelView::new(WHEEL_SIZE);
+        let mut pages = vec![[None; 8]; 3];
+        pages[1][0] = Some(WheelEmote::BuiltIn(3));
+        pages[2][0] = Some(WheelEmote::BuiltIn(8));
+        let present: Present = Rc::new(|_| {});
+        let now = Instant::now();
+        let open_emotes = |wheel: &mut WheelView, pages| {
+            wheel.activate(WheelContents::Emote(pages), Some(0), present.clone(), now)
+        };
+
+        assert!(!open_emotes(&mut wheel, pages.clone()));
+        assert!(wheel.active.as_mut().unwrap().turn_page(2));
+        assert!(open_emotes(&mut wheel, pages.clone()));
+        assert_eq!(wheel.emote(0), pages[2][0]);
+
+        assert!(wheel.active.as_mut().unwrap().turn_page(-1));
+        wheel.hide();
+        assert!(open_emotes(&mut wheel, pages.clone()));
+        assert_eq!(wheel.emote(0), pages[1][0]);
+
+        assert!(wheel.active.as_mut().unwrap().turn_page(1));
+        wheel.activate(WheelContents::Ping, None, present.clone(), now);
+        assert!(open_emotes(&mut wheel, pages.clone()));
+        assert_eq!(wheel.emote(0), pages[2][0]);
+
+        assert!(open_emotes(&mut wheel, pages[..2].to_vec()));
+        assert_eq!(wheel.emote(0), pages[1][0]);
+        assert!(open_emotes(&mut wheel, pages.clone()));
+        assert_eq!(wheel.emote(0), pages[1][0]);
     }
 
     #[test]
