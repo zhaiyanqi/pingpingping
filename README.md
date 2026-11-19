@@ -26,7 +26,7 @@ rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
 .\target\x86_64-pc-windows-msvc\debug\pingpingping.exe
 ```
 
-素材已嵌入 exe。若脚本找不到 `fxc.exe`，在 Visual Studio Installer 中检查 SDK 是否已安装，或把环境变量 `GPUI_FXC_PATH` 设为该文件的完整路径。
+素材和程序图标已嵌入 exe。程序、通知区域、任务栏和窗口使用「敌人消失」信号的金色问号图案。若脚本找不到 `fxc.exe`，在 Visual Studio Installer 中检查 SDK 是否已安装，或把环境变量 `GPUI_FXC_PATH` 设为该文件的完整路径。
 
 ## macOS 编译
 
@@ -42,7 +42,7 @@ open dist/PingPingPing.app
 open dist/debug/PingPingPing.app
 ```
 
-也可以用 `cargo run --release --locked` 直接运行。首次使用全局轮盘时，在应用设置中请求输入监控权限。绑定侧键后，还需在「隐私与安全性 → 辅助功能」中允许 PingPingPing 拦截侧键。若授权后轮盘仍不可用，退出并重新打开应用。
+访达和 Dock 使用金色问号图标，菜单栏使用随系统外观着色的单色问号。也可以用 `cargo run --release --locked` 直接运行。首次使用全局轮盘时，在应用设置中请求输入监控权限。绑定侧键后，还需在「隐私与安全性 → 辅助功能」中允许 PingPingPing 拦截侧键。若授权后轮盘仍不可用，退出并重新打开应用。
 
 ## 局域网连接
 

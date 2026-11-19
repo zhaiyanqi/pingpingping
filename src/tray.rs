@@ -46,12 +46,19 @@ pub(crate) fn install(sender: Sender<Command>, muted: bool) -> anyhow::Result<Tr
         (mute.id().clone(), Command::ToggleMute),
         (quit.id().clone(), Command::Quit),
     ];
-    let pixels = image::load_from_memory(include_bytes!("../assets/textures/omw_cyan.png"))?
-        .resize_exact(32, 32, image::imageops::FilterType::Lanczos3)
-        .into_rgba8();
+    #[cfg(target_os = "windows")]
+    let image = Icon::from_resource(1, Some((32, 32)))?;
+    #[cfg(target_os = "macos")]
+    let image = {
+        let pixels = image::load_from_memory(include_bytes!("../assets/icons/macos-menu-bar.png"))?
+            .into_rgba8();
+        let (width, height) = pixels.dimensions();
+        Icon::from_rgba(pixels.into_raw(), width, height)?
+    };
     let icon = TrayIconBuilder::new()
         .with_tooltip("PingPingPing")
-        .with_icon(Icon::from_rgba(pixels.into_raw(), 32, 32)?)
+        .with_icon(image)
+        .with_icon_as_template(cfg!(target_os = "macos"))
         .with_menu(Box::new(menu))
         .build()?;
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {

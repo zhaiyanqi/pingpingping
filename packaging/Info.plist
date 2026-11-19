@@ -8,6 +8,8 @@
     <string>PingPingPing</string>
     <key>CFBundleExecutable</key>
     <string>pingpingping</string>
+    <key>CFBundleIconFile</key>
+    <string>pingpingping.icns</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

@@ -26,8 +26,9 @@ case "$#:${1-}" in
         ;;
 esac
 
-mkdir -p "$bundle/Contents/MacOS"
+mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
 cp packaging/Info.plist "$bundle/Contents/Info.plist"
+cp packaging/pingpingping.icns "$bundle/Contents/Resources/"
 cp "target/$profile/pingpingping" "$bundle/Contents/MacOS/"
 codesign --force --sign - "$bundle"
 codesign --verify --strict "$bundle"

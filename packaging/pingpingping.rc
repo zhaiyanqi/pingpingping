@@ -1,0 +1,3 @@
+// GPUI loads icon resource 1 for its window class.
+// GPUI 使用编号为 1 的图标资源注册窗口类。
+1 ICON "pingpingping.ico"

@@ -26,7 +26,7 @@ Double-click the [Release script](script/build-windows-release.bat) or the [Debu
 .\target\x86_64-pc-windows-msvc\debug\pingpingping.exe
 ```
 
-The executable embeds its media. If `fxc.exe` is missing, check the SDK installation or set `GPUI_FXC_PATH` to the compiler's absolute path.
+The executable, notification area, taskbar, and windows use the gold question mark from the Enemy Missing ping. The executable embeds its icon and media. If `fxc.exe` is missing, check the SDK installation or set `GPUI_FXC_PATH` to the compiler's absolute path.
 
 ## Build on macOS
 
@@ -42,7 +42,7 @@ open dist/PingPingPing.app
 open dist/debug/PingPingPing.app
 ```
 
-You can also run `cargo run --release --locked`. Request Input Monitoring through Settings for global gestures. When using a side-button binding, also grant PingPingPing Accessibility access in Privacy & Security. Restart the app if gestures remain unavailable after granting access.
+Finder and the Dock use the gold question mark. The menu bar uses a monochrome question mark that adapts to the system appearance. You can also run `cargo run --release --locked`. Request Input Monitoring through Settings for global gestures. When using a side-button binding, also grant PingPingPing Accessibility access in Privacy & Security. Restart the app if gestures remain unavailable after granting access.
 
 ## Connect on a LAN
 
