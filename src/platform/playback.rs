@@ -120,6 +120,15 @@ fn prepare(image: RgbaImage, size: Option<u32>) -> RgbaImage {
     image
 }
 
+fn has_visible_pixels(image: &RgbaImage) -> bool {
+    image
+        .as_raw()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .any(|pixel| pixel[3] != 0)
+}
+
 fn decode(animation: &Animation, size: Option<u32>, send: async_channel::Sender<TimedFrame>) {
     let mut sent = false;
     'cycles: while !send.is_closed() {
@@ -134,13 +143,9 @@ fn decode(animation: &Animation, size: Option<u32>, send: async_channel::Sender<
             break;
         }
 
-        // Reopen the byte stream for each pass. Only two prepared frames wait in the queue.
-        // 每轮重新读取素材字节，队列中最多等待两张已处理的帧。
-        let mut frames = decoder.into_frames().peekable();
-        if frames.peek().is_none() {
-            break;
-        }
-        for frame in frames {
+        let mut visible = false;
+        let mut pending_blank: Option<TimedFrame> = None;
+        for frame in decoder.into_frames() {
             let Ok(frame) = frame else { break 'cycles };
             if send.is_closed() {
                 return;
@@ -151,13 +156,30 @@ fn decode(animation: &Animation, size: Option<u32>, send: async_channel::Sender<
             } else {
                 Duration::from_secs_f64(f64::from(n) / f64::from(d.max(1)) / 1000.0)
             };
-            if send
-                .send_blocking((prepare(frame.into_buffer(), size), delay))
-                .is_err()
+            let image = frame.into_buffer();
+            // Keep transparent frames inside a cycle, and skip the transparent padding at its edges.
+            // 保留一轮动画中间的透明帧，跳过首尾用于填充的透明帧。
+            if !has_visible_pixels(&image) {
+                if let Some((_, total)) = &mut pending_blank {
+                    *total += delay;
+                } else if visible {
+                    pending_blank = Some((image, delay));
+                }
+                continue;
+            }
+            if let Some((blank, delay)) = pending_blank.take()
+                && send.send_blocking((prepare(blank, size), delay)).is_err()
             {
                 return;
             }
+            if send.send_blocking((prepare(image, size), delay)).is_err() {
+                return;
+            }
+            visible = true;
             sent = true;
+        }
+        if !visible {
+            break;
         }
     }
     if !sent
@@ -192,14 +214,11 @@ async fn run(animation: Animation, size: Option<u32>, mut present: impl FnMut(Rg
             }
             present(current.0);
             smol::Timer::at(deadline.min(expires)).await;
-            match receive.recv().await {
-                Ok(next) => current = next,
-                Err(_) => break,
-            }
+            let Ok(next) = receive.recv().await else {
+                return;
+            };
+            current = next;
         }
-        // A still frame or a truncated file holds its last image until the same timeout.
-        // 静态图片或中途损坏的素材保留末帧，使用相同的超时时间。
-        smol::Timer::at(expires).await;
     };
     smol::future::or(frames, async {
         smol::Timer::at(expires).await;
@@ -267,19 +286,30 @@ mod tests {
     }
 
     #[test]
-    fn decoder_restarts_from_the_first_frame_after_a_complete_pass() {
-        let bytes = EMOTES[0].animation;
-        let first_pass = WebPDecoder::new(Cursor::new(bytes)).unwrap().into_frames();
-        let animation = Animation::webp(bytes, 110, Duration::from_secs(8));
-        smol::block_on(async {
-            let (send, receive) = async_channel::bounded(2);
-            let _worker = smol::unblock(move || decode(&animation, None, send));
-            let first = receive.recv().await.unwrap();
-            for _ in first_pass.skip(1) {
-                receive.recv().await.unwrap();
-            }
-            assert_eq!(receive.recv().await.unwrap(), first);
-        });
+    fn ping_and_emote_restart_without_transparent_padding() {
+        for clip in [PINGS[3], EMOTES[0]] {
+            let animation = Animation::webp(clip.animation, 110, Duration::from_secs(8));
+            smol::block_on(async {
+                let (send, receive) = async_channel::bounded(2);
+                let _worker = smol::unblock(move || decode(&animation, None, send));
+                for _ in 0..2 {
+                    let frames = WebPDecoder::new(Cursor::new(clip.animation))
+                        .unwrap()
+                        .into_frames()
+                        .map(Result::unwrap)
+                        .filter(|frame| has_visible_pixels(frame.buffer()));
+                    for frame in frames {
+                        let (image, delay) = receive.recv().await.unwrap();
+                        let (n, d) = frame.delay().numer_denom_ms();
+                        assert_eq!(image, prepare(frame.buffer().clone(), None));
+                        assert_eq!(
+                            delay,
+                            Duration::from_secs_f64(f64::from(n) / f64::from(d) / 1000.0)
+                        );
+                    }
+                }
+            });
+        }
     }
 
     #[test]

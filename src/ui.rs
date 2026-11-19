@@ -885,11 +885,13 @@ impl Settings {
                     .to_string(),
             )
         });
-        let ping_size = setting_slider(cx, PING_SIZE, 1, overlay.ping_size);
-        let emote_size = setting_slider(cx, EMOTE_SIZE, 1, overlay.emote_size);
-        let ping_timeout = setting_slider(cx, ANIMATION_TIMEOUT, 100, overlay.ping_timeout_ms);
-        let emote_timeout = setting_slider(cx, ANIMATION_TIMEOUT, 100, overlay.emote_timeout_ms);
-        let volume = setting_slider(cx, SOUND_VOLUME, 1, overlay.volume);
+        let ping_size = cx.new(|_| setting_slider(PING_SIZE, 1, overlay.ping_size));
+        let emote_size = cx.new(|_| setting_slider(EMOTE_SIZE, 1, overlay.emote_size));
+        let ping_timeout =
+            cx.new(|_| setting_slider(ANIMATION_TIMEOUT, 100, overlay.ping_timeout_ms));
+        let emote_timeout =
+            cx.new(|_| setting_slider(ANIMATION_TIMEOUT, 100, overlay.emote_timeout_ms));
+        let volume = cx.new(|_| setting_slider(SOUND_VOLUME, 1, overlay.volume));
         let mut subscriptions = vec![
             cx.observe(&model, |_, _, cx| cx.notify()),
             cx.subscribe_in(&ip, window, |this, _, event, _, cx| {
@@ -1043,19 +1045,14 @@ impl Settings {
     }
 }
 
-fn setting_slider(
-    cx: &mut App,
-    range: RangeInclusive<u32>,
-    step: u32,
-    value: u32,
-) -> Entity<SliderState> {
-    cx.new(|_| {
-        SliderState::new()
-            .min(*range.start() as f32)
-            .max(*range.end() as f32)
-            .step(step as f32)
-            .default_value(value as f32)
-    })
+fn setting_slider(range: RangeInclusive<u32>, step: u32, value: u32) -> SliderState {
+    // Each bound setter clamps the current value, so expand the upper bound first.
+    // 每次设置边界都会限制当前值，因此先扩大上限。
+    SliderState::new()
+        .max(*range.end() as f32)
+        .min(*range.start() as f32)
+        .step(step as f32)
+        .default_value(value as f32)
 }
 
 fn slider_field(label: &'static str, value: String, slider: Slider) -> Div {
@@ -1208,5 +1205,17 @@ impl Render for Settings {
                             .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ANIMATION_TIMEOUT, setting_slider};
+
+    #[test]
+    fn timeout_slider_accepts_the_saved_millisecond_range() {
+        let state = setting_slider(ANIMATION_TIMEOUT, 100, 3200);
+        assert_eq!((state.min_value(), state.max_value()), (1000.0, 8000.0));
+        assert_eq!(state.value().start(), 3200.0);
     }
 }
