@@ -7,7 +7,7 @@ use std::io::{self, BufWriter, Write as _};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, ensure};
 use async_channel::Sender;
@@ -20,6 +20,7 @@ use crate::emotes::{EmoteId, EmoteStore};
 use crate::room::{Room, RoomConfig, RoomEvent, RoomMember};
 
 const HISTORY_LIMIT: usize = 600;
+pub(crate) const ROOM_RECONNECT_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Location {
@@ -385,7 +386,14 @@ struct Entry {
 
 struct PendingRoom {
     config: RoomConfig,
+    mode: RoomOpenMode,
     _task: Task<()>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RoomOpenMode {
+    Once,
+    Reconnect,
 }
 
 pub(crate) struct Model {
@@ -519,6 +527,12 @@ impl Model {
         self.pending_room.as_ref().map(|pending| pending.config)
     }
 
+    pub(crate) fn is_reconnecting(&self) -> bool {
+        self.pending_room
+            .as_ref()
+            .is_some_and(|pending| pending.mode == RoomOpenMode::Reconnect)
+    }
+
     pub(crate) fn room_members(&self) -> Option<(Uuid, &[RoomMember])> {
         self.room.as_ref()?.members()
     }
@@ -614,23 +628,56 @@ impl Model {
         incoming: Sender<RoomEvent>,
         cx: &mut Context<Self>,
     ) {
+        self.start_room(config, incoming, RoomOpenMode::Once, cx);
+    }
+
+    fn start_room(
+        &mut self,
+        config: RoomConfig,
+        incoming: Sender<RoomEvent>,
+        mode: RoomOpenMode,
+        cx: &mut Context<Self>,
+    ) {
         if self.joined() || self.pending_room.is_some() {
             return;
         }
-        let name = self.profile.name.clone();
+        let reconnecting = mode == RoomOpenMode::Reconnect;
+        if !reconnecting {
+            self.room_error = None;
+        }
         let emotes = self.emotes();
-        self.room_error = None;
+        let mut retry_timer =
+            reconnecting.then(|| cx.background_executor().timer(ROOM_RECONNECT_INTERVAL));
         let task = cx.spawn(async move |model, cx| {
-            let room = Room::open(config, name, incoming, emotes).await;
-            let _ = model.update(cx, |model, cx| {
-                model.pending_room.take();
-                let result = room.and_then(|room| model.connect(room));
-                model.room_error = result.err().map(|error| format!("{error:#}"));
-                cx.notify();
-            });
+            loop {
+                if let Some(wait) = retry_timer.take() {
+                    wait.await;
+                    // Measure the interval from the start of each attempt, including the handshake.
+                    // 从每次尝试开始计时，间隔包含握手时间。
+                    retry_timer = Some(cx.background_executor().timer(ROOM_RECONNECT_INTERVAL));
+                }
+                let Ok(name) = model.read_with(cx, |model, _| model.profile.name.clone()) else {
+                    break;
+                };
+                let room = Room::open(config, name, incoming.clone(), emotes.clone()).await;
+                let try_again = model.update(cx, |model, cx| {
+                    let result = room.and_then(|room| model.connect(room));
+                    let try_again = reconnecting && result.is_err();
+                    if !try_again {
+                        model.pending_room.take();
+                    }
+                    model.room_error = result.err().map(|error| format!("{error:#}"));
+                    cx.notify();
+                    try_again
+                });
+                if !matches!(try_again, Ok(true)) {
+                    break;
+                }
+            }
         });
         self.pending_room = Some(PendingRoom {
             config,
+            mode,
             _task: task,
         });
         cx.notify();
@@ -671,15 +718,24 @@ impl Model {
         self.room_key.clear();
     }
 
-    pub(crate) fn closed(&mut self, id: Uuid, reason: String) -> bool {
-        if self.room.as_ref().map(Room::id) != Some(id) {
-            return false;
-        }
-        // An unexpected closure still allows restoring the saved room on the next launch.
-        // 房间意外关闭时保留恢复设置，下次启动仍可恢复房间。
+    pub(crate) fn closed(
+        &mut self,
+        id: Uuid,
+        reason: String,
+        incoming: Sender<RoomEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(room) = self.room.as_ref().filter(|room| room.id() == id) else {
+            return;
+        };
+        let config = room.config();
         self.leave_room();
         self.room_error = Some(reason);
-        true
+        if matches!(config, RoomConfig::Join(_)) {
+            self.start_room(config, incoming, RoomOpenMode::Reconnect, cx);
+        } else {
+            cx.notify();
+        }
     }
 
     pub(crate) fn send(
@@ -840,12 +896,14 @@ mod tests {
             },
         )
         .await;
-        guest.update(cx, |model, _| {
-            assert!(model.closed(id, reason));
+        guest.update(cx, |model, cx| {
+            model.closed(id, reason, events.clone(), cx);
             assert!(!model.joined());
             assert!(model.room_key().is_empty());
+            assert!(model.is_reconnecting());
             model.finish_writes().unwrap().join().unwrap();
         });
+        drop(guest);
 
         let guest = cx.new(|_| Model::load(data.clone()).unwrap());
         guest.update(cx, |model, cx| {
@@ -858,6 +916,73 @@ mod tests {
             assert!(!model.joined());
             assert!(model.room_error.is_some());
             assert_eq!(model.startup_room(), Some(config));
+            model.finish_writes().unwrap().join().unwrap();
+        });
+    }
+
+    #[gpui_kit::test]
+    #[ignore = "requires TCP loopback access"]
+    async fn guest_retries_every_thirty_seconds_until_reconnected_or_cancelled(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::AppContext as _;
+        use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+
+        cx.dispatcher.allow_parking();
+        let data = std::env::temp_dir().join(format!("pingpingping-retry-{}", Uuid::new_v4()));
+        cx.on_quit({
+            let data = data.clone();
+            move || fs::remove_dir_all(data).unwrap()
+        });
+        let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let SocketAddr::V4(address) = reservation.local_addr().unwrap() else {
+            unreachable!()
+        };
+        drop(reservation);
+
+        let config = RoomConfig::Join(address);
+        let (guest_events, _guest_inbox) = async_channel::bounded(8);
+        let guest = cx.new(|_| Model::load(data.clone()).unwrap());
+        guest.update(cx, |model, cx| {
+            model.start_room(config, guest_events.clone(), RoomOpenMode::Reconnect, cx);
+        });
+        let executor = cx.executor();
+        executor.advance_clock(Duration::from_secs(29));
+        guest.update(cx, |model, _| {
+            assert!(model.room_error.is_none());
+            assert!(model.is_reconnecting());
+        });
+        executor.advance_clock(Duration::from_secs(1));
+        cx.condition(&guest, |model, _| model.room_error.is_some())
+            .await;
+        assert!(cx.read_entity(&guest, |model, _| model.is_reconnecting()));
+
+        let (host_events, _host_inbox) = async_channel::bounded(8);
+        let mut host = Room::open(
+            RoomConfig::Host(address),
+            "主机".into(),
+            host_events,
+            EmoteStore::new(&data.join("host")),
+        )
+        .await
+        .unwrap();
+        host.activate();
+        executor.advance_clock(Duration::from_secs(30));
+        cx.condition(&guest, |model, _| model.joined()).await;
+        guest.update(cx, |model, cx| {
+            assert_eq!(model.connection(), Some(config));
+            assert!(!model.is_reconnecting());
+            let id = model.room.as_ref().unwrap().id();
+            model.closed(id, "主机已断开连接".into(), guest_events, cx);
+            assert!(model.is_reconnecting());
+            model.disconnect();
+            assert!(model.startup_room().is_none());
+        });
+        executor.advance_clock(Duration::from_secs(60));
+        guest.update(cx, |model, _| {
+            assert!(!model.joined());
+            assert!(model.pending_room().is_none());
+            assert!(model.room_error.is_none());
             model.finish_writes().unwrap().join().unwrap();
         });
     }

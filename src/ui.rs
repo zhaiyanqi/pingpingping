@@ -32,8 +32,8 @@ use crate::emotes::{EmoteId, EmoteStore, LibraryEmote};
 use crate::gesture::{GestureEvent, TriggerKey, Triggers, Wheel};
 use crate::model::{
     ANIMATION_TIMEOUT, Body, EMOTE_SIZE, EmotePage, Location, Message, Model, OverlaySettings,
-    PING_SIZE, Profile, SOUND_VOLUME, TextEffect, TextMotion, TextOverlaySettings, TextPosition,
-    WheelEmote, append_wheel_emote, wheel_has_emote,
+    PING_SIZE, Profile, ROOM_RECONNECT_INTERVAL, SOUND_VOLUME, TextEffect, TextMotion,
+    TextOverlaySettings, TextPosition, WheelEmote, append_wheel_emote, wheel_has_emote,
 };
 use crate::platform::{
     self, AnimationPosition, InputMonitor, Overlay, WheelContents, WheelFrame, WheelPreview,
@@ -140,11 +140,10 @@ pub(crate) fn start(cx: &mut App) {
                             cx.notify();
                         }
                     }),
-                    RoomEvent::Closed(id, reason) => model.update(cx, |model, cx| {
-                        if model.closed(id, reason) {
-                            cx.notify();
-                        }
-                    }),
+                    RoomEvent::Closed(id, reason) => {
+                        let incoming = cx.global::<Desktop>().incoming.clone();
+                        model.update(cx, |model, cx| model.closed(id, reason, incoming, cx));
+                    }
                 }
             });
         }
@@ -1386,6 +1385,8 @@ impl Render for Conversation {
                                         },
                                         connection.address()
                                     )
+                                } else if model.is_reconnecting() {
+                                    "本机 · 自动重连中".into()
                                 } else if let Some(config) = model.pending_room() {
                                     pending_room_label(config).into()
                                 } else {
@@ -2651,6 +2652,7 @@ impl Settings {
         let connection = model.connection();
         let pending = model.pending_room();
         let busy = pending.is_some();
+        let reconnecting = model.is_reconnecting();
         let room_error = self
             .connection_error
             .clone()
@@ -2674,8 +2676,10 @@ impl Settings {
                         .child(Button::new("join-room").primary().label("连接").on_click(cx.listener(|this, _, _, cx| this.connect(false, cx))))
                         .child(Button::new("host-room").label("创建房间").on_click(cx.listener(|this, _, _, cx| this.connect(true, cx)))))
                     .when_some(pending, |row, config| row
-                        .child(Button::new("pending-room").label(pending_room_label(config)).disabled(true))
-                        .child(Button::new("cancel-room").ghost().label("取消").on_click(cx.listener(|this, _, _, cx| this.disconnect(cx)))))
+                        .when(reconnecting, |row| row.child(div().self_center().text_sm().text_color(theme.muted_foreground)
+                            .child(format!("每 {} 秒尝试重连", ROOM_RECONNECT_INTERVAL.as_secs()))))
+                        .when(!reconnecting, |row| row.child(Button::new("pending-room").label(pending_room_label(config)).disabled(true)))
+                        .child(Button::new("cancel-room").ghost().label(if reconnecting { "取消重连" } else { "取消" }).on_click(cx.listener(|this, _, _, cx| this.disconnect(cx)))))
                     .when_some(connection, |row, config| row
                         .child(Button::new("copy-address").label("复制地址").on_click(move |_, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(config.address().to_string()));
