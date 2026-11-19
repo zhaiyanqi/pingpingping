@@ -27,7 +27,12 @@
 - Retain GPUI state and subscriptions in the owning entity. Use the GPUI Kit coding and design guides for window and component changes. 在所属实体中保留 GPUI 状态和订阅。修改窗口或组件时遵循 GPUI Kit 的开发与设计指南。
 - Keep asset indices stable for the room protocol and history. Validate incoming frames before they can reach rendering or storage. 保持素材索引与房间协议、历史兼容。消息须通过帧校验后才能进入渲染或存储。
 - Keep `Cargo.lock` tracked. Update both README files when build steps or user workflows change. Keep build outputs and personal data out of Git. 提交 `Cargo.lock`。构建或使用流程有变化时更新两份 README。构建产物和个人数据不纳入 Git。
-- Write each commit subject as `<English summary> | <简体中文摘要>` so changelog scripts can split it on ` | `. 每次提交均使用此双语标题格式，英文在前、简体中文在后，供更新日志脚本按固定分隔符解析。
+
+## Commits / 提交约定
+
+- After completing a code change and running the relevant checks, commit the files for that task before reporting completion. Keep unrelated changes out of the commit. 每次完成代码修改并运行相关检查后，在汇报完成前及时提交本次任务的改动，避免混入无关改动。
+- Write every commit subject on a single line in the format `<English summary> | <简体中文摘要>`. Use exactly one literal ` | ` separator (one ASCII space on each side of `|`) so changelog scripts can split the two summaries. 每次提交的标题使用单行双语格式，英文在前，简体中文在后。分隔符 ` | ` 只能出现一次，竖线两侧各有一个半角空格，便于脚本拆分生成更新日志。
+- Example / 示例 `Fix the settings crash | 修复设置页闪退`
 
 ## Checks / 验证
 
