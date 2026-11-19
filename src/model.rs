@@ -240,6 +240,32 @@ pub(crate) enum WheelEmote {
 
 pub(crate) type EmotePage = [Option<WheelEmote>; DEFAULT_EMOTE_SLOTS.len()];
 
+pub(crate) fn wheel_has_emote(pages: &[EmotePage], emote: WheelEmote) -> bool {
+    pages.iter().any(|page| page.contains(&Some(emote)))
+}
+
+pub(crate) fn append_wheel_emote(pages: &mut Vec<EmotePage>, emote: WheelEmote) -> bool {
+    if wheel_has_emote(pages, emote) {
+        return false;
+    }
+    // Append after the last occupied slot on the final page and preserve gaps in the layout.
+    // 从末页最后一个已配置的槽位往后追加，保留布局里的空位。
+    if let Some(page) = pages.last_mut() {
+        let next = page
+            .iter()
+            .rposition(Option::is_some)
+            .map_or(0, |slot| slot + 1);
+        if let Some(slot) = page.get_mut(next) {
+            *slot = Some(emote);
+            return true;
+        }
+    }
+    let mut page = EmotePage::default();
+    page[0] = Some(emote);
+    pages.push(page);
+    true
+}
+
 fn default_emote_pages() -> Vec<EmotePage> {
     vec![DEFAULT_EMOTE_SLOTS.map(|index| Some(WheelEmote::BuiltIn(index)))]
 }
@@ -457,6 +483,15 @@ impl Model {
         self.apply(profile)
     }
 
+    pub(crate) fn add_wheel_emote(&mut self, emote: WheelEmote) -> Result<bool> {
+        let mut profile = self.profile.clone();
+        if !append_wheel_emote(&mut profile.emote_pages, emote) {
+            return Ok(false);
+        }
+        self.apply(profile)?;
+        Ok(true)
+    }
+
     pub(crate) fn apply(&mut self, mut profile: Profile) -> Result<()> {
         ensure!(
             !profile.name.is_empty()
@@ -650,6 +685,41 @@ mod tests {
         loaded.normalize();
         page[4] = None;
         assert_eq!(loaded.emote_pages, vec![[None; 8], page]);
+    }
+
+    #[test]
+    fn wheel_additions_append_and_persist_without_displacing_existing_emotes() {
+        let folder = std::env::temp_dir().join(format!("pingpingping-wheel-{}", Uuid::new_v4()));
+        let mut model = Model::load(folder.clone()).unwrap();
+        let existing = [
+            Some(WheelEmote::BuiltIn(1)),
+            None,
+            Some(WheelEmote::BuiltIn(2)),
+            None,
+            None,
+            None,
+            None,
+            Some(WheelEmote::BuiltIn(3)),
+        ];
+        let profile = Profile {
+            emote_pages: vec![existing],
+            ..model.profile.clone()
+        };
+        model.apply(profile).unwrap();
+        let first = WheelEmote::BuiltIn(4);
+        let second = WheelEmote::BuiltIn(5);
+        assert!(model.add_wheel_emote(first).unwrap());
+        assert!(model.add_wheel_emote(second).unwrap());
+        assert!(!model.add_wheel_emote(WheelEmote::BuiltIn(1)).unwrap());
+        assert!(!model.add_wheel_emote(first).unwrap());
+        let mut appended = EmotePage::default();
+        appended[0] = Some(first);
+        appended[1] = Some(second);
+        assert_eq!(model.profile.emote_pages, vec![existing, appended]);
+        let saved: Profile = load_json(&folder.join("settings.json")).unwrap().unwrap();
+        assert_eq!(saved.emote_pages, vec![existing, appended]);
+        model.finish_writes().unwrap().join().unwrap();
+        fs::remove_dir_all(folder).unwrap();
     }
 
     #[test]

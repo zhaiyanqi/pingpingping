@@ -128,6 +128,23 @@ impl EmoteStore {
         Ok(LibraryEmote { id, name })
     }
 
+    pub(crate) fn save_received(&self, id: EmoteId) -> Result<LibraryEmote> {
+        ensure!(self.contains(id), "表情图片不可用");
+        // Received images already have cached bytes and a poster. A name adds them to the library.
+        // 收到的表情已有原图和预览缓存，写入名称即可加入表情库。
+        let path = self.path(id, "name");
+        let name = match fs::read_to_string(&path) {
+            Ok(name) => name,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = String::from("收藏表情");
+                write_atomic(&path, name.as_bytes()).context("无法保存表情名称")?;
+                name
+            }
+            Err(error) => return Err(error).context("无法读取表情名称"),
+        };
+        Ok(LibraryEmote { id, name })
+    }
+
     pub(crate) fn library(&self) -> Result<Vec<LibraryEmote>> {
         let entries = match fs::read_dir(&self.0) {
             Ok(entries) => entries,
@@ -290,6 +307,30 @@ mod tests {
         assert_eq!(library.len(), 1);
         assert_eq!(library[0].id(), id);
         assert_eq!(library[0].name(), "表情");
+        fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn received_emotes_join_the_library_on_request_and_keep_existing_names() {
+        let data = std::env::temp_dir().join(format!("pingpingping-received-{}", Uuid::new_v4()));
+        let store = EmoteStore::new(&data);
+        let bytes = EMOTES[0].image;
+        let id = EmoteId::from_bytes(bytes);
+        assert!(store.save_received(id).is_err());
+
+        store.save(id, bytes).unwrap();
+        assert!(store.library().unwrap().is_empty());
+        assert_eq!(store.save_received(id).unwrap().id(), id);
+        assert_eq!(store.save_received(id).unwrap().name(), "收藏表情");
+        assert_eq!(store.library().unwrap().len(), 1);
+
+        let path = data.join("喜欢的表情.png");
+        fs::write(&path, bytes).unwrap();
+        store.import(&path).unwrap();
+        let saved = store.save_received(id).unwrap();
+        assert_eq!(saved.name(), "喜欢的表情");
+        assert_eq!(store.read(id).unwrap(), bytes);
+        assert_eq!(EmoteStore::new(&data).library().unwrap().len(), 1);
         fs::remove_dir_all(data).unwrap();
     }
 }

@@ -33,11 +33,16 @@ use crate::gesture::{GestureEvent, TriggerKey, Triggers, Wheel};
 use crate::model::{
     ANIMATION_TIMEOUT, Body, EMOTE_SIZE, EmotePage, Message, Model, OverlaySettings, PING_SIZE,
     Profile, SOUND_VOLUME, TextEffect, TextMotion, TextOverlaySettings, TextPosition, WheelEmote,
+    append_wheel_emote, wheel_has_emote,
 };
 use crate::platform::{self, InputMonitor, Overlay, WheelContents, WheelFrame, WheelPreview};
 use crate::room::{DEFAULT_PORT, Room, RoomConfig, RoomEvent};
 
 gpui_kit::actions!([OpenChat, OpenHistory, OpenSettings, Quit]);
+
+struct WheelEmoteAdded(WheelEmote);
+
+impl EventEmitter<WheelEmoteAdded> for Model {}
 
 // The GPUI thread owns window and overlay state. Workers send typed events.
 // GPUI 线程管理窗口与悬浮层状态，后台任务通过带类型的事件与其通信。
@@ -510,6 +515,17 @@ impl LocalEmotes {
         self.import_image(None, |_, _| {}, cx);
     }
 
+    fn contains(&self, id: EmoteId) -> bool {
+        self.entries.iter().any(|emote| emote.id() == id)
+    }
+
+    fn remember(&mut self, emote: LibraryEmote) -> EmoteId {
+        let id = emote.id();
+        self.entries.retain(|known| known.id() != id);
+        self.entries.insert(0, emote);
+        id
+    }
+
     fn import_image(
         &mut self,
         path: Option<PathBuf>,
@@ -544,19 +560,60 @@ impl LocalEmotes {
             let _ = weak.update(cx, |this, cx| {
                 this.task.take();
                 let id = match result {
-                    Ok(Some(emote)) => {
-                        let id = emote.id();
-                        this.entries.retain(|known| known.id() != id);
-                        this.entries.insert(0, emote);
-                        Some(id)
-                    }
-                    Ok(None) => None,
+                    Ok(emote) => emote.map(|emote| this.remember(emote)),
                     Err(error) => {
                         this.error = Some(format!("{error:#}"));
                         None
                     }
                 };
                 completed(id, cx);
+                cx.notify();
+            });
+        }));
+        cx.notify();
+        true
+    }
+
+    fn save_received(
+        &mut self,
+        emote: WheelEmote,
+        completed: impl FnOnce(anyhow::Result<()>, &mut App) + 'static,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.task.is_some() {
+            return false;
+        }
+        let store = self.store.clone();
+        self.task = Some(cx.spawn(async move |weak, cx| {
+            let result = match emote {
+                WheelEmote::Custom(id) => smol::unblock(move || store.save_received(id))
+                    .await
+                    .map(Some),
+                WheelEmote::BuiltIn(_) => Ok(None),
+            };
+            let _ = weak.update(cx, |this, cx| {
+                this.task.take();
+                let result = result.and_then(|entry| {
+                    let new_entry = entry.filter(|entry| !this.contains(entry.id()));
+                    let library_changed = new_entry.is_some();
+                    if let Some(entry) = new_entry {
+                        this.remember(entry);
+                    }
+                    let model = cx.global::<Desktop>().model.clone();
+                    let added = model.update(cx, |model, cx| {
+                        let added = model.add_wheel_emote(emote)?;
+                        if added {
+                            cx.emit(WheelEmoteAdded(emote));
+                            cx.notify();
+                        }
+                        Ok::<_, anyhow::Error>(added)
+                    })?;
+                    if added || library_changed {
+                        refresh_wheel_posters(cx);
+                    }
+                    Ok(())
+                });
+                completed(result, cx);
                 cx.notify();
             });
         }));
@@ -571,6 +628,13 @@ enum Filter {
     Emotes,
 }
 
+#[derive(Clone)]
+enum EmoteSaveStatus {
+    Saving,
+    Saved,
+    Failed(String),
+}
+
 struct Conversation {
     model: Entity<Model>,
     input: Option<Entity<TextareaState>>,
@@ -582,6 +646,7 @@ struct Conversation {
     messages: ListState,
     rows: Vec<(usize, Uuid)>,
     error: Option<String>,
+    emote_save: Option<(Uuid, EmoteSaveStatus)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -621,7 +686,10 @@ impl Conversation {
         })];
         if !history {
             let library = cx.global::<Desktop>().library.clone();
-            subscriptions.push(cx.observe(&library, |_, _, cx| cx.notify()));
+            subscriptions.push(cx.observe(&library, |this, _, cx| {
+                this.messages.remeasure();
+                cx.notify();
+            }));
         }
         if let Some(input) = &input {
             subscriptions.push(
@@ -646,6 +714,7 @@ impl Conversation {
             messages,
             rows: Vec::new(),
             error: None,
+            emote_save: None,
             _subscriptions: subscriptions,
         };
         conversation.refresh_messages(cx);
@@ -740,6 +809,32 @@ impl Conversation {
         }
         cx.notify();
         sent
+    }
+
+    fn save_received_emote(&mut self, id: Uuid, emote: WheelEmote, cx: &mut Context<Self>) {
+        let library = cx.global::<Desktop>().library.clone();
+        let owner = cx.weak_entity();
+        if library.update(cx, |library, cx| {
+            library.save_received(
+                emote,
+                move |result, cx| {
+                    let _ = owner.update(cx, |this, cx| {
+                        let status = match result {
+                            Ok(()) => EmoteSaveStatus::Saved,
+                            Err(error) => {
+                                EmoteSaveStatus::Failed(format!("无法添加表情。{error:#}"))
+                            }
+                        };
+                        this.emote_save = Some((id, status));
+                        cx.notify();
+                    });
+                },
+                cx,
+            )
+        }) {
+            self.emote_save = Some((id, EmoteSaveStatus::Saving));
+            cx.notify();
+        }
     }
 
     fn picker(wheel: Wheel, cx: &Context<Self>) -> Popover {
@@ -870,7 +965,61 @@ impl Conversation {
     }
 }
 
-fn bubble(message: &Message, mine: bool, cx: &App) -> impl IntoElement {
+fn received_emote_action(
+    message: &Message,
+    owner: &WeakEntity<Conversation>,
+    status: Option<&EmoteSaveStatus>,
+    cx: &App,
+) -> Option<Div> {
+    let emote = match message.body {
+        Body::Emote { index, .. } => WheelEmote::BuiltIn(index),
+        Body::CustomEmote(id) => WheelEmote::Custom(id),
+        _ => return None,
+    };
+    let desktop = cx.global::<Desktop>();
+    let library = desktop.library.read(cx);
+    let in_library = match emote {
+        WheelEmote::BuiltIn(_) => true,
+        WheelEmote::Custom(id) => library.contains(id),
+    };
+    let on_wheel = wheel_has_emote(&desktop.model.read(cx).profile.emote_pages, emote);
+    let done = in_library && on_wheel;
+    if done && !matches!(status, Some(EmoteSaveStatus::Saved)) {
+        return None;
+    }
+    let label = if done {
+        "已添加"
+    } else if in_library {
+        "添加到轮盘"
+    } else {
+        "添加到表情库"
+    };
+    let saving = matches!(status, Some(EmoteSaveStatus::Saving));
+    let id = message.id;
+    let owner = owner.clone();
+    let mut action = div().flex().flex_col().items_start().child(
+        Button::new("save-received-emote")
+            .ghost()
+            .small()
+            .label(label)
+            .loading(saving)
+            .disabled(done || (library.task.is_some() && !saving))
+            .on_click(move |_, _, cx| {
+                let _ = owner.update(cx, |this, cx| this.save_received_emote(id, emote, cx));
+            }),
+    );
+    if let Some(EmoteSaveStatus::Failed(error)) = status {
+        action = action.child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().danger)
+                .child(error.clone()),
+        );
+    }
+    Some(action)
+}
+
+fn bubble(message: &Message, mine: bool, action: Option<Div>, cx: &App) -> impl IntoElement {
     let theme = cx.theme();
     let desktop = cx.global::<Desktop>();
     let clock = DateTime::from_timestamp(message.time as i64, 0)
@@ -964,7 +1113,8 @@ fn bubble(message: &Message, mine: bool, cx: &App) -> impl IntoElement {
                             theme.secondary_foreground
                         })
                         .child(content),
-                ),
+                )
+                .children(action),
         )
 }
 
@@ -1005,6 +1155,8 @@ impl Render for Conversation {
                 let model_view = self.model.clone();
                 let rows = self.rows.clone();
                 let all_rooms = self.all_rooms;
+                let save_owner = (!self.history).then(|| cx.weak_entity());
+                let emote_save = self.emote_save.clone();
                 list(self.messages.clone(), move |index, _, cx| {
                     let model = model_view.read(cx);
                     let Some((key, message)) =
@@ -1012,6 +1164,14 @@ impl Render for Conversation {
                     else {
                         return div().into_any_element();
                     };
+                    let mine = message.sender == model.profile.id;
+                    let action = save_owner.as_ref().filter(|_| !mine).and_then(|owner| {
+                        let status = emote_save
+                            .as_ref()
+                            .filter(|(id, _)| *id == message.id)
+                            .map(|(_, status)| status);
+                        received_emote_action(message, owner, status, cx)
+                    });
                     div()
                         .id(SharedString::from(format!("{key}/{}", message.id)))
                         .px_5()
@@ -1032,7 +1192,7 @@ impl Render for Conversation {
                                     .child(label),
                             )
                         })
-                        .child(bubble(message, message.sender == model.profile.id, cx))
+                        .child(bubble(message, mine, action, cx))
                         .into_any_element()
                 })
                 .flex_1()
@@ -1938,6 +2098,13 @@ impl Settings {
                 }
             }),
             cx.observe(&model, |_, _, cx| cx.notify()),
+            cx.subscribe(&model, |this, _, added: &WheelEmoteAdded, cx| {
+                // Apply the same addition to the settings draft without overwriting local edits.
+                // 在设置草稿中同步追加表情，保留用户尚未保存的调整。
+                if append_wheel_emote(&mut this.emote_pages, added.0) {
+                    cx.notify();
+                }
+            }),
             cx.observe(&library, |_, _, cx| cx.notify()),
             cx.subscribe_in(&ip, window, |this, _, event, _, cx| {
                 if matches!(event, InputEvent::PressEnter { shift: false, .. }) {

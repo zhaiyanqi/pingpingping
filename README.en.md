@@ -73,6 +73,8 @@ Finder and the Dock use the gold question mark. The menu bar uses a monochrome q
 
 Use **Emotes → Import image…** to add a GIF, PNG (including APNG), JPEG, or WebP. Images can be up to 8 MiB and 2048 pixels on either side. Select the thumbnail to send it. Room members automatically download missing images and play them according to their desktop animation settings. They reuse any cached copy and can click the thumbnail in chat or history to replay it. The host and all guests need a version that supports custom emotes.
 
+In chat, select **Add to emote library** below a received custom emote to save it locally and send it again. For an emote already in your library, select **Add to wheel**. Emotes that are missing from the wheel are appended to its last page. The app creates a page if there's no room at the end.
+
 The app accepts private, link-local, and loopback IPv4 addresses. LAN traffic is unauthenticated and unencrypted. Use it on a trusted LAN. For a same-machine test, use `127.0.0.1` and assign each instance a different `PINGPINGPING_DATA_DIR` to keep their identities and histories separate.
 
 ## Desktop animations
