@@ -5510,6 +5510,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "smol",
+ "socket2",
  "tiny-skia",
  "tray-icon",
  "ttf-parser",

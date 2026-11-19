@@ -87,6 +87,8 @@ Version tags such as `v0.1.0` and `0.1.0` set the package version. A tag such as
 2. **Guests** on the same LAN enter the host's IP and port and connect. The host keeps the app running and can accept up to 16 guests.
 3. In **Chat**, press Enter to send text and Shift+Enter to start a new line. Choose an item from **Emotes** or **Pings** above the input to send it. While outside a room, messages stay on this device. History can show all conversations or filter to emotes.
 
+After creating or joining a room, open **Settings → LAN room → Online users** to see the member count and nicknames. The list identifies the host and your own entry, and updates when people join, leave, or save a new nickname. The host must support the online user list. Guests on older versions appear as legacy guests until they send their first message.
+
 Use **Emotes → Import image…** to add a GIF, PNG (including APNG), JPEG, or WebP. Images can be up to 8 MiB and 2048 pixels on either side. Select the thumbnail to send it. Room members automatically download missing images and play them according to their desktop animation settings. They reuse any cached copy and can click the thumbnail in chat or history to replay it. The host and all guests need a version that supports custom emotes.
 
 In chat, select **Add to emote library** below a received custom emote to save it locally and send it again. For an emote already in your library, select **Add to wheel**. Emotes that are missing from the wheel are appended to its last page. The app creates a page if there's no room at the end.

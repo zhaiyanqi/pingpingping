@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::assets::{DEFAULT_EMOTE_SLOTS, EMOTES, PINGS};
 use crate::emotes::{EmoteId, EmoteStore};
-use crate::room::{Room, RoomConfig};
+use crate::room::{Room, RoomConfig, RoomMember};
 
 const HISTORY_LIMIT: usize = 600;
 
@@ -92,12 +92,14 @@ impl Message {
 
     pub(crate) fn valid(&self) -> bool {
         i64::try_from(self.time).is_ok()
-            && !self.name.is_empty()
-            && self.name.len() <= 64
-            && self.name.chars().all(|character| !character.is_control())
+            && valid_nickname(&self.name)
             && self.body.valid()
             && (self.text_effect.uses_default() || matches!(self.body, Body::Text(_)))
     }
+}
+
+pub(crate) fn valid_nickname(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 64 && name.chars().all(|character| !character.is_control())
 }
 
 fn now() -> u64 {
@@ -456,6 +458,17 @@ impl Model {
         self.room.as_ref().map(Room::config)
     }
 
+    pub(crate) fn room_members(&self) -> Option<(Uuid, &[RoomMember])> {
+        self.room.as_ref()?.members()
+    }
+
+    pub(crate) fn update_room_members(&mut self, id: Uuid, members: Vec<RoomMember>) -> bool {
+        self.room
+            .as_mut()
+            .filter(|room| room.id() == id)
+            .is_some_and(|room| room.set_members(members))
+    }
+
     pub(crate) fn room_key(&self) -> &str {
         &self.room_key
     }
@@ -493,15 +506,7 @@ impl Model {
     }
 
     pub(crate) fn apply(&mut self, mut profile: Profile) -> Result<()> {
-        ensure!(
-            !profile.name.is_empty()
-                && profile.name.len() <= 64
-                && profile
-                    .name
-                    .chars()
-                    .all(|character| !character.is_control()),
-            "请输入昵称（最多 64 字节）"
-        );
+        ensure!(valid_nickname(&profile.name), "请输入昵称（最多 64 字节）");
         ensure!(
             !(profile.triggers.ping_enabled
                 && profile.triggers.emote_enabled
@@ -513,6 +518,11 @@ impl Model {
         );
         profile.normalize();
         save_json(&self.data_dir.join("settings.json"), &profile).context("无法保存设置")?;
+        if profile.name != self.profile.name
+            && let Some(room) = &self.room
+        {
+            room.set_name(profile.name.clone());
+        }
         self.profile = profile;
         Ok(())
     }
@@ -524,6 +534,7 @@ impl Model {
         self.apply(profile)?;
         self.room_key = config.address().to_string();
         self.room_error = None;
+        room.set_name(self.profile.name.clone());
         room.activate();
         self.room = Some(room);
         Ok(())

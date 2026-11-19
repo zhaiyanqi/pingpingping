@@ -135,6 +135,11 @@ pub(crate) fn start(cx: &mut App) {
                             play(&body, text_effect, cx);
                         }
                     }
+                    RoomEvent::Members(id, members) => model.update(cx, |model, cx| {
+                        if model.update_room_members(id, members) {
+                            cx.notify();
+                        }
+                    }),
                     RoomEvent::Closed(id, reason) => model.update(cx, |model, cx| {
                         if model.closed(id, reason) {
                             cx.notify();
@@ -2330,9 +2335,11 @@ impl Settings {
             };
         self.connection_error = None;
         let incoming = cx.global::<Desktop>().incoming.clone();
-        let emotes = self.model.read(cx).emotes();
+        let model = self.model.read(cx);
+        let name = model.profile.name.clone();
+        let emotes = model.emotes();
         self.connecting = Some(cx.spawn(async move |weak, cx| {
-            let room = Room::open(config, incoming, emotes).await;
+            let room = Room::open(config, name, incoming, emotes).await;
             let _ = weak.update(cx, |this, cx| {
                 this.connecting.take();
                 let result = room.and_then(|room| {
@@ -2470,9 +2477,69 @@ impl Settings {
                             .label(if matches!(config, RoomConfig::Host(_)) { "停止监听" } else { "断开连接" })
                             .on_click(cx.listener(|this, _, _, cx| this.disconnect(cx))))))
                 .when_some(connection, |group, config| group
-                    .child(div().text_sm().text_color(theme.muted_foreground).child(format!("{} · {}", if matches!(config, RoomConfig::Host(_)) { "正在监听" } else { "已连接" }, config.address()))))
+                    .child(div().text_sm().text_color(theme.muted_foreground).child(format!("{} · {}", if matches!(config, RoomConfig::Host(_)) { "正在监听" } else { "已连接" }, config.address())))
+                    .child(self.online_users(cx)))
                 .when_some(room_error, |group, error| group
                     .child(div().text_sm().text_color(theme.danger).child(error)))
+    }
+
+    fn online_users(&self, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let section = div()
+            .id("online-users")
+            .mt_3()
+            .pt_4()
+            .border_t_1()
+            .border_color(theme.border)
+            .flex()
+            .flex_col()
+            .gap_2();
+        match self.model.read(cx).room_members() {
+            Some((local_id, members)) if !members.is_empty() => section
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(format!("在线用户（{}）", members.len())),
+                )
+                .children(members.iter().enumerate().map(|(index, member)| {
+                    let role = match (index == 0, member.id() == local_id) {
+                        (true, true) => Some("主机 · 你"),
+                        (true, false) => Some("主机"),
+                        (false, true) => Some("你"),
+                        (false, false) => None,
+                    };
+                    div()
+                        .id(member.id())
+                        .flex()
+                        .items_start()
+                        .gap_3()
+                        .text_sm()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .whitespace_normal()
+                                .child(member.name().unwrap_or("旧版访客").to_owned()),
+                        )
+                        .when_some(role, |row, role| {
+                            row.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_color(theme.muted_foreground)
+                                    .child(role),
+                            )
+                        })
+                })),
+            members => section
+                .child(div().font_weight(FontWeight::SEMIBOLD).child("在线用户"))
+                .child(div().text_sm().text_color(theme.muted_foreground).child(
+                    if members.is_some() {
+                        "正在获取在线用户…"
+                    } else {
+                        "请更新主机版本以查看在线用户。"
+                    },
+                )),
+        }
     }
 
     fn wheel_shortcuts(&self, cx: &Context<Self>) -> Div {
