@@ -111,14 +111,14 @@ impl Motion {
         }
     }
 
-    fn select(&mut self, selected: Option<usize>, now: Instant, animate: bool) {
+    fn select(&mut self, selected: Option<usize>, now: Instant) {
         if selected == self.selection {
             return;
         }
         for index in [self.selection, selected].into_iter().flatten() {
             let target = if Some(index) == selected { 1.0 } else { 0.0 };
-            self.wedges[index].animate(target, if animate { WEDGE_TIME } else { 0 }, false, now);
-            self.icons[index].animate(target, if animate { ICON_TIME } else { 0 }, false, now);
+            self.wedges[index].animate(target, WEDGE_TIME, false, now);
+            self.icons[index].animate(target, ICON_TIME, false, now);
         }
         self.selection = selected;
     }
@@ -137,7 +137,6 @@ struct Active {
     kind: Wheel,
     motion: Motion,
     present: Present,
-    animate: bool,
 }
 
 pub(super) struct WheelView {
@@ -162,7 +161,6 @@ impl WheelView {
         kind: Wheel,
         size: u32,
         selected: Option<usize>,
-        animate: bool,
         present: Present,
         cx: &App,
     ) {
@@ -180,15 +178,12 @@ impl WheelView {
         {
             motion = previous.motion.clone();
         }
-        motion
-            .visibility
-            .animate(1.0, if animate { WHEEL_TIME } else { 0 }, true, now);
-        motion.select(selected, now, animate);
+        motion.visibility.animate(1.0, WHEEL_TIME, true, now);
+        motion.select(selected, now);
         self.active = Some(Active {
             kind,
             motion,
             present,
-            animate,
         });
         self.draw(cx);
     }
@@ -200,9 +195,7 @@ impl WheelView {
         if active.motion.visibility.to == 0.0 || active.motion.selection == selected {
             return false;
         }
-        active
-            .motion
-            .select(selected, Instant::now(), active.animate);
+        active.motion.select(selected, Instant::now());
         self.draw(cx);
         selected.is_some()
     }
@@ -215,13 +208,8 @@ impl WheelView {
             return;
         }
         let now = Instant::now();
-        active.motion.select(None, now, active.animate);
-        active.motion.visibility.animate(
-            0.0,
-            if active.animate { WHEEL_TIME } else { 0 },
-            true,
-            now,
-        );
+        active.motion.select(None, now);
+        active.motion.visibility.animate(0.0, WHEEL_TIME, true, now);
         self.draw(cx);
         self.canvas = None;
     }
@@ -792,7 +780,7 @@ mod tests {
         let start = Instant::now();
         let mut motion = Motion::new(start);
         motion.visibility.animate(1.0, WHEEL_TIME, true, start);
-        motion.select(Some(0), start, true);
+        motion.select(Some(0), start);
         let middle = start + Duration::from_millis(60);
         let visible = motion.visibility.sample(middle);
         motion.visibility.animate(0.0, WHEEL_TIME, true, middle);

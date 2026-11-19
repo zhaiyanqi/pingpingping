@@ -24,7 +24,7 @@ use gpui_kit::App;
 use objc2::{MainThreadMarker, MainThreadOnly, rc::Retained, runtime::AnyObject};
 use objc2_app_kit::{
     NSBackingStoreType, NSColor, NSFloatingWindowLevel, NSPanel, NSScreen,
-    NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
+    NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_core_graphics::CGImage;
 use objc2_foundation::{NSPoint, NSRect, NSSize};
@@ -322,9 +322,7 @@ impl Overlay {
                 update_layers(|| content(&layer, None));
             }
         });
-        let animate = animation_enabled();
-        self.wheel_view
-            .open(kind, size, selected, animate, present, cx);
+        self.wheel_view.open(kind, size, selected, present, cx);
         if let Some(volume) = tick_volume.filter(|_| selected.is_some()) {
             let _ = self.audio.try_send(AudioCue::Tick(volume));
         }
@@ -402,8 +400,4 @@ fn set_pixels(layer: &CALayer, width: u32, height: u32, bytes: Vec<u8>, alpha: u
         0,
     );
     unsafe { layer.setContents(Some(&*image.as_ptr().cast::<AnyObject>())) };
-}
-
-pub(super) fn animation_enabled() -> bool {
-    !NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
 }

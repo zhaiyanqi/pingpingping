@@ -20,7 +20,7 @@ pub(super) const MAX_ACTIVE: usize = 16;
 
 pub(crate) struct Animation {
     size: u32,
-    webp: Option<Cow<'static, [u8]>>,
+    webp: Cow<'static, [u8]>,
     poster: Option<&'static [u8]>,
     timeout: Duration,
 }
@@ -31,17 +31,8 @@ impl Animation {
     pub(crate) fn webp(bytes: impl Into<Cow<'static, [u8]>>, size: u32, timeout: Duration) -> Self {
         Self {
             size: size.clamp(1, 1024),
-            webp: Some(bytes.into()),
+            webp: bytes.into(),
             poster: None,
-            timeout,
-        }
-    }
-
-    pub(super) fn still(png: &'static [u8], size: u32, timeout: Duration) -> Self {
-        Self {
-            size: size.clamp(1, 1024),
-            webp: None,
-            poster: Some(png),
             timeout,
         }
     }
@@ -131,45 +122,42 @@ fn prepare(image: RgbaImage, size: Option<u32>) -> RgbaImage {
 
 fn decode(animation: &Animation, size: Option<u32>, send: async_channel::Sender<TimedFrame>) {
     let mut sent = false;
-    if let Some(bytes) = animation.webp.as_deref() {
-        'cycles: while !send.is_closed() {
-            let Ok(decoder) = WebPDecoder::new(Cursor::new(bytes)) else {
-                break;
-            };
-            if !decoder.has_animation() {
-                if let Ok(image) = image::DynamicImage::from_decoder(decoder) {
-                    let _ =
-                        send.send_blocking((prepare(image.into_rgba8(), size), animation.timeout));
-                    return;
-                }
-                break;
+    'cycles: while !send.is_closed() {
+        let Ok(decoder) = WebPDecoder::new(Cursor::new(animation.webp.as_ref())) else {
+            break;
+        };
+        if !decoder.has_animation() {
+            if let Ok(image) = image::DynamicImage::from_decoder(decoder) {
+                let _ = send.send_blocking((prepare(image.into_rgba8(), size), animation.timeout));
+                return;
             }
+            break;
+        }
 
-            // Reopen the byte stream for each pass. Only two prepared frames wait in the queue.
-            // 每轮重新读取素材字节，队列中最多等待两张已处理的帧。
-            let mut frames = decoder.into_frames().peekable();
-            if frames.peek().is_none() {
-                break;
+        // Reopen the byte stream for each pass. Only two prepared frames wait in the queue.
+        // 每轮重新读取素材字节，队列中最多等待两张已处理的帧。
+        let mut frames = decoder.into_frames().peekable();
+        if frames.peek().is_none() {
+            break;
+        }
+        for frame in frames {
+            let Ok(frame) = frame else { break 'cycles };
+            if send.is_closed() {
+                return;
             }
-            for frame in frames {
-                let Ok(frame) = frame else { break 'cycles };
-                if send.is_closed() {
-                    return;
-                }
-                let (n, d) = frame.delay().numer_denom_ms();
-                let delay = if n == 0 {
-                    Duration::from_millis(16)
-                } else {
-                    Duration::from_secs_f64(f64::from(n) / f64::from(d.max(1)) / 1000.0)
-                };
-                if send
-                    .send_blocking((prepare(frame.into_buffer(), size), delay))
-                    .is_err()
-                {
-                    return;
-                }
-                sent = true;
+            let (n, d) = frame.delay().numer_denom_ms();
+            let delay = if n == 0 {
+                Duration::from_millis(16)
+            } else {
+                Duration::from_secs_f64(f64::from(n) / f64::from(d.max(1)) / 1000.0)
+            };
+            if send
+                .send_blocking((prepare(frame.into_buffer(), size), delay))
+                .is_err()
+            {
+                return;
             }
+            sent = true;
         }
     }
     if !sent
@@ -295,20 +283,14 @@ mod tests {
     }
 
     #[test]
-    fn reduced_motion_and_invalid_webp_deliver_one_poster() {
-        for animate in [false, true] {
-            let timeout = Duration::from_millis(100);
-            let animation = if animate {
-                Animation::webp(&b"broken"[..], 110, timeout).with_poster(PINGS[0].image)
-            } else {
-                Animation::still(PINGS[0].image, 110, timeout)
-            };
-            let mut frames = 0;
-            smol::block_on(run(animation, Some(110), |image| {
-                assert_eq!(image.dimensions(), (110, 110));
-                frames += 1;
-            }));
-            assert_eq!(frames, 1);
-        }
+    fn invalid_webp_delivers_one_poster() {
+        let animation = Animation::webp(&b"broken"[..], 110, Duration::from_millis(100))
+            .with_poster(PINGS[0].image);
+        let mut frames = 0;
+        smol::block_on(run(animation, Some(110), |image| {
+            assert_eq!(image.dimensions(), (110, 110));
+            frames += 1;
+        }));
+        assert_eq!(frames, 1);
     }
 }

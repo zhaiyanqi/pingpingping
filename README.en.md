@@ -54,7 +54,7 @@ The app accepts private, link-local, and loopback IPv4 addresses. LAN traffic is
 
 ## Desktop animations
 
-Under **Settings → Desktop animations**, set the size and timeout for pings and emotes separately and preview them before saving. Animations loop at their source frame rate and disappear at the configured timeout. With system Reduce Motion enabled, a static image stays visible until the same timeout. **Sound** controls the volume and has separate switches for emote sounds and wheel ticks.
+Under **Settings → Desktop animations**, set the size and timeout for pings and emotes separately and preview them before saving. Animations loop at their source frame rate and disappear at the configured timeout. **Sound** controls the volume and has separate switches for emote sounds and wheel ticks.
 
 ## Shortcuts and local data
 

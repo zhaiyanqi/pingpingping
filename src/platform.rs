@@ -48,17 +48,13 @@ impl Overlay {
             ),
         };
         let timeout = Duration::from_millis(u64::from(timeout_ms));
-        let animation = if animation_enabled() {
-            // The source canvases include room for expanding rings and emote effects.
-            // 素材画布为扩散光环和表情特效预留了空间。
-            let canvas = match kind {
-                Wheel::Ping => (size * 256).div_ceil(110),
-                Wheel::Emote => (size * 5).div_ceil(4),
-            };
-            Animation::webp(clip.animation, canvas, timeout).with_poster(clip.image)
-        } else {
-            Animation::still(clip.image, size, timeout)
+        // The source canvases include room for expanding rings and emote effects.
+        // 素材画布为扩散光环和表情特效预留了空间。
+        let canvas = match kind {
+            Wheel::Ping => (size * 256).div_ceil(110),
+            Wheel::Emote => (size * 5).div_ceil(4),
         };
+        let animation = Animation::webp(clip.animation, canvas, timeout).with_poster(clip.image);
         self.animations.play(animation, local, location, cx);
         if let Some(volume) = settings
             .volume()

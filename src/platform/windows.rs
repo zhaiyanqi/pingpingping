@@ -536,8 +536,7 @@ impl Overlay {
                 layer.borrow_mut().hide();
             }
         });
-        self.wheel_view
-            .open(wheel, size, selected, animation_enabled(), present, cx);
+        self.wheel_view.open(wheel, size, selected, present, cx);
         if let Some(volume) = tick_volume.filter(|_| selected.is_some()) {
             let _ = self.audio.try_send(AudioCue::Tick(volume));
         }
@@ -584,17 +583,4 @@ pub(super) fn animation_presenter(
     Some((Some(size), move |frame: RgbaImage| {
         layer.get_or_insert_with(Layer::new).frame(&frame, origin);
     }))
-}
-
-pub(super) fn animation_enabled() -> bool {
-    let mut enabled = 1i32;
-    unsafe {
-        SystemParametersInfoW(
-            SPI_GETCLIENTAREAANIMATION,
-            0,
-            (&mut enabled as *mut i32).cast(),
-            0,
-        )
-    };
-    enabled != 0
 }
