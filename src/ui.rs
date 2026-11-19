@@ -12,7 +12,7 @@ use uuid::Uuid;
 use async_channel::Sender;
 use chrono::{DateTime, Local};
 use gpui_kit::assets::IconName;
-use gpui_kit::base::{Button as BaseButton, Root};
+use gpui_kit::base::{Button as BaseButton, InteractiveElementExt, Root};
 use gpui_kit::component::{
     ActiveTheme, Disableable, IndexPath, Selectable, Sizable,
     button::{Button, ButtonVariants},
@@ -1650,6 +1650,7 @@ struct Settings {
     wheel_page: usize,
     wheel_slot: usize,
     wheel_preview: Rc<RefCell<WheelPreview>>,
+    wheel_library_scroll: ScrollHandle,
     swap_source: Option<WheelSlot>,
     pending_image: Option<WheelSlot>,
     recording: Option<Wheel>,
@@ -2098,16 +2099,28 @@ impl Settings {
             )
             .child(
                 div()
-                    .id("wheel-library")
-                    .max_h(rems(10.))
+                    .relative()
                     .child(
                         div()
-                            .flex()
-                            .flex_wrap()
-                            .gap_1()
-                            .children(preset.chain(custom)),
+                            .id("wheel-library")
+                            // Cap the viewport so the wrapping grid can report its full height.
+                            // 限制视口高度，让换行网格仍能报告完整高度。
+                            .max_h(rems(10.))
+                            .overflow_y_scroll()
+                            .lock_scroll_axis()
+                            .track_scroll(&self.wheel_library_scroll)
+                            // Wheel input over the library belongs to this viewport.
+                            // 表情库上方的滚动输入由此视口处理。
+                            .occlude()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap_1()
+                                    .children(preset.chain(custom)),
+                            ),
                     )
-                    .overflow_y_scrollbar(),
+                    .vertical_scrollbar(&self.wheel_library_scroll),
             )
     }
 
@@ -2216,6 +2229,7 @@ impl Settings {
             wheel_page: 0,
             wheel_slot: 0,
             wheel_preview: Rc::default(),
+            wheel_library_scroll: ScrollHandle::new(),
             swap_source: None,
             pending_image: None,
             recording: None,
@@ -3022,6 +3036,7 @@ impl Render for Settings {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::PathBuf;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -3030,23 +3045,28 @@ mod tests {
     use gpui_kit::base::Root;
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
-        AnyWindowHandle, AppContext, QuitMode, TestAppContext, WindowVisibility, px, size,
+        AnyWindowHandle, AppContext, QuitMode, ScrollDelta, SharedString, TestAppContext,
+        WindowVisibility, point, px, size,
     };
+    use image::{Rgba, RgbaImage};
     use uuid::Uuid;
 
     use super::{
         ANIMATION_TIMEOUT, Desktop, Settings, SettingsCategory, WheelSlot, open_chat,
         open_settings, register_window_actions, setting_slider, shortcut,
     };
-    use crate::model::Model;
+    use crate::model::{Model, WheelEmote};
 
-    fn settings_desktop(cx: &mut TestAppContext) -> (AnyWindowHandle, AnyWindowHandle) {
+    fn settings_desktop(cx: &mut TestAppContext) -> (AnyWindowHandle, AnyWindowHandle, PathBuf) {
         // The production emote library and wheel previews finish on smol workers.
         // 实际的表情库与轮盘预览由 smol 工作线程加载。
         cx.dispatcher.allow_parking();
         let data = std::env::temp_dir().join(format!("pingpingping-settings-{}", Uuid::new_v4()));
         let model = Model::load(data.clone()).unwrap();
-        cx.on_quit(move || fs::remove_dir_all(data).unwrap());
+        cx.on_quit({
+            let data = data.clone();
+            move || fs::remove_dir_all(data).unwrap()
+        });
         cx.update(|cx| {
             gpui_kit::init(cx);
             cx.set_quit_mode(QuitMode::Explicit);
@@ -3066,7 +3086,7 @@ mod tests {
             settings
                 .update(cx, |_, window, _| window.activate_window())
                 .unwrap();
-            (chat, settings)
+            (chat, settings, data)
         })
     }
 
@@ -3088,7 +3108,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn close_shortcut_dismisses_settings_during_shortcut_recording(cx: &mut TestAppContext) {
-        let (chat, settings) = settings_desktop(cx);
+        let (chat, settings, _) = settings_desktop(cx);
         let paused = start_shortcut_recording(settings, cx);
         cx.simulate_keystrokes(settings, &shortcut("w"));
 
@@ -3100,7 +3120,7 @@ mod tests {
     fn settings_close_button_allows_reopening_when_the_tray_is_unavailable(
         cx: &mut TestAppContext,
     ) {
-        let (chat, settings) = settings_desktop(cx);
+        let (chat, settings, _) = settings_desktop(cx);
         cx.update_window(settings, |_, window, cx| {
             window.render_frame(cx);
             window.click("settings-name", cx);
@@ -3135,7 +3155,7 @@ mod tests {
     fn hiding_settings_cancels_shortcut_recording_and_reopening_keeps_the_view(
         cx: &mut TestAppContext,
     ) {
-        let (_, settings) = settings_desktop(cx);
+        let (_, settings, _) = settings_desktop(cx);
         let paused = start_shortcut_recording(settings, cx);
         cx.simulate_window_visibility_change(settings, WindowVisibility::Hidden);
         assert!(!paused.load(Ordering::Relaxed));
@@ -3154,6 +3174,66 @@ mod tests {
             let settings = settings.read(cx);
             assert!(settings.category == SettingsCategory::Wheel);
             assert!(settings.recording.is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn settings_can_scroll_to_and_assign_the_last_library_emote(cx: &mut TestAppContext) {
+        let (_, settings, data) = settings_desktop(cx);
+        let file = data.join("Test emote.png");
+        let library = cx.update(|cx| cx.global::<Desktop>().library.clone());
+        let store = cx.read_entity(&library, |library, _| library.store.clone());
+        let entries: Vec<_> = (0..24)
+            .map(|index| {
+                RgbaImage::from_pixel(1, 1, Rgba([index, 0, 0, 255]))
+                    .save(&file)
+                    .unwrap();
+                store.import(&file).unwrap()
+            })
+            .collect();
+        let last_emote = entries.last().unwrap().id();
+        library.update(cx, |library, cx| {
+            library.task.take();
+            library.entries = entries;
+            cx.notify();
+        });
+
+        cx.simulate_window_resize(settings, size(px(560.), px(400.)));
+        cx.update_window(settings, |_, window, cx| {
+            window.render_frame(cx);
+            window.click(("settings-category", SettingsCategory::Wheel as usize), cx);
+
+            // Reveal the whole library above the footer at the minimum window height.
+            // 在最小窗口高度下，将整个表情库滚动到页脚上方。
+            window.scroll(
+                "add-wheel-page",
+                ScrollDelta::Pixels(point(px(0.), px(-48.))),
+                cx,
+            );
+            let page_button = window.find("add-wheel-page").bounds();
+            let last_button = SharedString::from(last_emote.to_string());
+            assert!(!window.find(last_button.clone()).visible());
+            window.scroll(
+                ("built-in", 0usize),
+                ScrollDelta::Pixels(point(px(0.), px(-600.))),
+                cx,
+            );
+            assert_eq!(window.find("add-wheel-page").bounds(), page_button);
+            assert!(window.find(last_button.clone()).visible());
+            window.click(last_button, cx);
+
+            let view = Root::read(window, cx)
+                .view()
+                .clone()
+                .downcast::<Settings>()
+                .unwrap();
+            let view = view.read(cx);
+            let slot = view.selected_slot();
+            assert_eq!(
+                view.emote_pages[slot.page][slot.sector],
+                Some(WheelEmote::Custom(last_emote))
+            );
         })
         .unwrap();
     }
