@@ -125,6 +125,7 @@ impl InputEvent {
 pub(crate) enum MouseDelivery {
     Pass,
     HoldDown,
+    WheelMove,
     Swallow,
     ReplayClick,
 }
@@ -150,11 +151,6 @@ impl WheelInput {
             swallowed_buttons: self.swallowed_buttons | self.held_button.map_or(0, |id| 1u64 << id),
             ..Self::default()
         };
-    }
-
-    #[cfg(target_os = "windows")]
-    pub(crate) fn visible(&self) -> bool {
-        self.gesture.visible
     }
 
     pub(crate) fn active(&self) -> bool {
@@ -268,10 +264,12 @@ impl WheelInput {
         let updates =
             self.gesture
                 .input(wheel, at, action, self.suppressed, scale, config.click_ping);
-        if (was_open || self.gesture.visible)
-            && matches!(event, InputEvent::Move | InputEvent::Interrupt)
-        {
-            delivery = MouseDelivery::Swallow;
+        if was_open || self.gesture.visible {
+            delivery = match event {
+                InputEvent::Move => MouseDelivery::WheelMove,
+                InputEvent::Interrupt => MouseDelivery::Swallow,
+                _ => delivery,
+            };
         }
         match event {
             InputEvent::Side(bit, false) => self.sides &= !bit,
@@ -399,11 +397,14 @@ mod tests {
             MouseDelivery::ReplayClick
         );
         assert_eq!(event(InputEvent::Left(true), 0.).1, MouseDelivery::HoldDown);
-        assert_eq!(event(InputEvent::Move, 9.).1, MouseDelivery::Swallow);
+        assert_eq!(event(InputEvent::Move, 9.).1, MouseDelivery::WheelMove);
         let (updates, delivery) = event(InputEvent::Move, 100.);
         assert_eq!(
             (updates, delivery),
-            (vec![GestureEvent::Select(Some(2))], MouseDelivery::Swallow)
+            (
+                vec![GestureEvent::Select(Some(2))],
+                MouseDelivery::WheelMove
+            )
         );
         let (updates, delivery) = event(InputEvent::Left(false), -100.);
         assert!(matches!(
@@ -434,7 +435,7 @@ mod tests {
                 event(InputEvent::Side(2, true), 0.).1,
                 MouseDelivery::HoldDown
             );
-            assert_eq!(event(InputEvent::Move, 90.).1, MouseDelivery::Swallow);
+            assert_eq!(event(InputEvent::Move, 90.).1, MouseDelivery::WheelMove);
             assert_eq!(
                 event(interrupt, 90.),
                 (vec![GestureEvent::Finish(None)], MouseDelivery::Swallow)
@@ -497,7 +498,7 @@ mod tests {
                     updates.as_slice(),
                     [GestureEvent::Open(Wheel::Emote, _, None)]
                 ));
-                assert_eq!(delivery, MouseDelivery::Swallow);
+                assert_eq!(delivery, MouseDelivery::WheelMove);
                 assert_eq!(
                     event(InputEvent::Side(2, false), 0.),
                     (vec![GestureEvent::Finish(None)], MouseDelivery::Swallow)

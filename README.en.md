@@ -71,7 +71,7 @@ Right-click the Windows system tray or macOS menu bar icon and select **Mute**. 
 
 In **Settings → Desktop wheel**, turn each wheel on or off independently. Click the current binding, press a keyboard key or mouse button 4 (Back) or 5 (Forward), then save. Esc cancels recording. Enabled wheels must use different bindings.
 
-For a keyboard binding, hold the key and left-drag. Releasing the key first cancels. For a side-button binding, hold that button, drag, then release it to confirm. Returning to the center cancels either gesture. A plain click goes to the current app on release. While the wheel is open, it consumes mouse movement, button presses, scrolling, and the release that confirms or cancels the gesture. If quick ping is enabled, a click of the ping wheel’s bound side button sends a marker.
+For a keyboard binding, hold the key and left-drag. Releasing the key first cancels. For a side-button binding, hold that button, drag, then release it to confirm. Returning to the center cancels either gesture. A plain click goes to the current app on release. The system pointer moves normally, and its position on release determines the selection. While the wheel is open, it consumes mouse movement, button presses, scrolling, and the release that confirms or cancels the gesture. If quick ping is enabled, a click of the ping wheel’s bound side button sends a marker.
 
 The latest 600 text messages, pings, and emotes are stored locally as JSON. Custom emotes are stored in the `emotes` subdirectory. The app data directory is `%LOCALAPPDATA%\PingPingPing` on Windows or `~/Library/Application Support/PingPingPing` on macOS.
 

@@ -50,12 +50,15 @@ impl InputMonitor {
                 unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
                 let mut message = MSG::default();
                 unsafe { PeekMessageW(&mut message, null_mut(), 0, 0, PM_NOREMOVE) };
+                let Some(move_window) = WheelMouseWindow::new() else {
+                    return;
+                };
                 INPUT.with(|state| {
                     *state.borrow_mut() = Some(Input {
                         events,
                         triggers,
                         gesture: WheelInput::default(),
-                        wheel_cursor: None,
+                        move_window,
                         paused,
                         keys: initial_keys(),
                     });
@@ -116,7 +119,7 @@ struct Input {
     events: Sender<GestureEvent>,
     triggers: Option<Triggers>,
     gesture: WheelInput,
-    wheel_cursor: Option<Position>,
+    move_window: WheelMouseWindow,
     keys: u16,
     paused: std::sync::Arc<AtomicBool>,
 }
@@ -152,18 +155,7 @@ impl Input {
                 modifiers |= modifier;
             }
         }
-        let mut at = position(point);
-        if let Some(previous) = self.wheel_cursor {
-            // A swallowed move does not advance the Windows cursor. Accumulate its proposed displacement.
-            // 吞掉移动事件后系统光标不会前进，因此用建议坐标与实际坐标的差累积轮盘位置。
-            let mut cursor = POINT::default();
-            if unsafe { GetCursorPos(&mut cursor) } != 0 {
-                at = Position {
-                    x: previous.x + at.x - f64::from(cursor.x),
-                    y: previous.y + at.y - f64::from(cursor.y),
-                };
-            }
-        }
+        let at = position(point);
         let (updates, delivery) = self.gesture.event(
             config,
             modifiers,
@@ -172,8 +164,16 @@ impl Input {
             self.paused.load(Ordering::Relaxed),
             || f64::from(screen(point, false).1) / 96.0,
         );
-        self.wheel_cursor = self.gesture.visible().then_some(at);
         for update in updates {
+            match update {
+                GestureEvent::Open(..) if !self.move_window.show() => {
+                    self.gesture
+                        .event(config, modifiers, InputEvent::Interrupt, at, false, || 1.0);
+                    return MouseDelivery::Pass;
+                }
+                GestureEvent::Finish(_) => self.move_window.hide(),
+                _ => {}
+            }
             let _ = self.events.try_send(update);
         }
         delivery
@@ -289,6 +289,9 @@ unsafe extern "system" fn mouse_hook(code: i32, message: WPARAM, data: LPARAM) -
             input.dispatch(event.pt, kind)
         });
         match delivery {
+            // Let Windows advance the real cursor and route WM_MOUSEMOVE to the wheel's input window.
+            // 让 Windows 更新系统光标，由轮盘输入窗口接收 WM_MOUSEMOVE。
+            MouseDelivery::WheelMove => {}
             MouseDelivery::HoldDown | MouseDelivery::Swallow => return 1,
             // SendInput can block on our own hook. Replay after this callback returns.
             // SendInput 可能等待当前钩子返回，因此把单击交给消息循环回放。
@@ -365,6 +368,78 @@ fn fit(point: POINT, bounds: RECT, size: u32) -> POINT {
     POINT {
         x: (point.x - edge / 2).clamp(bounds.left, (bounds.right - edge).max(bounds.left)),
         y: (point.y - edge / 2).clamp(bounds.top, (bounds.bottom - edge).max(bounds.top)),
+    }
+}
+
+// A window without a redirection bitmap is visually transparent but still participates in hit testing.
+// 无重定向位图的窗口在视觉上透明，同时仍能接收命中测试范围内的鼠标消息。
+struct WheelMouseWindow(HWND);
+
+impl WheelMouseWindow {
+    fn new() -> Option<Self> {
+        let class = windows_sys::w!("PingPingPingWheelMouse");
+        unsafe {
+            let instance = GetModuleHandleW(null());
+            RegisterClassW(&WNDCLASSW {
+                lpfnWndProc: Some(wheel_mouse_proc),
+                hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+                hInstance: instance,
+                lpszClassName: class,
+                ..Default::default()
+            });
+            let hwnd = CreateWindowExW(
+                WS_EX_NOREDIRECTIONBITMAP | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+                class,
+                null(),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                null_mut(),
+                null_mut(),
+                instance,
+                null(),
+            );
+            (!hwnd.is_null()).then(|| Self(hwnd))
+        }
+    }
+
+    fn show(&self) -> bool {
+        unsafe {
+            SetWindowPos(
+                self.0,
+                HWND_TOPMOST,
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+                GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN),
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            ) != 0
+        }
+    }
+
+    fn hide(&self) {
+        unsafe { ShowWindow(self.0, SW_HIDE) };
+    }
+}
+
+impl Drop for WheelMouseWindow {
+    fn drop(&mut self) {
+        unsafe { DestroyWindow(self.0) };
+    }
+}
+
+unsafe extern "system" fn wheel_mouse_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match message {
+        WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+        WM_MOUSEMOVE => 0,
+        _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
     }
 }
 

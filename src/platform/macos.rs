@@ -185,19 +185,14 @@ unsafe extern "C" fn tap_callback(
             state.held_down = Some(CGEvent::clone(&event));
             ptr::null_mut()
         }
+        MouseDelivery::WheelMove => {
+            // Move the visible cursor without dispatching a drag to the window underneath.
+            // 移动可见光标，同时避免向下方窗口派发拖动事件。
+            let _ = core_graphics::display::CGDisplay::warp_mouse_cursor_position(event.location());
+            ptr::null_mut()
+        }
         MouseDelivery::Swallow => {
-            if matches!(
-                kind,
-                CGEventType::MouseMoved
-                    | CGEventType::LeftMouseDragged
-                    | CGEventType::RightMouseDragged
-                    | CGEventType::OtherMouseDragged
-            ) {
-                // Move the visible cursor without dispatching a drag to the window underneath.
-                // 移动可见光标，同时避免向下方窗口派发拖动事件。
-                let _ =
-                    core_graphics::display::CGDisplay::warp_mouse_cursor_position(event.location());
-            } else if matches!(kind, CGEventType::LeftMouseUp | CGEventType::OtherMouseUp) {
+            if matches!(kind, CGEventType::LeftMouseUp | CGEventType::OtherMouseUp) {
                 state.held_down = None;
             }
             ptr::null_mut()
