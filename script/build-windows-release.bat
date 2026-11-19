@@ -3,6 +3,14 @@ setlocal EnableExtensions DisableDelayedExpansion
 rem Build the x64 MSVC executable from any working directory.
 rem ZH: 从任意工作目录构建 x64 MSVC 可执行文件。
 
+set "BUILD_PROFILE=release"
+set "CARGO_PROFILE=--release"
+if /i "%~1"=="--debug" (
+    set "BUILD_PROFILE=debug"
+    set "CARGO_PROFILE="
+    shift
+)
+
 set "EXIT_CODE=1"
 set "PAUSE_AT_END=1"
 if /i "%~1"=="--no-pause" set "PAUSE_AT_END="
@@ -43,6 +51,7 @@ where.exe cl.exe >nul 2>&1
 if errorlevel 1 goto missing_vs
 
 :find_fxc
+if "%BUILD_PROFILE%"=="debug" goto build
 rem GPUI needs the Windows SDK shader compiler for Release builds.
 rem ZH: GPUI 的 Release 构建需要 Windows SDK 的着色器编译器。
 if defined GPUI_FXC_PATH (
@@ -66,11 +75,11 @@ if not defined GPUI_FXC_PATH (
 )
 
 :build
-rustup run "%RUST_TOOLCHAIN%" cargo build --release --locked --target "%RUST_TARGET%" --target-dir target
+rustup run "%RUST_TOOLCHAIN%" cargo build %CARGO_PROFILE% --locked --target "%RUST_TARGET%" --target-dir target
 set "EXIT_CODE=%ERRORLEVEL%"
 if not "%EXIT_CODE%"=="0" goto finish
 echo.
-echo Built: "%CD%\target\%RUST_TARGET%\release\pingpingping.exe"
+echo Built: "%CD%\target\%RUST_TARGET%\%BUILD_PROFILE%\pingpingping.exe"
 goto finish
 
 :missing_vs
@@ -78,7 +87,7 @@ echo Install the Visual Studio Build Tools workload "Desktop development with C+
 goto finish
 
 :usage
-echo Usage: %~nx0 [--no-pause]
+echo Usage: %~nx0 [--debug] [--no-pause]
 set "PAUSE_AT_END="
 set "EXIT_CODE=2"
 

@@ -12,11 +12,16 @@ PingPingPing 是用 Rust 编写的 Windows 和 macOS 桌面信号、表情轮盘
 rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
 ```
 
-双击 [script/build-windows.bat](script/build-windows.bat) 即可编译。脚本会定位 Visual Studio 和 GPUI 所需的 Windows SDK 着色器编译器 `fxc.exe`。从 PowerShell 运行时可加 `--no-pause`。
+双击 [Release 脚本](script/build-windows-release.bat) 或 [Debug 脚本](script/build-windows-debug.bat) 编译对应版本。Release 脚本会定位 Visual Studio 和 GPUI 所需的 Windows SDK 着色器编译器 `fxc.exe`。从 PowerShell 运行时可加 `--no-pause`。
 
 ```powershell
-.\script\build-windows.bat --no-pause
+# Release
+.\script\build-windows-release.bat --no-pause
 .\target\x86_64-pc-windows-msvc\release\pingpingping.exe
+
+# Debug
+.\script\build-windows-debug.bat --no-pause
+.\target\x86_64-pc-windows-msvc\debug\pingpingping.exe
 ```
 
 素材已嵌入 exe。若脚本找不到 `fxc.exe`，在 Visual Studio Installer 中检查 SDK 是否已安装，或把环境变量 `GPUI_FXC_PATH` 设为该文件的完整路径。
@@ -26,8 +31,13 @@ rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
 安装稳定版 Rust 和 Xcode Command Line Tools。在项目根目录运行：
 
 ```sh
-./script/build-macos.sh
+# Release
+./script/build-macos-release.sh
 open dist/PingPingPing.app
+
+# Debug
+./script/build-macos-debug.sh
+open dist/debug/PingPingPing.app
 ```
 
 也可以用 `cargo run --release --locked` 直接运行。首次使用全局轮盘时，在应用设置中请求输入监控权限。若授权后轮盘仍不可用，退出并重新打开应用。

@@ -9,12 +9,26 @@ if [ "$(uname -s)" != Darwin ]; then
 fi
 
 cd "$(dirname "$0")/.."
-cargo build --release --locked --target-dir target
+case "$#:${1-}" in
+    0:)
+        cargo build --release --locked --target-dir target
+        profile=release
+        bundle=dist/PingPingPing.app
+        ;;
+    1:--debug)
+        cargo build --locked --target-dir target
+        profile=debug
+        bundle=dist/debug/PingPingPing.app
+        ;;
+    *)
+        printf 'Usage: %s [--debug]\n' "$0" >&2
+        exit 2
+        ;;
+esac
 
-bundle=dist/PingPingPing.app
 mkdir -p "$bundle/Contents/MacOS"
 cp packaging/Info.plist "$bundle/Contents/Info.plist"
-cp target/release/pingpingping "$bundle/Contents/MacOS/"
+cp "target/$profile/pingpingping" "$bundle/Contents/MacOS/"
 codesign --force --sign - "$bundle"
 codesign --verify --strict "$bundle"
 printf 'Built: %s/%s\n' "$PWD" "$bundle"

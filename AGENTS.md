@@ -26,9 +26,10 @@
 - Retain GPUI state and subscriptions in the owning entity. Use the GPUI Kit coding and design guides for window and component changes. 在所属实体中保留 GPUI 状态和订阅。修改窗口或组件时遵循 GPUI Kit 的开发与设计指南。
 - Keep asset indices stable for the room protocol and history. Validate incoming frames before they can reach rendering or storage. 保持素材索引与房间协议、历史兼容。消息须通过帧校验后才能进入渲染或存储。
 - Keep `Cargo.lock` tracked. Update both README files when build steps or user workflows change. Keep build outputs and personal data out of Git. 提交 `Cargo.lock`。构建或使用流程有变化时更新两份 README。构建产物和个人数据不纳入 Git。
+- Write each commit subject as `<English summary> | <简体中文摘要>` so changelog scripts can split it on ` | `. 每次提交均使用此双语标题格式，英文在前、简体中文在后，供更新日志脚本按固定分隔符解析。
 
 ## Checks / 验证
 
 - `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked`
 - `cargo test --locked clients_join_by_endpoint_exchange_messages_and_notice_disconnect -- --ignored` requires TCP loopback access / 需要 TCP 回环权限。
-- Run `script\build-windows.bat --no-pause` on Windows for the full MSVC Release build. Verify pointer pass-through, focus, mixed-DPI displays, and two-device LAN chat when changing those paths. Windows 完整 MSVC Release 构建使用此脚本。相关改动需验证鼠标穿透、焦点、混合 DPI 和双设备局域网聊天。
+- Run `script\build-windows-release.bat --no-pause` on Windows for the full MSVC Release build. Verify pointer pass-through, focus, mixed-DPI displays, and two-device LAN chat when changing those paths. Windows 完整 MSVC Release 构建使用此脚本。相关改动需验证鼠标穿透、焦点、混合 DPI 和双设备局域网聊天。

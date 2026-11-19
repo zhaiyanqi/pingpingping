@@ -12,11 +12,16 @@ On Windows 11 x64, install [Rustup](https://rustup.rs/) and the **Desktop develo
 rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
 ```
 
-Double-click [script/build-windows.bat](script/build-windows.bat). It locates Visual Studio and the Windows SDK shader compiler `fxc.exe` required by GPUI. Pass `--no-pause` when running it from a terminal or automation.
+Double-click the [Release script](script/build-windows-release.bat) or the [Debug script](script/build-windows-debug.bat). The Release script locates Visual Studio and the Windows SDK shader compiler `fxc.exe` required by GPUI. Pass `--no-pause` when running it from a terminal or automation.
 
 ```powershell
-.\script\build-windows.bat --no-pause
+# Release
+.\script\build-windows-release.bat --no-pause
 .\target\x86_64-pc-windows-msvc\release\pingpingping.exe
+
+# Debug
+.\script\build-windows-debug.bat --no-pause
+.\target\x86_64-pc-windows-msvc\debug\pingpingping.exe
 ```
 
 The executable embeds its media. If `fxc.exe` is missing, check the SDK installation or set `GPUI_FXC_PATH` to the compiler's absolute path.
@@ -26,8 +31,13 @@ The executable embeds its media. If `fxc.exe` is missing, check the SDK installa
 Install stable Rust and Xcode Command Line Tools, then run:
 
 ```sh
-./script/build-macos.sh
+# Release
+./script/build-macos-release.sh
 open dist/PingPingPing.app
+
+# Debug
+./script/build-macos-debug.sh
+open dist/debug/PingPingPing.app
 ```
 
 You can also run `cargo run --release --locked`. Request Input Monitoring through Settings for global gestures. Restart the app if gestures remain unavailable after granting access.
