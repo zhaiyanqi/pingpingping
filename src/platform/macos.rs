@@ -32,7 +32,7 @@ use objc2_foundation::{NSPoint, NSRect, NSSize};
 use objc2_quartz_core::{CALayer, CATransaction};
 
 use crate::gesture::{
-    ALT, CTRL, GestureEvent, InputEvent, Position, SHIFT, SUPER, SideDelivery, Triggers,
+    ALT, CTRL, GestureEvent, InputEvent, MouseDelivery, Position, SHIFT, SUPER, Triggers,
     WHEEL_SIZE, Wheel, WheelInput,
 };
 use crate::model::Location;
@@ -57,8 +57,8 @@ unsafe extern "C" {
     fn CGEventTapEnable(tap: CFMachPortRef, enabled: bool);
 }
 
-pub(crate) fn request_input_access(side_buttons: bool) {
-    if side_buttons {
+pub(crate) fn request_input_access(captures_mouse: bool) {
+    if captures_mouse {
         unsafe { CGRequestPostEventAccess() };
     } else {
         unsafe { CGRequestListenEventAccess() };
@@ -78,15 +78,15 @@ struct TapState {
     events: Sender<GestureEvent>,
     port: CFMachPortRef,
     function_held: bool,
-    side_down: Option<CGEvent>,
+    held_down: Option<CGEvent>,
 }
 
 impl TapState {
-    fn dispatch(&mut self, kind: CGEventType, event: &CGEvent) -> SideDelivery {
+    fn dispatch(&mut self, kind: CGEventType, event: &CGEvent) -> MouseDelivery {
         use CGEventFlags as Flags;
         use CGEventType as Kind;
         let Some(config) = self.triggers.as_ref() else {
-            return SideDelivery::Pass;
+            return MouseDelivery::Pass;
         };
         let flags = event.get_flags();
         let mut modifiers = 0;
@@ -120,10 +120,19 @@ impl TapState {
                 match event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER) {
                     3 => InputEvent::Side(1, matches!(kind, Kind::OtherMouseDown)),
                     4 => InputEvent::Side(2, matches!(kind, Kind::OtherMouseDown)),
+                    n @ 0..64 => {
+                        InputEvent::OtherButton(n as u8, matches!(kind, Kind::OtherMouseDown))
+                    }
                     _ => InputEvent::Interrupt,
                 }
             }
-            Kind::MouseMoved | Kind::LeftMouseDragged | Kind::OtherMouseDragged => InputEvent::Move,
+            Kind::RightMouseDown | Kind::RightMouseUp => {
+                InputEvent::OtherButton(1, matches!(kind, Kind::RightMouseDown))
+            }
+            Kind::MouseMoved
+            | Kind::LeftMouseDragged
+            | Kind::OtherMouseDragged
+            | Kind::RightMouseDragged => InputEvent::Move,
             _ => InputEvent::Interrupt,
         };
         let point = event.location();
@@ -160,7 +169,7 @@ unsafe extern "C" fn tap_callback(
         CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
     ) {
         state.gesture.reset_after_gap();
-        state.side_down = None;
+        state.held_down = None;
         state.function_held = false;
         let _ = state.events.try_send(GestureEvent::Finish(None));
         unsafe { CGEventTapEnable(state.port, true) };
@@ -171,21 +180,32 @@ unsafe extern "C" fn tap_callback(
     }
     let event = ManuallyDrop::new(unsafe { CGEvent::from_ptr(raw) });
     match state.dispatch(kind, &event) {
-        SideDelivery::Pass => raw,
-        SideDelivery::HoldDown => {
-            state.side_down = Some(CGEvent::clone(&event));
+        MouseDelivery::Pass => raw,
+        MouseDelivery::HoldDown => {
+            state.held_down = Some(CGEvent::clone(&event));
             ptr::null_mut()
         }
-        SideDelivery::Swallow => {
-            if matches!(kind, CGEventType::OtherMouseUp) {
-                state.side_down = None;
+        MouseDelivery::Swallow => {
+            if matches!(
+                kind,
+                CGEventType::MouseMoved
+                    | CGEventType::LeftMouseDragged
+                    | CGEventType::RightMouseDragged
+                    | CGEventType::OtherMouseDragged
+            ) {
+                // Move the visible cursor without dispatching a drag to the window underneath.
+                // 移动可见光标，同时避免向下方窗口派发拖动事件。
+                let _ =
+                    core_graphics::display::CGDisplay::warp_mouse_cursor_position(event.location());
+            } else if matches!(kind, CGEventType::LeftMouseUp | CGEventType::OtherMouseUp) {
+                state.held_down = None;
             }
             ptr::null_mut()
         }
-        SideDelivery::ReplayClick => {
+        MouseDelivery::ReplayClick => {
             // Posting from this tap places the original down before this up, without re-entering the tap.
             // 从当前 tap 投递原始按下事件会排在这次松开之前，并跳过当前 tap。
-            if let Some(down) = state.side_down.take() {
+            if let Some(down) = state.held_down.take() {
                 down.post_from_tap(proxy);
             }
             raw
@@ -206,7 +226,7 @@ impl InputMonitor {
         paused: Arc<AtomicBool>,
     ) -> Option<Self> {
         use CGEventType as Kind;
-        let options = if triggers.as_ref().is_some_and(Triggers::uses_side_button) {
+        let options = if triggers.as_ref().is_some_and(Triggers::captures_mouse) {
             CGEventTapOptions::Default
         } else {
             CGEventTapOptions::ListenOnly
@@ -222,6 +242,7 @@ impl InputMonitor {
             Kind::LeftMouseDown,
             Kind::LeftMouseUp,
             Kind::RightMouseDown,
+            Kind::RightMouseUp,
             Kind::OtherMouseDown,
             Kind::OtherMouseUp,
             Kind::ScrollWheel,
@@ -235,7 +256,7 @@ impl InputMonitor {
             paused,
             port: ptr::null_mut(),
             function_held: false,
-            side_down: None,
+            held_down: None,
         });
         let port = unsafe {
             CGEventTapCreate(

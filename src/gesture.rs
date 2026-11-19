@@ -78,10 +78,8 @@ impl Default for Triggers {
 
 impl Triggers {
     #[cfg(target_os = "macos")]
-    pub(crate) fn uses_side_button(&self) -> bool {
-        (self.ping_enabled && matches!(self.ping_key, TriggerKey::Mouse4 | TriggerKey::Mouse5))
-            || (self.emote_enabled
-                && matches!(self.emote_key, TriggerKey::Mouse4 | TriggerKey::Mouse5))
+    pub(crate) fn captures_mouse(&self) -> bool {
+        self.ping_enabled || self.emote_enabled
     }
 
     fn match_wheel(&self, matches: impl Fn(&TriggerKey) -> bool) -> Option<Wheel> {
@@ -107,12 +105,24 @@ pub(crate) enum InputEvent {
     Modifier,
     Side(u8, bool),
     Left(bool),
+    OtherButton(u8, bool),
     Move,
     Interrupt,
 }
 
+impl InputEvent {
+    fn button(self) -> Option<(u8, bool)> {
+        match self {
+            Self::Left(down) => Some((0, down)),
+            Self::Side(bit, down) => Some((bit + 2, down)),
+            Self::OtherButton(number, down) => Some((number, down)),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SideDelivery {
+pub(crate) enum MouseDelivery {
     Pass,
     HoldDown,
     Swallow,
@@ -124,7 +134,9 @@ pub(crate) struct WheelInput {
     gesture: Gesture,
     keys: Vec<u16>,
     sides: u8,
-    held_side: Option<u8>,
+    other_buttons: u64,
+    held_button: Option<u8>,
+    swallowed_buttons: u64,
     left: bool,
     suppressed: bool,
 }
@@ -133,15 +145,20 @@ impl WheelInput {
     #[cfg(any(target_os = "macos", test))]
     pub(crate) fn reset_after_gap(&mut self) {
         // If the withheld press is still held, its eventual release must also be consumed.
-        // 如果被暂扣的侧键仍按着，恢复监听后还需拦截它的松开事件。
+        // 如果被暂扣的鼠标键仍按着，恢复监听后还需拦截它的松开事件。
         *self = Self {
-            held_side: self.held_side,
+            swallowed_buttons: self.swallowed_buttons | self.held_button.map_or(0, |id| 1u64 << id),
             ..Self::default()
         };
     }
 
+    #[cfg(target_os = "windows")]
+    pub(crate) fn visible(&self) -> bool {
+        self.gesture.visible
+    }
+
     pub(crate) fn active(&self) -> bool {
-        !self.keys.is_empty() || self.sides != 0 || self.left
+        !self.keys.is_empty() || self.sides != 0 || self.left || self.other_buttons != 0
     }
 
     pub(crate) fn event(
@@ -152,17 +169,22 @@ impl WheelInput {
         at: Position,
         paused: bool,
         scale: impl FnOnce() -> f64,
-    ) -> (Vec<GestureEvent>, SideDelivery) {
+    ) -> (Vec<GestureEvent>, MouseDelivery) {
+        let button = event.button();
+        let was_open = self.gesture.visible;
+        if let Some((id, true)) = button {
+            // A new down also recovers from a release lost while the hook was suspended.
+            // 如果监听暂停时丢失了松开事件，新按下事件会重新开始这一对按键。
+            self.swallowed_buttons &= !(1u64 << id);
+        }
         match event {
             InputEvent::Key(code, true) if !self.keys.contains(&code) => self.keys.push(code),
             InputEvent::Key(code, false) => self.keys.retain(|key| *key != code),
             InputEvent::Side(bit, true) => {
-                if self.held_side == Some(bit) && self.sides & bit == 0 {
-                    self.held_side = None;
-                }
                 self.sides |= bit;
             }
             InputEvent::Left(true) => self.left = true,
+            InputEvent::OtherButton(id, true) => self.other_buttons |= 1u64 << id,
             _ => {}
         }
         // Resolve ownership before clearing the released button. A side button owns its whole drag.
@@ -202,22 +224,33 @@ impl WheelInput {
         self.suppressed |= paused
             || count > 1
             || (self.sides != 0 && self.left)
-            || matches!(event, InputEvent::Interrupt);
+            || matches!(
+                event,
+                InputEvent::Interrupt | InputEvent::OtherButton(_, true)
+            );
         let scale = if action == Pointer::Down && wheel.is_some() && !self.suppressed {
             scale()
         } else {
             1.0
         };
-        // Some apps navigate on button-down. Defer both edges until the gesture is classified.
-        // 有些应用在按下侧键时就会跳转，因此要等手势确定后再决定是否交付这一对按键事件。
-        let delivery = match event {
-            InputEvent::Side(bit, true) if self.held_side == Some(bit) => SideDelivery::Swallow,
-            InputEvent::Side(bit, true) if wheel.is_some() && !self.suppressed => {
-                self.held_side = Some(bit);
-                SideDelivery::HoldDown
+        // Hold the initiating press so a drag never leaves the foreground app with a stuck button.
+        // 暂扣起始按下事件，避免拖动时前台应用只收到按下、收不到松开。
+        let mut delivery = match button {
+            Some((id, true)) if self.held_button == Some(id) => MouseDelivery::Swallow,
+            Some((id, true)) if was_open => {
+                self.swallowed_buttons |= 1u64 << id;
+                MouseDelivery::Swallow
             }
-            InputEvent::Side(bit, false) if self.held_side == Some(bit) => {
-                self.held_side = None;
+            Some((id, true)) if action == Pointer::Down && wheel.is_some() && !self.suppressed => {
+                self.held_button = Some(id);
+                MouseDelivery::HoldDown
+            }
+            Some((id, false)) if self.swallowed_buttons & (1u64 << id) != 0 => {
+                self.swallowed_buttons &= !(1u64 << id);
+                MouseDelivery::Swallow
+            }
+            Some((id, false)) if self.held_button == Some(id) => {
+                self.held_button = None;
                 if !self.suppressed
                     && !self.gesture.visible
                     && self.gesture.held.is_some_and(|(_, origin)| {
@@ -225,19 +258,25 @@ impl WheelInput {
                             <= OPEN_DISTANCE * self.gesture.scale
                     })
                 {
-                    SideDelivery::ReplayClick
+                    MouseDelivery::ReplayClick
                 } else {
-                    SideDelivery::Swallow
+                    MouseDelivery::Swallow
                 }
             }
-            _ => SideDelivery::Pass,
+            _ => MouseDelivery::Pass,
         };
         let updates =
             self.gesture
                 .input(wheel, at, action, self.suppressed, scale, config.click_ping);
+        if (was_open || self.gesture.visible)
+            && matches!(event, InputEvent::Move | InputEvent::Interrupt)
+        {
+            delivery = MouseDelivery::Swallow;
+        }
         match event {
             InputEvent::Side(bit, false) => self.sides &= !bit,
             InputEvent::Left(false) => self.left = false,
+            InputEvent::OtherButton(id, false) => self.other_buttons &= !(1u64 << id),
             _ => {}
         }
         if modifiers == 0 && !self.active() {
@@ -342,6 +381,80 @@ mod tests {
     use super::*;
 
     #[test]
+    fn keyboard_drag_consumes_open_move_selection_and_release() {
+        let mut state = WheelInput::default();
+        let mut event = |kind, x| {
+            state.event(
+                &Triggers::default(),
+                ALT,
+                kind,
+                Position { x, y: 0. },
+                false,
+                || 1.,
+            )
+        };
+        assert_eq!(event(InputEvent::Left(true), 0.).1, MouseDelivery::HoldDown);
+        assert_eq!(
+            event(InputEvent::Left(false), 1.).1,
+            MouseDelivery::ReplayClick
+        );
+        assert_eq!(event(InputEvent::Left(true), 0.).1, MouseDelivery::HoldDown);
+        assert_eq!(event(InputEvent::Move, 9.).1, MouseDelivery::Swallow);
+        let (updates, delivery) = event(InputEvent::Move, 100.);
+        assert_eq!(
+            (updates, delivery),
+            (vec![GestureEvent::Select(Some(2))], MouseDelivery::Swallow)
+        );
+        let (updates, delivery) = event(InputEvent::Left(false), -100.);
+        assert!(matches!(
+            updates.as_slice(),
+            [GestureEvent::Finish(Some((Wheel::Ping, 6, _)))]
+        ));
+        assert_eq!(delivery, MouseDelivery::Swallow);
+        assert_eq!(event(InputEvent::Move, 0.).1, MouseDelivery::Pass);
+    }
+
+    #[test]
+    fn cancelling_mouse_events_and_their_releases_do_not_leak() {
+        let config = Triggers {
+            emote_key: TriggerKey::Mouse5,
+            ..Triggers::default()
+        };
+        for interrupt in [
+            InputEvent::OtherButton(1, true),
+            InputEvent::OtherButton(2, true),
+            InputEvent::Left(true),
+            InputEvent::Side(1, true),
+            InputEvent::Interrupt,
+        ] {
+            let mut state = WheelInput::default();
+            let mut event =
+                |kind, x| state.event(&config, 0, kind, Position { x, y: 0. }, false, || 1.);
+            assert_eq!(
+                event(InputEvent::Side(2, true), 0.).1,
+                MouseDelivery::HoldDown
+            );
+            assert_eq!(event(InputEvent::Move, 90.).1, MouseDelivery::Swallow);
+            assert_eq!(
+                event(interrupt, 90.),
+                (vec![GestureEvent::Finish(None)], MouseDelivery::Swallow)
+            );
+            assert_eq!(
+                event(InputEvent::Side(2, false), 90.).1,
+                MouseDelivery::Swallow
+            );
+            let release = match interrupt {
+                InputEvent::OtherButton(id, _) => InputEvent::OtherButton(id, false),
+                InputEvent::Left(_) => InputEvent::Left(false),
+                InputEvent::Side(bit, _) => InputEvent::Side(bit, false),
+                _ => continue,
+            };
+            assert_eq!(event(release, 90.).1, MouseDelivery::Swallow);
+            assert_eq!(event(interrupt, 90.).1, MouseDelivery::Pass);
+        }
+    }
+
+    #[test]
     fn a_gap_in_input_cancels_the_held_click_and_accepts_the_next_press() {
         let config = Triggers {
             emote_key: TriggerKey::Mouse4,
@@ -354,13 +467,13 @@ mod tests {
                 .event(&config, 0, InputEvent::Side(1, down), at, false, || 1.)
                 .1
         };
-        assert_eq!(side(&mut input, true), SideDelivery::HoldDown);
+        assert_eq!(side(&mut input, true), MouseDelivery::HoldDown);
         input.reset_after_gap();
-        assert_eq!(side(&mut input, false), SideDelivery::Swallow);
-        assert_eq!(side(&mut input, true), SideDelivery::HoldDown);
+        assert_eq!(side(&mut input, false), MouseDelivery::Swallow);
+        assert_eq!(side(&mut input, true), MouseDelivery::HoldDown);
         input.reset_after_gap();
-        assert_eq!(side(&mut input, true), SideDelivery::HoldDown);
-        assert_eq!(side(&mut input, false), SideDelivery::ReplayClick);
+        assert_eq!(side(&mut input, true), MouseDelivery::HoldDown);
+        assert_eq!(side(&mut input, false), MouseDelivery::ReplayClick);
     }
 
     #[test]
@@ -375,27 +488,27 @@ mod tests {
         for open in [false, true] {
             assert_eq!(
                 event(InputEvent::Side(2, true), 0.).1,
-                SideDelivery::HoldDown
+                MouseDelivery::HoldDown
             );
-            assert_eq!(event(InputEvent::Move, 12.), (vec![], SideDelivery::Pass));
+            assert_eq!(event(InputEvent::Move, 12.), (vec![], MouseDelivery::Pass));
             if open {
                 let (updates, delivery) = event(InputEvent::Move, 13.);
                 assert!(matches!(
                     updates.as_slice(),
                     [GestureEvent::Open(Wheel::Emote, _, None)]
                 ));
-                assert_eq!(delivery, SideDelivery::Pass);
+                assert_eq!(delivery, MouseDelivery::Swallow);
                 assert_eq!(
                     event(InputEvent::Side(2, false), 0.),
-                    (vec![GestureEvent::Finish(None)], SideDelivery::Swallow)
+                    (vec![GestureEvent::Finish(None)], MouseDelivery::Swallow)
                 );
             } else {
                 assert_eq!(
                     event(InputEvent::Side(2, false), 0.),
-                    (vec![], SideDelivery::ReplayClick)
+                    (vec![], MouseDelivery::ReplayClick)
                 );
             }
-            assert_eq!(event(InputEvent::Side(2, false), 0.).1, SideDelivery::Pass);
+            assert_eq!(event(InputEvent::Side(2, false), 0.).1, MouseDelivery::Pass);
         }
     }
 
@@ -426,7 +539,7 @@ mod tests {
                             || 1.
                         )
                         .1,
-                    SideDelivery::Pass
+                    MouseDelivery::Pass
                 );
             }
             input.event(&config, 0, InputEvent::Modifier, at, false, || 1.);

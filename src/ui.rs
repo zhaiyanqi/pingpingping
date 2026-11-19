@@ -1428,10 +1428,10 @@ impl Render for Settings {
         let active = model.input_ready;
         let incoming_muted = model.profile.incoming_muted();
         #[cfg(target_os = "macos")]
-        let side_access = model.profile.gestures && model.profile.triggers.uses_side_button();
+        let capture_access = model.profile.gestures && model.profile.triggers.captures_mouse();
         #[cfg(target_os = "macos")]
-        let permission_hint = if side_access {
-            "侧键拦截需要「隐私与安全性 → 辅助功能」权限。授权后请重新检测。"
+        let permission_hint = if capture_access {
+            "轮盘拦截鼠标事件需要「隐私与安全性 → 辅助功能」权限。授权后请重新检测。"
         } else {
             "请在系统设置的「隐私与安全性 → 输入监控」中授权，再重试。"
         };
@@ -1490,7 +1490,7 @@ impl Render for Settings {
                     .child({
                         let row = div().flex().gap_2();
                         #[cfg(target_os = "macos")]
-                        let row = row.child(Button::new("permission").label(if side_access { "请求辅助功能权限…" } else { "请求输入监控权限…" }).on_click(move |_, _, _| platform::request_input_access(side_access)));
+                        let row = row.child(Button::new("permission").label(if capture_access { "请求辅助功能权限…" } else { "请求输入监控权限…" }).on_click(move |_, _, _| platform::request_input_access(capture_access)));
                         row.child(Button::new("retry").ghost().label("重新检测").on_click(cx.listener(|this, _, _, cx| this.retry_input(cx))))
                     })))
             .child(div().flex().flex_col().gap_3().border_t_1().border_color(theme.border).pt_4()

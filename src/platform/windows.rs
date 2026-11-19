@@ -21,7 +21,7 @@ use windows_sys::Win32::{
 
 use super::{AnimationOverlay, AudioCue, start_audio, wheel::WheelView};
 use crate::gesture::{
-    ALT, CTRL, GestureEvent, InputEvent, Position, SHIFT, SUPER, SideDelivery, Triggers,
+    ALT, CTRL, GestureEvent, InputEvent, MouseDelivery, Position, SHIFT, SUPER, Triggers,
     WHEEL_SIZE, Wheel, WheelInput,
 };
 use crate::model::Location;
@@ -55,6 +55,7 @@ impl InputMonitor {
                         events,
                         triggers,
                         gesture: WheelInput::default(),
+                        wheel_cursor: None,
                         paused,
                         keys: initial_keys(),
                     });
@@ -73,8 +74,8 @@ impl InputMonitor {
                     && installed
                 {
                     while unsafe { GetMessageW(&mut message, null_mut(), 0, 0) } > 0 {
-                        if message.message == REPLAY_SIDE_CLICK && matches!(message.wParam, 1 | 2) {
-                            replay_side_click(message.wParam as u32);
+                        if message.message == REPLAY_MOUSE_CLICK && message.wParam <= 2 {
+                            replay_mouse_click(message.wParam as u32);
                         } else {
                             unsafe { DispatchMessageW(&message) };
                         }
@@ -115,6 +116,7 @@ struct Input {
     events: Sender<GestureEvent>,
     triggers: Option<Triggers>,
     gesture: WheelInput,
+    wheel_cursor: Option<Position>,
     keys: u16,
     paused: std::sync::Arc<AtomicBool>,
 }
@@ -140,9 +142,9 @@ fn initial_keys() -> u16 {
 }
 
 impl Input {
-    fn dispatch(&mut self, point: POINT, event: InputEvent) -> SideDelivery {
+    fn dispatch(&mut self, point: POINT, event: InputEvent) -> MouseDelivery {
         let Some(config) = &self.triggers else {
-            return SideDelivery::Pass;
+            return MouseDelivery::Pass;
         };
         let mut modifiers = 0;
         for (mask, modifier) in [(0x03, ALT), (0x0c, CTRL), (0x30, SHIFT), (0xc0, SUPER)] {
@@ -150,14 +152,27 @@ impl Input {
                 modifiers |= modifier;
             }
         }
+        let mut at = position(point);
+        if let Some(previous) = self.wheel_cursor {
+            // A swallowed move does not advance the Windows cursor. Accumulate its proposed displacement.
+            // 吞掉移动事件后系统光标不会前进，因此用建议坐标与实际坐标的差累积轮盘位置。
+            let mut cursor = POINT::default();
+            if unsafe { GetCursorPos(&mut cursor) } != 0 {
+                at = Position {
+                    x: previous.x + at.x - f64::from(cursor.x),
+                    y: previous.y + at.y - f64::from(cursor.y),
+                };
+            }
+        }
         let (updates, delivery) = self.gesture.event(
             config,
             modifiers,
             event,
-            position(point),
+            at,
             self.paused.load(Ordering::Relaxed),
             || f64::from(screen(point, false).1) / 96.0,
         );
+        self.wheel_cursor = self.gesture.visible().then_some(at);
         for update in updates {
             let _ = self.events.try_send(update);
         }
@@ -210,12 +225,17 @@ unsafe extern "system" fn keyboard_hook(code: i32, message: WPARAM, data: LPARAM
     unsafe { CallNextHookEx(null_mut(), code, message, data) }
 }
 
-const REPLAY_SIDE_CLICK: u32 = WM_APP + 1;
+const REPLAY_MOUSE_CLICK: u32 = WM_APP + 1;
 const REPLAY_MARKER: usize = 0x50505058;
 
-fn replay_side_click(bit: u32) {
+fn replay_mouse_click(bit: u32) {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::INPUT as WinInput;
-    let pair = [MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP].map(|flags| WinInput {
+    let flags = if bit == 0 {
+        [MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP]
+    } else {
+        [MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP]
+    };
+    let pair = flags.map(|flags| WinInput {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
             mi: MOUSEINPUT {
@@ -233,7 +253,7 @@ fn replay_side_click(bit: u32) {
         if unsafe { SendInput(remaining.len() as u32, remaining.as_ptr(), size) }
             != remaining.len() as u32
         {
-            eprintln!("无法还原鼠标侧键单击");
+            eprintln!("无法还原鼠标单击");
         }
     }
 }
@@ -247,7 +267,7 @@ unsafe extern "system" fn mouse_hook(code: i32, message: WPARAM, data: LPARAM) -
         let delivery = INPUT.with(|cell| {
             let mut cell = cell.borrow_mut();
             let Some(input) = cell.as_mut() else {
-                return SideDelivery::Pass;
+                return MouseDelivery::Pass;
             };
             let kind = match message as u32 {
                 WM_MOUSEMOVE if input.keys != 0 || input.gesture.active() => InputEvent::Move,
@@ -257,23 +277,31 @@ unsafe extern "system" fn mouse_hook(code: i32, message: WPARAM, data: LPARAM) -
                     bit @ (1 | 2) => InputEvent::Side(bit as u8, message as u32 == WM_XBUTTONDOWN),
                     _ => InputEvent::Interrupt,
                 },
-                WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
-                    InputEvent::Interrupt
+                WM_RBUTTONDOWN | WM_RBUTTONUP => {
+                    InputEvent::OtherButton(1, message as u32 == WM_RBUTTONDOWN)
                 }
-                _ => return SideDelivery::Pass,
+                WM_MBUTTONDOWN | WM_MBUTTONUP => {
+                    InputEvent::OtherButton(2, message as u32 == WM_MBUTTONDOWN)
+                }
+                WM_MOUSEWHEEL | WM_MOUSEHWHEEL => InputEvent::Interrupt,
+                _ => return MouseDelivery::Pass,
             };
             input.dispatch(event.pt, kind)
         });
         match delivery {
-            SideDelivery::HoldDown | SideDelivery::Swallow => return 1,
+            MouseDelivery::HoldDown | MouseDelivery::Swallow => return 1,
             // SendInput can block on our own hook. Replay after this callback returns.
             // SendInput 可能等待当前钩子返回，因此把单击交给消息循环回放。
-            SideDelivery::ReplayClick
+            MouseDelivery::ReplayClick
                 if unsafe {
                     PostThreadMessageW(
                         GetCurrentThreadId(),
-                        REPLAY_SIDE_CLICK,
-                        (event.mouseData >> 16) as usize,
+                        REPLAY_MOUSE_CLICK,
+                        if message as u32 == WM_LBUTTONUP {
+                            0
+                        } else {
+                            (event.mouseData >> 16) as usize
+                        },
                         0,
                     )
                 } != 0 =>
