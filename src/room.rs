@@ -489,6 +489,7 @@ mod tests {
 
     use super::*;
     use crate::assets::{EMOTES, PINGS};
+    use crate::model::TextEffect;
 
     #[test]
     fn endpoints_require_a_local_ipv4_and_nonzero_port() {
@@ -548,13 +549,14 @@ mod tests {
                 .await
                 .unwrap();
                 second.activate();
-                let text = Message::new(Uuid::new_v4(), "甲".into(), Body::Text("你好".into()));
+                let mut text = Message::new(Uuid::new_v4(), "甲".into(), Body::Text("你好".into()));
+                text.text_effect = TextEffect::Shake;
                 first.send(text.clone()).unwrap();
                 assert!(
-                    matches!(host_inbox.recv().await.unwrap(), RoomEvent::Message(_, received) if received.id == text.id)
+                    matches!(host_inbox.recv().await.unwrap(), RoomEvent::Message(_, received) if received.id == text.id && received.text_effect == TextEffect::Shake)
                 );
                 assert!(
-                    matches!(second_inbox.recv().await.unwrap(), RoomEvent::Message(_, received) if received.id == text.id)
+                    matches!(second_inbox.recv().await.unwrap(), RoomEvent::Message(_, received) if received.id == text.id && received.text_effect == TextEffect::Shake)
                 );
                 let emote = Message::new(
                     Uuid::new_v4(),

@@ -11,7 +11,7 @@ use rodio::{Decoder, DeviceSinkBuilder, Player};
 use crate::assets::{EMOTES, PINGS, WHEEL_TICK};
 use crate::emotes::{EmoteId, EmoteStore};
 use crate::gesture::Wheel;
-use crate::model::{EmotePage, OverlaySettings, TextOverlaySettings, WheelEmote};
+use crate::model::{EmotePage, OverlaySettings, TextEffect, TextOverlaySettings, WheelEmote};
 
 mod playback;
 pub(crate) use playback::{Animation, AnimationOverlay};
@@ -90,9 +90,10 @@ impl Overlay {
         &mut self,
         text: &str,
         settings: TextOverlaySettings,
+        effect: TextEffect,
         cx: &gpui_kit::App,
     ) {
-        self.animations.play_text(text, settings, cx);
+        self.animations.play_text(text, settings, effect, cx);
     }
 
     pub(crate) fn play(

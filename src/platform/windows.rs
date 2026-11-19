@@ -21,7 +21,7 @@ use windows_sys::Win32::{
 
 use super::playback::{
     FrameUpdate, TEXT_FONT_SIZE, TEXT_MARGIN, TEXT_MAX_LINES, TEXT_PADDING, TEXT_RADIUS,
-    TEXT_WIDTH, TextColors, text_anchor,
+    TEXT_WIDTH, TextColors, TextFrame, text_anchor,
 };
 use super::{AnimationOverlay, AudioCue, WheelContents, start_audio, wheel::WheelView};
 use crate::gesture::{
@@ -840,17 +840,18 @@ pub(super) fn text_presenter(
     text: &str,
     position: TextPosition,
     colors: TextColors,
-) -> Option<impl FnMut(f32, f64) + use<>> {
+) -> Option<impl FnMut(TextFrame) + use<>> {
     let (info, dpi) = monitor_info(POINT::default(), true);
     let work = info.rcWork;
     let work_width = (work.right - work.left).max(0) as u32;
     let work_height = (work.bottom - work.top).max(0) as u32;
     let width = pixels(TEXT_WIDTH, dpi).min(work_width);
     let surface = text_surface(text, colors, width, work_height, dpi)?;
+    let free_x = f64::from(work_width - surface.width);
     let free_y = f64::from(work_height - surface.height);
     let (x, y) = text_anchor(
         position,
-        f64::from(work_width - surface.width),
+        free_x,
         free_y,
         f64::from(pixels(TEXT_MARGIN, dpi)),
     );
@@ -859,16 +860,14 @@ pub(super) fn text_presenter(
         return None;
     }
     layer.surface = Some(surface);
-    Some(move |opacity, offset: f64| {
+    let scale = f64::from(dpi) / 96.0;
+    Some(move |frame: TextFrame| {
         layer.present(
             POINT {
-                x: work.left + x.round() as i32,
-                y: work.top
-                    + (y + offset * f64::from(dpi) / 96.0)
-                        .clamp(0.0, free_y)
-                        .round() as i32,
+                x: work.left + (x + frame.offset_x * scale).clamp(0.0, free_x).round() as i32,
+                y: work.top + (y + frame.offset_y * scale).clamp(0.0, free_y).round() as i32,
             },
-            alpha_byte(opacity),
+            alpha_byte(frame.opacity),
         );
     })
 }

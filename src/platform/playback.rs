@@ -13,14 +13,13 @@ use image::{AnimationDecoder, DynamicImage, ImageResult, RgbaImage, codecs::webp
 
 use crate::emotes::{self, EmoteId, EmoteImage, EmoteStore, has_visible_pixels};
 use crate::gesture::Position;
-use crate::model::{Location, TextMotion, TextOverlaySettings, TextPosition};
+use crate::model::{Location, TextEffect, TextMotion, TextOverlaySettings, TextPosition};
 
 use super::{animation_presenter, system_reduces_motion, text_presenter};
 
 pub(super) const MAX_ACTIVE: usize = 16;
 const TRANSITION_DURATION: Duration = Duration::from_millis(180);
 const TRANSITION_FRAME: Duration = Duration::from_millis(16);
-const TEXT_HOLD: Duration = Duration::from_secs(4);
 pub(super) const TEXT_WIDTH: u32 = 360;
 pub(super) const TEXT_PADDING: u32 = 14;
 pub(super) const TEXT_RADIUS: u32 = 12;
@@ -31,6 +30,12 @@ pub(super) const TEXT_MARGIN: u32 = 24;
 pub(super) struct TextColors {
     pub(super) background: Rgba,
     pub(super) foreground: Rgba,
+}
+
+pub(super) struct TextFrame {
+    pub(super) opacity: f32,
+    pub(super) offset_x: f64,
+    pub(super) offset_y: f64,
 }
 
 pub(super) enum FrameUpdate {
@@ -126,39 +131,118 @@ impl AnimationOverlay {
         active.insert(id, task);
     }
 
-    pub(super) fn play_text(&mut self, text: &str, settings: TextOverlaySettings, cx: &App) {
+    pub(super) fn play_text(
+        &mut self,
+        text: &str,
+        settings: TextOverlaySettings,
+        effect: TextEffect,
+        cx: &App,
+    ) {
         let theme = cx.theme();
         let colors = TextColors {
             background: theme.popover.into(),
             foreground: theme.popover_foreground.into(),
         };
-        let Some(mut present) = text_presenter(text, settings.position, colors) else {
+        let Some(present) = text_presenter(text, settings.position, colors) else {
             return;
         };
-        let (enter, exit) = if cx.reduce_motion() || system_reduces_motion() {
-            (TextMotion::None, TextMotion::None)
-        } else {
-            (settings.enter, settings.exit)
-        };
+        let reduce_motion = cx.reduce_motion() || system_reduces_motion();
         // A new message takes over the card immediately, so bursts cannot obscure each other.
         // 新消息立即接替这张卡片，连发时卡片不会互相遮挡。
         self.text = Some(cx.spawn(async move |_| {
-            if enter == TextMotion::None {
-                present(1.0, 0.0);
-            } else {
-                transition(true, |hidden| {
-                    present_text(&mut present, settings.position, enter, hidden);
-                })
-                .await;
-            }
-            smol::Timer::after(TEXT_HOLD).await;
-            if exit != TextMotion::None {
-                transition(false, |hidden| {
-                    present_text(&mut present, settings.position, exit, hidden);
-                })
-                .await;
-            }
+            play_text_overlay(settings, effect, reduce_motion, present).await;
         }));
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TextEntrance {
+    Basic(TextMotion),
+    FlyIn,
+    Shake,
+    Bounce,
+}
+
+impl TextEntrance {
+    fn duration(self) -> Duration {
+        match self {
+            Self::Basic(TextMotion::None) => Duration::ZERO,
+            Self::Basic(_) => TRANSITION_DURATION,
+            Self::FlyIn => Duration::from_millis(300),
+            Self::Shake => Duration::from_millis(380),
+            Self::Bounce => Duration::from_millis(440),
+        }
+    }
+
+    fn frame(self, position: TextPosition, progress: f32) -> TextFrame {
+        let remaining = 1.0 - progress;
+        match self {
+            Self::Basic(motion) => basic_text_frame(position, motion, remaining.powi(3)),
+            Self::FlyIn => {
+                let inward_x = match position {
+                    TextPosition::TopLeft | TextPosition::BottomLeft => 1.0,
+                    TextPosition::TopRight | TextPosition::BottomRight => -1.0,
+                };
+                TextFrame {
+                    opacity: (progress * 3.0).min(1.0),
+                    offset_x: inward_x * 120.0 * f64::from(remaining.powi(3)),
+                    offset_y: 0.0,
+                }
+            }
+            Self::Shake => {
+                // A quick reveal is followed by a damped, two-axis shake around the anchor.
+                // 文字快速显现，随后围绕定位点做幅度递减的双轴抖动。
+                let phase = f64::from(progress) * std::f64::consts::TAU;
+                let amplitude = f64::from(remaining.powi(2));
+                TextFrame {
+                    opacity: (progress * 12.0).min(1.0),
+                    offset_x: 18.0 * amplitude * (phase * 3.0).sin(),
+                    offset_y: 8.0 * amplitude * (phase * 2.0).sin(),
+                }
+            }
+            Self::Bounce => {
+                // Rebound into the work area after each contact with the resting position.
+                // 每次触及停靠位置后，都向工作区内侧回弹。
+                let phase = f64::from(progress) * std::f64::consts::TAU * 1.4;
+                TextFrame {
+                    opacity: (progress * 4.0).min(1.0),
+                    offset_x: 0.0,
+                    offset_y: vertical_direction(position)
+                        * 68.0
+                        * f64::from(remaining.powi(2))
+                        * phase.cos().abs(),
+                }
+            }
+        }
+    }
+}
+
+async fn play_text_overlay(
+    settings: TextOverlaySettings,
+    effect: TextEffect,
+    reduce_motion: bool,
+    mut present: impl FnMut(TextFrame),
+) {
+    let (enter, exit) = if reduce_motion {
+        (TextEntrance::Basic(TextMotion::None), TextMotion::None)
+    } else {
+        match effect {
+            TextEffect::Default => (TextEntrance::Basic(settings.enter), settings.exit),
+            TextEffect::Fade => (TextEntrance::Basic(TextMotion::Fade), TextMotion::Fade),
+            TextEffect::Slide => (TextEntrance::Basic(TextMotion::Slide), TextMotion::Slide),
+            TextEffect::FlyIn => (TextEntrance::FlyIn, TextMotion::Fade),
+            TextEffect::Shake => (TextEntrance::Shake, TextMotion::Fade),
+            TextEffect::Bounce => (TextEntrance::Bounce, TextMotion::Fade),
+            TextEffect::None => (TextEntrance::Basic(TextMotion::None), TextMotion::None),
+        }
+    };
+    animate(enter.duration(), |progress| {
+        present(enter.frame(settings.position, progress));
+    })
+    .await;
+    smol::Timer::after(Duration::from_millis(u64::from(settings.timeout_ms))).await;
+    if exit != TextMotion::None {
+        transition(|hidden| present(basic_text_frame(settings.position, exit, hidden))).await;
     }
 }
 
@@ -183,40 +267,39 @@ pub(super) fn text_anchor(
     (x, y)
 }
 
-fn present_text(
-    present: &mut impl FnMut(f32, f64),
-    position: TextPosition,
-    motion: TextMotion,
-    hidden: f32,
-) {
-    let offset = if motion == TextMotion::Slide {
-        let direction = match position {
-            TextPosition::TopLeft | TextPosition::TopRight => -1.0,
-            TextPosition::BottomLeft | TextPosition::BottomRight => 1.0,
-        };
-        direction * 20.0 * f64::from(hidden)
-    } else {
-        0.0
-    };
-    present(1.0 - hidden, offset);
+fn vertical_direction(position: TextPosition) -> f64 {
+    match position {
+        TextPosition::TopLeft | TextPosition::TopRight => 1.0,
+        TextPosition::BottomLeft | TextPosition::BottomRight => -1.0,
+    }
 }
 
-async fn transition(entering: bool, mut present: impl FnMut(f32)) {
+fn basic_text_frame(position: TextPosition, motion: TextMotion, hidden: f32) -> TextFrame {
+    TextFrame {
+        opacity: 1.0 - hidden,
+        offset_x: 0.0,
+        offset_y: if motion == TextMotion::Slide {
+            -vertical_direction(position) * 20.0 * f64::from(hidden)
+        } else {
+            0.0
+        },
+    }
+}
+
+async fn transition(mut present: impl FnMut(f32)) {
+    animate(TRANSITION_DURATION, |progress| present(progress.powi(2))).await;
+}
+
+async fn animate(duration: Duration, mut present: impl FnMut(f32)) {
     let start = Instant::now();
-    let end = start + TRANSITION_DURATION;
+    let end = start + duration;
     loop {
         let now = Instant::now();
-        let progress =
-            (now.duration_since(start).as_secs_f32() / TRANSITION_DURATION.as_secs_f32()).min(1.0);
-        let hidden = if entering {
-            (1.0 - progress).powi(3)
-        } else {
-            progress.powi(2)
-        };
-        present(hidden);
-        if progress == 1.0 {
+        if now >= end {
+            present(1.0);
             break;
         }
+        present(now.duration_since(start).as_secs_f32() / duration.as_secs_f32());
         smol::Timer::at((now + TRANSITION_FRAME).min(end)).await;
     }
 }
@@ -388,7 +471,7 @@ async fn run(
     if shown && fade_out {
         // Keep the last bitmap in the native window and change only its opacity.
         // 保留原生浮窗中的最后一帧，只更新透明度。
-        transition(false, |hidden| present(FrameUpdate::Opacity(1.0 - hidden))).await;
+        transition(|hidden| present(FrameUpdate::Opacity(1.0 - hidden))).await;
     }
 }
 
@@ -412,22 +495,65 @@ mod tests {
 
     #[test]
     fn text_slide_moves_toward_its_edge_and_fade_holds_position() {
-        let mut updates = Vec::new();
-        let mut present = |opacity, offset| updates.push((opacity, offset));
-        present_text(&mut present, TextPosition::TopRight, TextMotion::Slide, 0.5);
-        present_text(
-            &mut present,
-            TextPosition::BottomRight,
-            TextMotion::Slide,
-            0.5,
-        );
-        present_text(
-            &mut present,
-            TextPosition::BottomRight,
-            TextMotion::Fade,
-            0.5,
-        );
-        assert_eq!(updates, [(0.5, -10.0), (0.5, 10.0), (0.5, 0.0)]);
+        for (position, motion, y) in [
+            (TextPosition::TopRight, TextMotion::Slide, -10.0),
+            (TextPosition::BottomRight, TextMotion::Slide, 10.0),
+            (TextPosition::BottomRight, TextMotion::Fade, 0.0),
+        ] {
+            let frame = basic_text_frame(position, motion, 0.5);
+            assert_eq!(
+                (frame.opacity, frame.offset_x, frame.offset_y),
+                (0.5, 0.0, y)
+            );
+        }
+    }
+
+    #[test]
+    fn text_presets_move_distinctly_and_settle_on_the_anchor() {
+        let right = TextPosition::BottomRight;
+        let left = TextPosition::TopLeft;
+        let fly_from_left = TextEntrance::FlyIn.frame(right, 0.25);
+        let fly_from_right = TextEntrance::FlyIn.frame(left, 0.25);
+        assert!(fly_from_left.offset_x < -45.0);
+        assert_eq!(fly_from_left.offset_x, -fly_from_right.offset_x);
+        assert!(TextEntrance::Shake.frame(right, 0.08).offset_x > 10.0);
+        assert!(TextEntrance::Shake.frame(right, 0.25).offset_x < -10.0);
+        assert!(TextEntrance::Bounce.frame(left, 0.25).offset_y > 20.0);
+        assert!(TextEntrance::Bounce.frame(right, 0.25).offset_y < -20.0);
+        for preset in [
+            TextEntrance::FlyIn,
+            TextEntrance::Shake,
+            TextEntrance::Bounce,
+        ] {
+            let frame = preset.frame(right, 1.0);
+            assert_eq!(
+                (frame.opacity, frame.offset_x, frame.offset_y),
+                (1.0, 0.0, 0.0)
+            );
+        }
+    }
+
+    #[test]
+    fn text_uses_the_configured_hold_with_reduced_motion() {
+        let settings = TextOverlaySettings {
+            timeout_ms: 40,
+            ..Default::default()
+        };
+        let mut presented = None;
+        smol::block_on(smol::future::or(
+            play_text_overlay(settings, TextEffect::Shake, true, |frame| {
+                assert_eq!(
+                    (frame.opacity, frame.offset_x, frame.offset_y),
+                    (1.0, 0.0, 0.0)
+                );
+                assert!(presented.replace(Instant::now()).is_none());
+            }),
+            async {
+                smol::Timer::after(Duration::from_secs(1)).await;
+                panic!("text overlay did not use the configured hold");
+            },
+        ));
+        assert!(presented.unwrap().elapsed() >= Duration::from_millis(40));
     }
 
     #[test]

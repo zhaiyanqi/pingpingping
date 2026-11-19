@@ -32,7 +32,7 @@ use crate::emotes::{EmoteId, EmoteStore, LibraryEmote};
 use crate::gesture::{GestureEvent, TriggerKey, Triggers, Wheel};
 use crate::model::{
     ANIMATION_TIMEOUT, Body, EMOTE_SIZE, EmotePage, Message, Model, OverlaySettings, PING_SIZE,
-    Profile, SOUND_VOLUME, TextMotion, TextOverlaySettings, TextPosition, WheelEmote,
+    Profile, SOUND_VOLUME, TextEffect, TextMotion, TextOverlaySettings, TextPosition, WheelEmote,
 };
 use crate::platform::{self, InputMonitor, Overlay, WheelContents, WheelFrame, WheelPreview};
 use crate::room::{DEFAULT_PORT, Room, RoomConfig, RoomEvent};
@@ -118,6 +118,7 @@ pub(crate) fn start(cx: &mut App) {
                 match event {
                     RoomEvent::Message(id, message) => {
                         let body = message.body.clone();
+                        let text_effect = message.text_effect;
                         if model.update(cx, |model, cx| {
                             if model.receive(id, message) {
                                 cx.notify();
@@ -126,7 +127,7 @@ pub(crate) fn start(cx: &mut App) {
                                 false
                             }
                         }) {
-                            play(&body, cx);
+                            play(&body, text_effect, cx);
                         }
                     }
                     RoomEvent::Closed(id, reason) => model.update(cx, |model, cx| {
@@ -259,7 +260,7 @@ impl Render for StartupError {
     }
 }
 
-fn play(body: &Body, cx: &mut App) {
+fn play(body: &Body, text_effect: TextEffect, cx: &mut App) {
     cx.update_global::<Desktop, _>(|desktop, cx| {
         let model = desktop.model.read(cx);
         let settings = model.profile.overlay.with_sound(model.profile.sound);
@@ -280,7 +281,9 @@ fn play(body: &Body, cx: &mut App) {
                     .overlay
                     .play_custom(model.emotes(), id, None, settings, cx)
             }
-            Body::Text(ref text) => desktop.overlay.play_text(text, settings.text, cx),
+            Body::Text(ref text) => desktop
+                .overlay
+                .play_text(text, settings.text, text_effect, cx),
         }
     });
 }
@@ -386,12 +389,12 @@ fn handle_gesture(event: GestureEvent, cx: &mut App) {
                     ),
                     Body::Text(_) => {}
                 }
-                desktop
-                    .model
-                    .update(cx, |model, cx| match model.send(body) {
+                desktop.model.update(cx, |model, cx| {
+                    match model.send(body, TextEffect::Default) {
                         Ok(()) => cx.notify(),
                         Err(error) => eprintln!("无法记录或发送手势：{error:#}"),
-                    });
+                    }
+                });
             }
         }
         _ => {}
@@ -571,6 +574,7 @@ enum Filter {
 struct Conversation {
     model: Entity<Model>,
     input: Option<Entity<TextareaState>>,
+    text_effect: Option<Entity<OverlaySelect<TextEffect>>>,
     history: bool,
     all_rooms: bool,
     room_key: String,
@@ -592,6 +596,8 @@ impl Conversation {
                     .submit_on_enter(true)
             })
         });
+        let text_effect =
+            (!history).then(|| overlay_select(&TEXT_EFFECTS, TextEffect::Default, window, cx));
         let model = cx.global::<Desktop>().model.clone();
         let messages = ListState::new(0, ListAlignment::Bottom, px(180.));
         messages.set_follow_mode(FollowMode::Tail);
@@ -603,6 +609,11 @@ impl Conversation {
                 this.error = None;
                 if let Some(input) = &this.input {
                     input.update(cx, |input, cx| input.set_value("", window, cx));
+                }
+                if let Some(effect) = &this.text_effect {
+                    effect.update(cx, |effect, cx| {
+                        effect.set_selected_value(&TextEffect::Default, window, cx);
+                    });
                 }
             }
             this.refresh_messages(cx);
@@ -627,6 +638,7 @@ impl Conversation {
         let mut conversation = Self {
             model,
             input,
+            text_effect,
             history,
             all_rooms: false,
             room_key,
@@ -678,14 +690,22 @@ impl Conversation {
     }
 
     fn send_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(input) = self.input.clone() else {
+        let (Some(input), Some(effect)) = (self.input.clone(), self.text_effect.clone()) else {
             return;
         };
         let value = input.read(cx).value().trim().to_owned();
         if value.is_empty() {
             return;
         }
-        if self.send(Body::Text(value), cx) {
+        let selected = effect
+            .read(cx)
+            .selected_value()
+            .copied()
+            .unwrap_or_default();
+        if self.send(Body::Text(value), selected, cx) {
+            effect.update(cx, |effect, cx| {
+                effect.set_selected_value(&TextEffect::Default, window, cx);
+            });
             input.update(cx, |input, cx| {
                 input.set_value("", window, cx);
                 input.focus(window, cx);
@@ -693,9 +713,9 @@ impl Conversation {
         }
     }
 
-    fn send(&mut self, body: Body, cx: &mut Context<Self>) -> bool {
+    fn send(&mut self, body: Body, text_effect: TextEffect, cx: &mut Context<Self>) -> bool {
         let result = self.model.update(cx, |model, cx| {
-            let result = model.send(body.clone());
+            let result = model.send(body.clone(), text_effect);
             if result.is_ok() {
                 cx.notify();
             }
@@ -705,7 +725,7 @@ impl Conversation {
         self.error = result.err().map(|error| format!("{error:#}"));
         if sent {
             self.messages.set_follow_mode(FollowMode::Tail);
-            play(&body, cx);
+            play(&body, text_effect, cx);
         }
         cx.notify();
         sent
@@ -741,7 +761,9 @@ impl Conversation {
             let popup = popup.clone();
             move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
                 if owner
-                    .update(cx, |this, cx| this.send(body.clone(), cx))
+                    .update(cx, |this, cx| {
+                        this.send(body.clone(), TextEffect::Default, cx)
+                    })
                     .unwrap_or(false)
                 {
                     let _ = popup.update(cx, |state, cx| state.dismiss(window, cx));
@@ -874,7 +896,7 @@ fn bubble(message: &Message, mine: bool, cx: &App) -> impl IntoElement {
                         .object_fit(ObjectFit::Contain)
                         .with_fallback(|| div().text_xs().child("图片不可用").into_any_element()),
                 )
-                .on_click(move |_, _, cx| play(&Body::CustomEmote(id), cx))
+                .on_click(move |_, _, cx| play(&Body::CustomEmote(id), TextEffect::Default, cx))
                 .into_any_element()
         }
     };
@@ -1126,7 +1148,7 @@ impl Render for Conversation {
             );
         }
         view = view.child(feed);
-        if let Some(input) = &self.input {
+        if let (Some(input), Some(effect)) = (&self.input, &self.text_effect) {
             view = view.child(
                 div()
                     .flex()
@@ -1150,16 +1172,27 @@ impl Render for Conversation {
                         footer.child(div().text_sm().text_color(theme.danger).child(error))
                     })
                     .child(
-                        div().flex().justify_end().child(
-                            Button::new("send")
-                                .primary()
-                                .label("发送")
-                                .tooltip("Enter 发送 · Shift+Enter 换行")
-                                .disabled(input.read(cx).value().trim().is_empty())
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| this.send_text(window, cx)),
-                                ),
-                        ),
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Select::new(effect)
+                                    .accessibility_label("文字动效")
+                                    .title_prefix("动效 · ")
+                                    .w(rems(10.)),
+                            )
+                            .child(
+                                Button::new("send")
+                                    .primary()
+                                    .label("发送")
+                                    .tooltip("Enter 发送 · Shift+Enter 换行")
+                                    .disabled(input.read(cx).value().trim().is_empty())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.send_text(window, cx)
+                                    })),
+                            ),
                     ),
             );
         }
@@ -1283,6 +1316,15 @@ const TEXT_EXIT_MOTIONS: [(TextMotion, &str); 3] = [
     (TextMotion::Fade, "淡出"),
     (TextMotion::Slide, "滑出"),
 ];
+const TEXT_EFFECTS: [(TextEffect, &str); 7] = [
+    (TextEffect::Default, "跟随设置"),
+    (TextEffect::Shake, "爆炸抖动"),
+    (TextEffect::FlyIn, "飞入"),
+    (TextEffect::Bounce, "弹跳"),
+    (TextEffect::Fade, "淡入淡出"),
+    (TextEffect::Slide, "滑入滑出"),
+    (TextEffect::None, "无动效"),
+];
 
 #[derive(Clone)]
 struct OverlayChoice<T>(T, &'static str);
@@ -1355,6 +1397,7 @@ struct Settings {
     emote_size: Entity<SliderState>,
     ping_timeout: Entity<SliderState>,
     emote_timeout: Entity<SliderState>,
+    text_timeout: Entity<SliderState>,
     text_position: Entity<OverlaySelect<TextPosition>>,
     text_enter: Entity<OverlaySelect<TextMotion>>,
     text_exit: Entity<OverlaySelect<TextMotion>>,
@@ -1843,6 +1886,8 @@ impl Settings {
             cx.new(|_| setting_slider(ANIMATION_TIMEOUT, 100, overlay.ping_timeout_ms));
         let emote_timeout =
             cx.new(|_| setting_slider(ANIMATION_TIMEOUT, 100, overlay.emote_timeout_ms));
+        let text_timeout =
+            cx.new(|_| setting_slider(ANIMATION_TIMEOUT, 100, overlay.text.timeout_ms));
         let text_position = overlay_select(&TEXT_POSITIONS, overlay.text.position, window, cx);
         let text_enter = overlay_select(&TEXT_ENTRANCE_MOTIONS, overlay.text.enter, window, cx);
         let text_exit = overlay_select(&TEXT_EXIT_MOTIONS, overlay.text.exit, window, cx);
@@ -1882,6 +1927,7 @@ impl Settings {
                 &emote_size,
                 &ping_timeout,
                 &emote_timeout,
+                &text_timeout,
                 &volume,
             ]
             .into_iter()
@@ -1910,6 +1956,7 @@ impl Settings {
             emote_size,
             ping_timeout,
             emote_timeout,
+            text_timeout,
             text_position,
             text_enter,
             text_exit,
@@ -2002,6 +2049,7 @@ impl Settings {
 
     fn text_overlay_settings(&self, cx: &App) -> TextOverlaySettings {
         TextOverlaySettings {
+            timeout_ms: self.text_timeout.read(cx).value().start().round() as u32,
             position: self
                 .text_position
                 .read(cx)
@@ -2345,6 +2393,7 @@ impl Settings {
                                     desktop.overlay.play_text(
                                         "这是一条文字消息预览。",
                                         settings,
+                                        TextEffect::Default,
                                         cx,
                                     );
                                 });
@@ -2356,9 +2405,14 @@ impl Settings {
                     .flex()
                     .gap_3()
                     .child(overlay_select_field("显示位置", &self.text_position))
-                    .child(overlay_select_field("入场动效", &self.text_enter))
-                    .child(overlay_select_field("退场动效", &self.text_exit)),
+                    .child(overlay_select_field("默认入场", &self.text_enter))
+                    .child(overlay_select_field("默认退场", &self.text_exit)),
             )
+            .child(slider_field(
+                "文字停留时长",
+                format!("{:.1} 秒", overlay.text.timeout_ms as f32 / 1000.),
+                Slider::new(&self.text_timeout),
+            ))
             .child(
                 Switch::new("room-overlay")
                     .label("在桌面显示收到的房间消息")

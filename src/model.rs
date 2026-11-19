@@ -72,6 +72,10 @@ pub(crate) struct Message {
     pub(crate) name: String,
     pub(crate) time: u64,
     pub(crate) body: Body,
+    // Keep the text body readable by older room clients and history readers.
+    // 保留文字消息体的格式，旧版房间客户端和历史读取器仍可读取。
+    #[serde(default, skip_serializing_if = "TextEffect::uses_default")]
+    pub(crate) text_effect: TextEffect,
 }
 
 impl Message {
@@ -82,6 +86,7 @@ impl Message {
             name,
             time: now(),
             body,
+            text_effect: TextEffect::default(),
         }
     }
 
@@ -91,6 +96,7 @@ impl Message {
             && self.name.len() <= 64
             && self.name.chars().all(|character| !character.is_control())
             && self.body.valid()
+            && (self.text_effect.uses_default() || matches!(self.body, Body::Text(_)))
     }
 }
 
@@ -126,11 +132,42 @@ pub(crate) enum TextMotion {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TextEffect {
+    #[default]
+    Default,
+    Fade,
+    Slide,
+    FlyIn,
+    Shake,
+    Bounce,
+    None,
+}
+
+impl TextEffect {
+    fn uses_default(&self) -> bool {
+        *self == Self::Default
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct TextOverlaySettings {
     pub(crate) position: TextPosition,
     pub(crate) enter: TextMotion,
     pub(crate) exit: TextMotion,
+    pub(crate) timeout_ms: u32,
+}
+
+impl Default for TextOverlaySettings {
+    fn default() -> Self {
+        Self {
+            position: TextPosition::default(),
+            enter: TextMotion::default(),
+            exit: TextMotion::default(),
+            timeout_ms: 4000,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,6 +210,10 @@ impl OverlaySettings {
             .clamp(*ANIMATION_TIMEOUT.start(), *ANIMATION_TIMEOUT.end());
         self.emote_timeout_ms = self
             .emote_timeout_ms
+            .clamp(*ANIMATION_TIMEOUT.start(), *ANIMATION_TIMEOUT.end());
+        self.text.timeout_ms = self
+            .text
+            .timeout_ms
             .clamp(*ANIMATION_TIMEOUT.start(), *ANIMATION_TIMEOUT.end());
         self.volume = self
             .volume
@@ -468,8 +509,9 @@ impl Model {
         true
     }
 
-    pub(crate) fn send(&mut self, body: Body) -> Result<()> {
-        let message = Message::new(self.profile.id, self.profile.name.clone(), body);
+    pub(crate) fn send(&mut self, body: Body, text_effect: TextEffect) -> Result<()> {
+        let mut message = Message::new(self.profile.id, self.profile.name.clone(), body);
+        message.text_effect = text_effect;
         ensure!(message.valid(), "请发送非空消息，最多 600 字节");
         if let Some(room) = &self.room {
             room.send(message.clone()).context("未能发送到局域网")?;
@@ -530,16 +572,49 @@ mod tests {
         assert_eq!(settings.text.position, TextPosition::BottomRight);
         assert_eq!(settings.text.enter, TextMotion::Fade);
         assert_eq!(settings.text.exit, TextMotion::Fade);
+        assert_eq!(settings.text.timeout_ms, 4000);
 
-        settings.text = TextOverlaySettings {
-            position: TextPosition::TopLeft,
-            enter: TextMotion::Slide,
-            exit: TextMotion::None,
-        };
+        settings.text =
+            serde_json::from_str(r#"{"position":"top_left","enter":"slide","exit":"none"}"#)
+                .unwrap();
+        assert_eq!(settings.text.timeout_ms, 4000);
+        settings.text.timeout_ms = 2200;
         let restored =
             serde_json::from_str::<OverlaySettings>(&serde_json::to_string(&settings).unwrap())
                 .unwrap();
         assert_eq!(restored, settings);
+        settings.text.timeout_ms = u32::MAX;
+        settings.normalize();
+        assert_eq!(settings.text.timeout_ms, *ANIMATION_TIMEOUT.end());
+    }
+
+    #[test]
+    fn text_effect_extends_the_message_without_changing_its_body() {
+        #[derive(Deserialize, Serialize)]
+        struct LegacyMessage {
+            id: Uuid,
+            sender: Uuid,
+            name: String,
+            time: u64,
+            body: Body,
+        }
+
+        let mut message = Message::new(Uuid::new_v4(), "甲".into(), Body::Text("你好".into()));
+        message.text_effect = TextEffect::Shake;
+        let wire = serde_json::to_vec(&message).unwrap();
+        let legacy: LegacyMessage = serde_json::from_slice(&wire).unwrap();
+        assert!(matches!(&legacy.body, Body::Text(text) if text == "你好"));
+        let forwarded: Message =
+            serde_json::from_slice(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(forwarded.id, message.id);
+        assert_eq!(forwarded.text_effect, TextEffect::Default);
+        assert!(forwarded.valid());
+
+        message.body = Body::Ping {
+            index: 0,
+            location: None,
+        };
+        assert!(!message.valid());
     }
 
     #[test]
@@ -624,20 +699,25 @@ mod tests {
         let folder = std::env::temp_dir().join(format!("pingpingping-history-{}", Uuid::new_v4()));
         let mut original = Model::load(folder.clone()).unwrap();
         let text = "你好\n第二行";
-        original.send(Body::Text(text.into())).unwrap();
         original
-            .send(Body::Emote {
-                index: 3,
-                location: None,
-            })
+            .send(Body::Text(text.into()), TextEffect::FlyIn)
+            .unwrap();
+        original
+            .send(
+                Body::Emote {
+                    index: 3,
+                    location: None,
+                },
+                TextEffect::Default,
+            )
             .unwrap();
         let message = original.messages().next_back().unwrap().clone();
         original.finish_writes().unwrap().join().unwrap();
         let mut restored = Model::load(folder.clone()).unwrap();
         assert_eq!(restored.profile.id, message.sender);
-        assert!(
-            matches!(&restored.messages().next().unwrap().body, Body::Text(saved) if saved == text)
-        );
+        let restored_text = restored.messages().next().unwrap();
+        assert!(matches!(&restored_text.body, Body::Text(saved) if saved == text));
+        assert_eq!(restored_text.text_effect, TextEffect::FlyIn);
         assert_eq!(restored.messages().next_back().unwrap().id, message.id);
         restored.finish_writes().unwrap().join().unwrap();
         fs::remove_dir_all(folder).unwrap();

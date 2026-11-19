@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::playback::{
     FrameUpdate, TEXT_FONT_SIZE, TEXT_MARGIN, TEXT_MAX_LINES, TEXT_PADDING, TEXT_RADIUS,
-    TEXT_WIDTH, TextColors, text_anchor,
+    TEXT_WIDTH, TextColors, TextFrame, text_anchor,
 };
 use super::{AnimationOverlay, AudioCue, WheelContents, start_audio, wheel::WheelView};
 use async_channel::Sender;
@@ -609,7 +609,7 @@ pub(super) fn text_presenter(
     text: &str,
     position: TextPosition,
     colors: TextColors,
-) -> Option<impl FnMut(f32, f64) + use<>> {
+) -> Option<impl FnMut(TextFrame) + use<>> {
     let mtm = MainThreadMarker::new()?;
     let work = NSScreen::screens(mtm).firstObject()?.visibleFrame();
     let width = f64::from(TEXT_WIDTH).min(work.size.width);
@@ -635,19 +635,15 @@ pub(super) fn text_presenter(
     label.setFrame(rect(padding, padding, inner_width, text_height));
     view.addSubview(&label);
 
+    let free_x = work.size.width - size.width;
     let free_y = work.size.height - size.height;
-    let (x, y) = text_anchor(
-        position,
-        work.size.width - size.width,
-        free_y,
-        f64::from(TEXT_MARGIN),
-    );
+    let (x, y) = text_anchor(position, free_x, free_y, f64::from(TEXT_MARGIN));
     let window = Effect { panel, art };
-    Some(move |opacity, offset: f64| {
-        window.panel.setAlphaValue(f64::from(opacity));
+    Some(move |frame: TextFrame| {
+        window.panel.setAlphaValue(f64::from(frame.opacity));
         window.panel.setFrameOrigin(NSPoint::new(
-            work.origin.x + x,
-            work.origin.y + free_y - (y + offset).clamp(0.0, free_y),
+            work.origin.x + (x + frame.offset_x).clamp(0.0, free_x),
+            work.origin.y + free_y - (y + frame.offset_y).clamp(0.0, free_y),
         ));
         if !window.panel.isVisible() {
             window.panel.orderFrontRegardless();
