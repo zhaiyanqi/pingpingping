@@ -1186,15 +1186,19 @@ impl Render for Conversation {
                     .child(
                         div()
                             .flex()
-                            .flex_wrap()
+                            .min_w_0()
                             .items_center()
                             .justify_end()
                             .gap_2()
+                            // Select fills its parent even when its inner trigger has a set width.
+                            // 即使给触发器指定宽度，Select 根元素仍会填满父容器。
                             .child(
-                                Select::new(effect)
-                                    .accessibility_label("文字动效")
-                                    .title_prefix("动效 · ")
-                                    .w(rems(10.)),
+                                div().w(rems(10.)).min_w_0().child(
+                                    Select::new(effect)
+                                        .accessibility_label("文字动效")
+                                        .title_prefix("动效 · ")
+                                        .w_full(),
+                                ),
                             )
                             .child(
                                 Button::new("preview-text-draft")
