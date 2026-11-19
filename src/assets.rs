@@ -6,7 +6,7 @@ use std::borrow::Cow;
 use gpui_kit::assets::{Assets, icon_assets};
 use gpui_kit::{AssetSource, Result, SharedString};
 
-icon_assets!(PaletteIcons, [Pin, PinOff, X]);
+icon_assets!(PaletteIcons, [GripVertical, Pin, PinOff, X]);
 
 pub(crate) struct AppAssets;
 
@@ -103,6 +103,7 @@ mod tests {
     #[test]
     fn app_assets_include_palette_and_component_svgs() {
         for icon in [
+            IconName::GripVertical,
             IconName::Pin,
             IconName::PinOff,
             IconName::X,

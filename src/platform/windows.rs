@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
 use async_channel::Sender;
-use gpui_kit::{App, Window};
+use gpui_kit::{App, Pixels, Point, Window};
 use image::RgbaImage;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows_sys::Win32::{
@@ -49,7 +49,17 @@ pub(crate) fn init_dpi() {
 pub(crate) struct InputMonitor {
     thread: u32,
     worker: Option<JoinHandle<()>>,
-    palette_release: Arc<Mutex<Option<Sender<Position>>>>,
+    palette_pointer: Arc<Mutex<Option<PalettePointerWatch>>>,
+}
+
+pub(crate) struct PalettePointer {
+    pub(crate) position: Position,
+    pub(crate) released: bool,
+}
+
+struct PalettePointerWatch {
+    events: Sender<PalettePointer>,
+    track_moves: bool,
 }
 
 impl InputMonitor {
@@ -61,8 +71,8 @@ impl InputMonitor {
         paused: std::sync::Arc<AtomicBool>,
     ) -> Option<Self> {
         let (ready, result) = mpsc::sync_channel(1);
-        let palette_release = Arc::new(Mutex::new(None));
-        let hook_release = palette_release.clone();
+        let palette_pointer = Arc::new(Mutex::new(None));
+        let hook_pointer = palette_pointer.clone();
         let worker = std::thread::Builder::new()
             .name("global-input".into())
             .spawn(move || {
@@ -80,7 +90,7 @@ impl InputMonitor {
                         move_window,
                         paused,
                         keys: initial_keys(),
-                        palette_release: hook_release,
+                        palette_pointer: hook_pointer,
                     });
                 });
                 let (keyboard, mouse) = unsafe {
@@ -118,19 +128,25 @@ impl InputMonitor {
         Some(Self {
             thread,
             worker: Some(worker),
-            palette_release,
+            palette_pointer,
         })
     }
 
-    pub(crate) fn watch_palette_release(&self) -> Option<async_channel::Receiver<Position>> {
-        let mut pending = self.palette_release.lock().ok()?;
-        // Background windows cannot capture a release across another app's window.
-        // 后台窗口无法捕获在其他应用窗口上发生的松键。
+    pub(crate) fn watch_palette_pointer(
+        &self,
+        track_moves: bool,
+    ) -> Option<async_channel::Receiver<PalettePointer>> {
+        let mut pending = self.palette_pointer.lock().ok()?;
+        // A nonactivating window cannot rely on ordinary capture outside its client area.
+        // 不激活的浮窗无法依赖普通鼠标捕获来接收客户区外的事件。
         if unsafe { GetAsyncKeyState(i32::from(VK_LBUTTON)) } >= 0 {
             return None;
         }
-        let (sender, receiver) = async_channel::bounded(1);
-        *pending = Some(sender);
+        let (events, receiver) = async_channel::bounded(1);
+        *pending = Some(PalettePointerWatch {
+            events,
+            track_moves,
+        });
         Some(receiver)
     }
 }
@@ -155,7 +171,7 @@ struct Input {
     move_window: WheelMouseWindow,
     keys: u16,
     paused: std::sync::Arc<AtomicBool>,
-    palette_release: Arc<Mutex<Option<Sender<Position>>>>,
+    palette_pointer: Arc<Mutex<Option<PalettePointerWatch>>>,
 }
 
 const MODIFIERS: [u32; 8] = [
@@ -179,6 +195,34 @@ fn initial_keys() -> u16 {
 }
 
 impl Input {
+    fn forward_palette_pointer(&self, message: u32, point: POINT) {
+        match message {
+            WM_MOUSEMOVE => {
+                if let Ok(pending) = self.palette_pointer.try_lock()
+                    && let Some(watch) = pending.as_ref().filter(|watch| watch.track_moves)
+                {
+                    let _ = watch.events.force_send(PalettePointer {
+                        position: position(point),
+                        released: false,
+                    });
+                }
+            }
+            WM_LBUTTONUP => {
+                if let Ok(mut pending) = self.palette_pointer.lock()
+                    && let Some(watch) = pending.take()
+                {
+                    // Replace any queued movement with the exact release point.
+                    // 用精确的松键坐标替换队列中尚未处理的移动事件。
+                    let _ = watch.events.force_send(PalettePointer {
+                        position: position(point),
+                        released: true,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn dispatch(&mut self, point: POINT, event: InputEvent) -> MouseDelivery {
         let Some(config) = &self.triggers else {
             return MouseDelivery::Pass;
@@ -303,12 +347,7 @@ unsafe extern "system" fn mouse_hook(code: i32, message: WPARAM, data: LPARAM) -
             let Some(input) = cell.as_mut() else {
                 return MouseDelivery::Pass;
             };
-            if message as u32 == WM_LBUTTONUP
-                && let Ok(mut pending) = input.palette_release.lock()
-                && let Some(sender) = pending.take()
-            {
-                let _ = sender.try_send(position(event.pt));
-            }
+            input.forward_palette_pointer(message as u32, event.pt);
             let kind = match message as u32 {
                 WM_MOUSEMOVE if input.keys != 0 || input.gesture.active() => InputEvent::Move,
                 WM_LBUTTONDOWN => InputEvent::Left(true),
@@ -402,6 +441,44 @@ fn palette_hwnd(window: &Window) -> Option<HWND> {
     match HasWindowHandle::window_handle(window).ok()?.as_raw() {
         RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as HWND),
         _ => None,
+    }
+}
+
+pub(crate) struct PaletteMove {
+    hwnd: HWND,
+    grab: Point<Pixels>,
+}
+
+impl PaletteMove {
+    pub(crate) fn new(window: &Window, grab: Point<Pixels>) -> Option<Self> {
+        Some(Self {
+            hwnd: palette_hwnd(window)?,
+            grab,
+        })
+    }
+
+    pub(crate) fn update(&self, event: PalettePointer) -> bool {
+        let at = point(event.position);
+        let (_, dpi) = screen(at, false);
+        let scale = f64::from(dpi) / 96.0;
+        // Keep the same logical point under the pointer across displays with different DPI.
+        // 跨不同 DPI 的显示器时，保持鼠标抓住浮窗上的同一逻辑位置。
+        let x = at.x - (f64::from(self.grab.x) * scale).round() as i32;
+        let y = at.y - (f64::from(self.grab.y) * scale).round() as i32;
+        unsafe {
+            if event.released && GetCapture() == self.hwnd {
+                ReleaseCapture();
+            }
+            SetWindowPos(
+                self.hwnd,
+                null_mut(),
+                x,
+                y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            ) != 0
+        }
     }
 }
 

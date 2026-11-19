@@ -3,7 +3,7 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme, Selectable, Sizable,
+    ActiveTheme, Icon, Selectable, Sizable,
     button::{Button, ButtonVariants},
     scroll::ScrollableElement,
 };
@@ -159,7 +159,7 @@ struct Palette {
     category: Wheel,
     dragging: Option<Item>,
     #[cfg(target_os = "windows")]
-    release_task: Option<Task<()>>,
+    pointer_task: Option<Task<()>>,
     error: Option<String>,
 }
 
@@ -174,9 +174,34 @@ impl Palette {
             category: Wheel::Emote,
             dragging: None,
             #[cfg(target_os = "windows")]
-            release_task: None,
+            pointer_task: None,
             error: None,
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn begin_move(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((monitor, _)) = &cx.global::<Desktop>().monitor else {
+            self.error = Some("鼠标监听不可用，请在设置中重试。".into());
+            cx.notify();
+            return;
+        };
+        let Some(drag) = platform::PaletteMove::new(window, event.position) else {
+            return;
+        };
+        let Some(events) = monitor.watch_palette_pointer(true) else {
+            return;
+        };
+        // SetWindowPos can dispatch move and DPI callbacks synchronously.
+        // SetWindowPos 可能同步触发窗口移动和 DPI 回调。
+        self.pointer_task = Some(cx.spawn(async move |_, _| {
+            while let Ok(event) = events.recv().await {
+                let released = event.released;
+                if !drag.update(event) || released {
+                    break;
+                }
+            }
+        }));
     }
 
     fn toggle_pin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -207,11 +232,11 @@ impl Palette {
                 cx.notify();
                 return;
             };
-            let Some(release) = monitor.watch_palette_release() else {
+            let Some(release) = monitor.watch_palette_pointer(false) else {
                 return;
             };
-            self.release_task = Some(cx.spawn_in(_window, async move |owner, cx| {
-                let position = release.recv().await.ok();
+            self.pointer_task = Some(cx.spawn_in(_window, async move |owner, cx| {
+                let position = release.recv().await.ok().map(|event| event.position);
                 let _ = owner.update_in(cx, |this, window, cx| {
                     let position =
                         position.and_then(|position| platform::palette_drop(window, position));
@@ -359,14 +384,23 @@ impl Render for Palette {
         let title = div()
             .flex()
             .flex_1()
-            .h_7()
+            .h_9()
+            .pl_3()
+            .gap_2()
             .items_center()
             .cursor_move()
             .text_sm()
             .font_weight(FontWeight::SEMIBOLD)
+            .child(
+                Icon::new(IconName::GripVertical)
+                    .small()
+                    .text_color(theme.muted_foreground),
+            )
             .child("快捷浮窗");
+        // Win32 caption hit testing in GPUI uses the previous pointer event.
+        // GPUI 的 Win32 标题栏命中测试使用上一次指针事件。
         #[cfg(target_os = "windows")]
-        let title = title.window_control_area(WindowControlArea::Drag);
+        let title = title.on_mouse_down(MouseButton::Left, cx.listener(Self::begin_move));
         #[cfg(target_os = "macos")]
         let title =
             title.on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move());
@@ -382,8 +416,7 @@ impl Render for Palette {
                     .flex()
                     .items_center()
                     .flex_shrink_0()
-                    .px_3()
-                    .py_1()
+                    .pr_3()
                     .gap_1()
                     .child(title)
                     .child(
