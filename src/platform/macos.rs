@@ -22,9 +22,11 @@ use core_graphics::event::{
 use foreign_types::ForeignType;
 use gpui_kit::App;
 
-use objc2::{MainThreadMarker, MainThreadOnly, rc::Retained, runtime::AnyObject};
+use objc2::{
+    MainThreadMarker, MainThreadOnly, define_class, msg_send, rc::Retained, runtime::AnyObject,
+};
 use objc2_app_kit::{
-    NSBackingStoreType, NSColor, NSFloatingWindowLevel, NSPanel, NSScreen,
+    NSApplication, NSBackingStoreType, NSColor, NSFloatingWindowLevel, NSPanel, NSScreen, NSWindow,
     NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_core_graphics::CGImage;
@@ -342,18 +344,42 @@ pub(crate) fn normalized(position: Position) -> Location {
     }
 }
 
-fn panel(size: f64, mtm: MainThreadMarker) -> (Retained<NSPanel>, Retained<CALayer>) {
-    let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
-        NSPanel::alloc(mtm),
-        rect(0.0, 0.0, size, size),
-        NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
-        NSBackingStoreType::Buffered,
-        false,
-    );
+define_class!(
+    #[unsafe(super = NSPanel)]
+    #[thread_kind = MainThreadOnly]
+    #[name = "PingPingPingWheelPanel"]
+    struct WheelPanel;
+
+    impl WheelPanel {
+        #[unsafe(method(canBecomeKeyWindow))]
+        fn can_become_key_window(&self) -> bool { true }
+    }
+);
+
+fn panel(size: f64, mtm: MainThreadMarker, wheel: bool) -> (Retained<NSPanel>, Retained<CALayer>) {
+    let bounds = rect(0.0, 0.0, size, size);
+    // A nonactivating key panel borrows keyboard focus without bringing chat or settings forward.
+    // 非激活面板可临时取得键盘焦点，同时保持聊天、设置窗口原有的前后顺序。
+    let style = NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel;
+    let panel = if wheel {
+        let panel: Retained<WheelPanel> = unsafe {
+            msg_send![WheelPanel::alloc(mtm),
+            initWithContentRect: bounds, styleMask: style, backing: NSBackingStoreType::Buffered, defer: false]
+        };
+        Retained::into_super(panel)
+    } else {
+        NSPanel::initWithContentRect_styleMask_backing_defer(
+            NSPanel::alloc(mtm),
+            bounds,
+            style,
+            NSBackingStoreType::Buffered,
+            false,
+        )
+    };
     panel.setBackgroundColor(Some(&NSColor::clearColor()));
     panel.setOpaque(false);
     panel.setHasShadow(false);
-    panel.setIgnoresMouseEvents(true);
+    panel.setIgnoresMouseEvents(!wheel);
     panel.setHidesOnDeactivate(false);
     panel.setLevel(NSFloatingWindowLevel);
     panel.setCollectionBehavior(
@@ -413,6 +439,7 @@ pub(crate) struct Overlay {
     mtm: MainThreadMarker,
     wheel: Retained<NSPanel>,
     wheel_art: Retained<CALayer>,
+    previous_key: Option<Retained<NSWindow>>,
     pub(super) wheel_view: WheelView,
     pub(super) animations: AnimationOverlay,
     pub(super) audio: std::sync::mpsc::SyncSender<AudioCue>,
@@ -421,7 +448,7 @@ pub(crate) struct Overlay {
 impl Overlay {
     pub(crate) fn new() -> Self {
         let mtm = MainThreadMarker::new().expect("GUI must use the main thread");
-        let (wheel, wheel_art) = panel(f64::from(WHEEL_SIZE), mtm);
+        let (wheel, wheel_art) = panel(f64::from(WHEEL_SIZE), mtm, true);
         let scale = NSScreen::screens(mtm)
             .firstObject()
             .map_or(1.0, |screen| screen.backingScaleFactor());
@@ -430,6 +457,7 @@ impl Overlay {
             mtm,
             wheel,
             wheel_art,
+            previous_key: None,
             wheel_view,
             animations: AnimationOverlay::default(),
             audio: start_audio(),
@@ -473,9 +501,14 @@ impl Overlay {
                 update_layers(|| content(&layer, None));
             }
         });
-        if self.wheel_view.open(contents, size, selected, present, cx)
-            && let Some(volume) = tick_volume
-        {
+        let tick = self.wheel_view.open(contents, size, selected, present, cx);
+        if !self.wheel.isKeyWindow() {
+            let app = NSApplication::sharedApplication(self.mtm);
+            self.previous_key = app.keyWindow().filter(|_| app.isActive());
+            self.wheel.setIgnoresMouseEvents(false);
+            self.wheel.makeKeyAndOrderFront(None);
+        }
+        if tick && let Some(volume) = tick_volume {
             let _ = self.audio.try_send(AudioCue::Tick(volume));
         }
     }
@@ -488,12 +521,33 @@ impl Overlay {
         }
     }
 
+    fn release_focus(&mut self) {
+        let previous = self.previous_key.take();
+        self.wheel.setIgnoresMouseEvents(true);
+        if self.wheel.isKeyWindow() {
+            self.wheel.orderOut(None);
+            if let Some(previous) = previous.filter(|window| {
+                window.isVisible() && NSApplication::sharedApplication(self.mtm).isActive()
+            }) {
+                previous.makeKeyWindow();
+            }
+        }
+    }
+
     pub(crate) fn close(&mut self, cx: &App) {
+        self.release_focus();
         self.wheel_view.close(cx);
     }
 
     pub(crate) fn hide(&mut self) {
+        self.release_focus();
         self.wheel_view.hide();
+    }
+}
+
+impl Drop for Overlay {
+    fn drop(&mut self) {
+        self.release_focus();
     }
 }
 
@@ -518,7 +572,7 @@ pub(super) fn animation_presenter(
     let mut effect = None;
     Some((None, move |frame: image::RgbaImage| {
         let window = effect.get_or_insert_with(|| {
-            let (panel, art) = panel(size, mtm);
+            let (panel, art) = panel(size, mtm, false);
             art.setContentsGravity(unsafe { objc2_quartz_core::kCAGravityResizeAspect });
             Effect { panel, art }
         });

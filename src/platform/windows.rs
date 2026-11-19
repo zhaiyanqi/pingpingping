@@ -444,6 +444,21 @@ unsafe extern "system" fn wheel_mouse_proc(
     }
 }
 
+// The wheel is reused across gestures; Alt+F4 cancels the gesture without destroying its HWND.
+// 轮盘窗口会被后续手势复用，Alt+F4 取消手势时要保留 HWND。
+unsafe extern "system" fn wheel_layer_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match message {
+        WM_CLOSE => 0,
+        WM_SYSCOMMAND if wparam as u32 & 0xfff0 == SC_KEYMENU => 0,
+        _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+    }
+}
+
 unsafe extern "system" fn overlay_proc(
     hwnd: HWND,
     message: u32,
@@ -520,26 +535,36 @@ impl Drop for Surface {
 struct Layer {
     hwnd: HWND,
     surface: Option<Surface>,
+    previous_foreground: Option<HWND>,
 }
 
 impl Layer {
-    fn new() -> Self {
-        let class: Vec<u16> = "PingPingPingOverlay\0".encode_utf16().collect();
+    fn new(wheel: bool) -> Self {
+        let class = if wheel {
+            windows_sys::w!("PingPingPingWheel")
+        } else {
+            windows_sys::w!("PingPingPingOverlay")
+        };
         let hwnd = unsafe {
             let instance = GetModuleHandleW(null());
             RegisterClassW(&WNDCLASSW {
-                lpfnWndProc: Some(overlay_proc),
+                lpfnWndProc: if wheel {
+                    Some(wheel_layer_proc)
+                } else {
+                    Some(overlay_proc)
+                },
+                hCursor: LoadCursorW(null_mut(), IDC_ARROW),
                 hInstance: instance,
-                lpszClassName: class.as_ptr(),
+                lpszClassName: class,
                 ..Default::default()
             });
             CreateWindowExW(
                 WS_EX_LAYERED
                     | WS_EX_TRANSPARENT
-                    | WS_EX_NOACTIVATE
+                    | if wheel { 0 } else { WS_EX_NOACTIVATE }
                     | WS_EX_TOPMOST
                     | WS_EX_TOOLWINDOW,
-                class.as_ptr(),
+                class,
                 null(),
                 WS_POPUP,
                 0,
@@ -555,6 +580,35 @@ impl Layer {
         Self {
             hwnd,
             surface: None,
+            previous_foreground: None,
+        }
+    }
+
+    fn focus_wheel(&mut self) {
+        unsafe {
+            let previous = GetForegroundWindow();
+            if previous != self.hwnd
+                && IsWindowVisible(self.hwnd) != 0
+                && SetForegroundWindow(self.hwnd) != 0
+            {
+                self.previous_foreground = Some(previous);
+                SetFocus(self.hwnd);
+            }
+        }
+    }
+
+    fn release_focus(&mut self) {
+        let Some(previous) = self.previous_foreground.take() else {
+            return;
+        };
+        // Only return focus we still own. A user may already have switched to a third window.
+        // 仅在轮盘仍持有焦点时归还，避免打断用户已切换到的其他窗口。
+        unsafe {
+            if GetForegroundWindow() == self.hwnd
+                && (IsWindowVisible(previous) == 0 || SetForegroundWindow(previous) == 0)
+            {
+                ShowWindow(self.hwnd, SW_HIDE);
+            }
         }
     }
 
@@ -644,6 +698,7 @@ impl Layer {
 
 impl Drop for Layer {
     fn drop(&mut self) {
+        self.release_focus();
         if !self.hwnd.is_null() {
             unsafe { DestroyWindow(self.hwnd) };
         }
@@ -660,7 +715,7 @@ pub(crate) struct Overlay {
 impl Overlay {
     pub(crate) fn new() -> Self {
         let (_, dpi) = screen(POINT::default(), true);
-        let wheel = Layer::new();
+        let wheel = Layer::new(true);
         Self {
             wheel: Rc::new(RefCell::new(wheel)),
             wheel_view: WheelView::new(pixels(WHEEL_SIZE, dpi)),
@@ -692,9 +747,9 @@ impl Overlay {
                 layer.borrow_mut().hide();
             }
         });
-        if self.wheel_view.open(contents, size, selected, present, cx)
-            && let Some(volume) = tick_volume
-        {
+        let tick = self.wheel_view.open(contents, size, selected, present, cx);
+        self.wheel.borrow_mut().focus_wheel();
+        if tick && let Some(volume) = tick_volume {
             let _ = self.audio.try_send(AudioCue::Tick(volume));
         }
     }
@@ -708,10 +763,12 @@ impl Overlay {
     }
 
     pub(crate) fn close(&mut self, cx: &App) {
+        self.wheel.borrow_mut().release_focus();
         self.wheel_view.close(cx);
     }
 
     pub(crate) fn hide(&mut self) {
+        self.wheel.borrow_mut().release_focus();
         self.wheel_view.hide();
     }
 }
@@ -738,6 +795,8 @@ pub(super) fn animation_presenter(
     let origin = fit(point, bounds, size);
     let mut layer = None;
     Some((Some(size), move |frame: RgbaImage| {
-        layer.get_or_insert_with(Layer::new).frame(&frame, origin);
+        layer
+            .get_or_insert_with(|| Layer::new(false))
+            .frame(&frame, origin);
     }))
 }
