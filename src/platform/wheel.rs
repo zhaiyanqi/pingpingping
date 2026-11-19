@@ -3,10 +3,12 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path as FilePath, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpui_kit::{App, Task};
+use gpui_kit::{App, Asset, RenderImage, Task, Window};
 use tiny_skia::{
     Color, FillRule, FilterQuality, GradientStop, IntSize, Paint, Path, PathBuilder, Pixmap,
     PixmapPaint, Point, RadialGradient, SpreadMode, Stroke, Transform,
@@ -15,7 +17,7 @@ use tiny_skia::{
 use super::WheelContents;
 use crate::assets::{EMOTE_HUB, EMOTES, PINGS};
 use crate::emotes::{EmoteId, EmoteStore};
-use crate::gesture::{INNER_RADIUS, WHEEL_SIZE, Wheel};
+use crate::gesture::{self, INNER_RADIUS, Position, WHEEL_SIZE, Wheel};
 use crate::model::{EmotePage, WheelEmote};
 
 const CENTER: f32 = WHEEL_SIZE as f32 / 2.0;
@@ -157,18 +159,15 @@ impl Active {
     fn frame(&self) -> WheelFrame {
         match &self.contents {
             WheelContents::Ping => WheelFrame::ping(),
-            WheelContents::Emote(pages) => WheelFrame {
-                kind: Wheel::Emote,
-                slots: pages[self.page],
-                page: self.page,
-                page_count: pages.len(),
-            },
+            WheelContents::Emote(pages) => {
+                WheelFrame::emote(pages[self.page], self.page, pages.len())
+            }
         }
     }
 }
 
 #[derive(Clone, Copy, PartialEq)]
-struct WheelFrame {
+pub(crate) struct WheelFrame {
     kind: Wheel,
     slots: EmotePage,
     page: usize,
@@ -176,6 +175,15 @@ struct WheelFrame {
 }
 
 impl WheelFrame {
+    pub(crate) fn emote(slots: EmotePage, page: usize, page_count: usize) -> Self {
+        Self {
+            kind: Wheel::Emote,
+            slots,
+            page,
+            page_count,
+        }
+    }
+
     fn ping() -> Self {
         Self {
             kind: Wheel::Ping,
@@ -187,6 +195,97 @@ impl WheelFrame {
 
     fn occupied(self, selected: Option<usize>) -> Option<usize> {
         selected.filter(|&slot| self.kind == Wheel::Ping || self.slots[slot].is_some())
+    }
+}
+
+struct PreviewArt;
+
+impl Asset for PreviewArt {
+    type Source = ();
+    type Output = Arc<WheelArt>;
+
+    fn load(_: (), _: &mut App) -> impl Future<Output = Self::Output> + Send + 'static {
+        smol::unblock(|| Arc::new(WheelArt::new(WHEEL_SIZE)))
+    }
+}
+
+struct PreviewPoster;
+
+impl Asset for PreviewPoster {
+    type Source = PathBuf;
+    type Output = Option<Arc<Pixmap>>;
+
+    fn load(path: PathBuf, _: &mut App) -> impl Future<Output = Self::Output> + Send + 'static {
+        smol::unblock(move || load_poster(&path).map(Arc::new))
+    }
+}
+
+#[derive(PartialEq)]
+struct PreviewKey {
+    wheel: WheelFrame,
+    selection: usize,
+    loaded: [bool; 8],
+}
+
+#[derive(Default)]
+pub(crate) struct WheelPreview {
+    cached: Option<(PreviewKey, Arc<RenderImage>)>,
+}
+
+impl WheelPreview {
+    pub(crate) fn image(
+        &mut self,
+        wheel: WheelFrame,
+        selection: usize,
+        store: &EmoteStore,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Arc<RenderImage>> {
+        let art = window.use_asset::<PreviewArt>(&(), cx)?;
+        let posters = wheel.slots.map(|slot| match slot {
+            Some(WheelEmote::Custom(id)) => window
+                .use_asset::<PreviewPoster>(&store.poster(id), cx)
+                .flatten(),
+            _ => None,
+        });
+        let key = PreviewKey {
+            wheel,
+            selection,
+            loaded: posters.each_ref().map(Option::is_some),
+        };
+        if let Some((cached, image)) = &self.cached
+            && *cached == key
+        {
+            return Some(image.clone());
+        }
+        let mut scene = square(art.size);
+        let now = Instant::now();
+        let mut motion = Motion::new(now);
+        motion.select(Some(selection), now);
+        art.draw(
+            &mut scene,
+            wheel,
+            |index, _| posters[index].as_deref(),
+            &motion,
+            now + Duration::from_millis(WEDGE_TIME.max(ICON_TIME)),
+        );
+
+        // Tiny-skia supplies premultiplied RGBA. GPUI's sprite atlas expects straight BGRA.
+        // Tiny-skia 输出预乘 RGBA，GPUI 的纹理图集需要非预乘 BGRA。
+        let bytes = scene
+            .pixels()
+            .iter()
+            .flat_map(|pixel| {
+                let pixel = pixel.demultiply();
+                [pixel.blue(), pixel.green(), pixel.red(), pixel.alpha()]
+            })
+            .collect();
+        let frame = image::RgbaImage::from_raw(scene.width(), scene.height(), bytes).unwrap();
+        let image = Arc::new(RenderImage::new([image::Frame::new(frame)]));
+        if let Some((_, previous)) = self.cached.replace((key, image.clone())) {
+            let _ = window.drop_image(previous);
+        }
+        Some(image)
     }
 }
 
@@ -391,7 +490,13 @@ impl Canvas {
             .any(|tween| tween.running(now));
         let key = (wheel, motion.selection);
         if !settled || self.cached != Some(key) {
-            art.draw(&mut self.scene, wheel, posters, motion, now);
+            art.draw(
+                &mut self.scene,
+                wheel,
+                |_, id| posters.get(&id),
+                motion,
+                now,
+            );
             self.cached = settled.then_some(key);
         }
         if opacity >= 1.0 {
@@ -441,6 +546,34 @@ fn polar(radius: f32, angle: f32) -> Point {
 
 fn angle(index: usize) -> f32 {
     -std::f32::consts::FRAC_PI_2 + index as f32 * std::f32::consts::FRAC_PI_4
+}
+
+fn icon_center(index: usize) -> Point {
+    polar(137.0, angle(index))
+}
+
+pub(crate) fn slot_center(index: usize) -> [f32; 2] {
+    let center = icon_center(index);
+    [center.x / WHEEL_SIZE as f32, center.y / WHEEL_SIZE as f32]
+}
+
+fn wedge_extent(index: usize) -> f32 {
+    if index.is_multiple_of(2) {
+        EXTENT
+    } else {
+        OUTER
+    }
+}
+
+pub(crate) fn editor_sector(x: f64, y: f64, diameter: f64) -> Option<usize> {
+    if diameter <= 0.0 {
+        return None;
+    }
+    let scale = diameter / f64::from(WHEEL_SIZE);
+    let index = gesture::sector(Position { x: 0.0, y: 0.0 }, Position { x, y }, scale)?;
+    // The popup gesture can point past the artwork; editor clicks must hit a visible sector.
+    // 弹出轮盘的手势可以越过图案，编辑点击则必须落在可见扇区内。
+    (x.hypot(y) <= f64::from(wedge_extent(index)) * scale).then_some(index)
 }
 
 fn sector(inner: f32, outer: f32, index: usize) -> Path {
@@ -551,19 +684,21 @@ pub(crate) fn load_wheel_posters(
         })
         .collect();
     ids.into_iter()
-        .filter_map(|id| {
-            let image = image::open(store.poster(id)).ok()?.into_rgba8();
-            let edge = image.width().max(image.height());
-            let mut square = image::RgbaImage::new(edge, edge);
-            image::imageops::overlay(
-                &mut square,
-                &image,
-                i64::from((edge - image.width()) / 2),
-                i64::from((edge - image.height()) / 2),
-            );
-            Some((id, pixmap(square, false, false)))
-        })
+        .filter_map(|id| load_poster(&store.poster(id)).map(|poster| (id, poster)))
         .collect()
+}
+
+fn load_poster(path: &FilePath) -> Option<Pixmap> {
+    let image = image::open(path).ok()?.into_rgba8();
+    let edge = image.width().max(image.height());
+    let mut square = image::RgbaImage::new(edge, edge);
+    image::imageops::overlay(
+        &mut square,
+        &image,
+        i64::from((edge - image.width()) / 2),
+        i64::from((edge - image.height()) / 2),
+    );
+    Some(pixmap(square, false, false))
 }
 
 fn sprite(target: &mut Pixmap, sprite: &Pixmap, center: Point, edge: f32, dpi: f32, opacity: f32) {
@@ -781,9 +916,7 @@ impl WheelArt {
             );
             image
         });
-        let wedges = std::array::from_fn(|index| {
-            sector(INNER, if index % 2 == 0 { EXTENT } else { OUTER }, index)
-        });
+        let wedges = std::array::from_fn(|index| sector(INNER, wedge_extent(index), index));
         let ping_icons = std::array::from_fn(|index| {
             let bytes = PINGS[index].image;
             (asset(bytes, false, true), asset(bytes, false, false))
@@ -799,11 +932,11 @@ impl WheelArt {
         }
     }
 
-    fn draw(
+    fn draw<'a>(
         &self,
         target: &mut Pixmap,
         wheel: WheelFrame,
-        posters: &HashMap<EmoteId, Pixmap>,
+        poster: impl Fn(usize, EmoteId) -> Option<&'a Pixmap>,
         motion: &Motion,
         now: Instant,
     ) {
@@ -856,7 +989,7 @@ impl WheelArt {
         }
         for index in 0..wheel.slots.len() {
             let active = motion.icons[index].sample(now);
-            let center = polar(137.0, angle(index));
+            let center = icon_center(index);
             let edge = 48.0 * (1.0 + 0.18 * active);
             if wheel.kind == Wheel::Ping {
                 let (normal, hot) = &self.ping_icons[index];
@@ -867,7 +1000,7 @@ impl WheelArt {
             } else if let Some(emote) = wheel.slots[index] {
                 let icon = match emote {
                     WheelEmote::BuiltIn(id) => self.emote_icons.get(id),
-                    WheelEmote::Custom(id) => posters.get(&id),
+                    WheelEmote::Custom(id) => poster(index, id),
                 };
                 if let Some(icon) = icon {
                     sprite(target, icon, center, edge, dpi, 1.0);
@@ -890,6 +1023,25 @@ impl WheelArt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editor_sectors_follow_the_artwork_at_smaller_sizes() {
+        for diameter in [240.0, 360.0] {
+            for index in 0..8 {
+                let [x, y] = slot_center(index).map(f64::from);
+                assert_eq!(
+                    editor_sector((x - 0.5) * diameter, (y - 0.5) * diameter, diameter),
+                    Some(index)
+                );
+            }
+            assert_eq!(editor_sector(0.0, 0.0, diameter), None);
+            assert_eq!(editor_sector(0.0, diameter * -0.4, diameter), Some(0));
+            assert_eq!(
+                editor_sector(diameter * 0.27, diameter * -0.27, diameter),
+                None
+            );
+        }
+    }
 
     #[test]
     fn displayed_emote_page_wraps_and_empty_slots_do_not_resolve() {
@@ -990,7 +1142,7 @@ mod tests {
         art.draw(
             &mut target,
             WheelFrame::ping(),
-            &HashMap::new(),
+            |_, _| None,
             &Motion::new(now),
             now,
         );

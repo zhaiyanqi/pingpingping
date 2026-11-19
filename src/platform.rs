@@ -16,7 +16,7 @@ use crate::model::{EmotePage, OverlaySettings, WheelEmote};
 mod playback;
 pub(crate) use playback::{Animation, AnimationOverlay};
 mod wheel;
-pub(crate) use wheel::load_wheel_posters;
+pub(crate) use wheel::{WheelFrame, WheelPreview, editor_sector, load_wheel_posters, slot_center};
 
 pub(crate) enum WheelContents {
     Ping,

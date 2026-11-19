@@ -312,7 +312,7 @@ const OPEN_DISTANCE: f64 = 8.0;
 
 // Sector zero is up. Screen coordinates increase downward, and sectors advance clockwise.
 // 上方为第 0 个扇区。屏幕坐标向下递增，扇区按顺时针排列。
-fn sector(origin: Position, position: Position, scale: f64) -> Option<usize> {
+pub(crate) fn sector(origin: Position, position: Position, scale: f64) -> Option<usize> {
     let dx = position.x - origin.x;
     let dy = position.y - origin.y;
     if dx.hypot(dy) < INNER_RADIUS * scale {

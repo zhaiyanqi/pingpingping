@@ -1,8 +1,10 @@
 //! GPUI Kit chat, history, and settings windows.
 //! 使用 GPUI Kit 实现的聊天、历史和设置窗口。
 
+use std::cell::{Cell, RefCell};
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
@@ -10,6 +12,7 @@ use uuid::Uuid;
 use async_channel::Sender;
 use chrono::{DateTime, Local};
 use gpui_kit::assets::IconName;
+use gpui_kit::base::Button as BaseButton;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Selectable, Sizable,
     button::{Button, ButtonVariants},
@@ -18,6 +21,7 @@ use gpui_kit::component::{
     scroll::ScrollableElement,
     slider::{Slider, SliderState},
     switch::Switch,
+    tooltip::Tooltip,
 };
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -29,7 +33,7 @@ use crate::model::{
     ANIMATION_TIMEOUT, Body, EMOTE_SIZE, EmotePage, Message, Model, OverlaySettings, PING_SIZE,
     Profile, SOUND_VOLUME, WheelEmote,
 };
-use crate::platform::{self, InputMonitor, Overlay, WheelContents};
+use crate::platform::{self, InputMonitor, Overlay, WheelContents, WheelFrame, WheelPreview};
 use crate::room::{DEFAULT_PORT, Room, RoomConfig, RoomEvent};
 
 gpui_kit::actions!([OpenChat, OpenHistory, OpenSettings, Quit]);
@@ -1219,7 +1223,11 @@ impl Render for EmoteDragPreview {
     }
 }
 
-fn draggable_emote<T: 'static>(mut button: Button, value: T, image: ImageSource) -> Button {
+fn draggable_emote<T: 'static, B: InteractiveElement + Styled>(
+    mut button: B,
+    value: T,
+    image: ImageSource,
+) -> B {
     button
         .interactivity()
         .on_drag(value, move |_, offset, _, cx| {
@@ -1231,8 +1239,13 @@ fn draggable_emote<T: 'static>(mut button: Button, value: T, image: ImageSource)
     button.cursor_grab()
 }
 
-fn wheel_drop_style(style: StyleRefinement, cx: &App) -> StyleRefinement {
-    style.border_color(cx.theme().drag_border)
+fn wheel_sector_at(bounds: Bounds<Pixels>, position: Point<Pixels>) -> Option<usize> {
+    let offset = position - bounds.center();
+    platform::editor_sector(
+        f64::from(offset.x),
+        f64::from(offset.y),
+        f64::from(bounds.size.width),
+    )
 }
 
 impl SettingsCategory {
@@ -1267,6 +1280,7 @@ struct Settings {
     emote_pages: Vec<EmotePage>,
     wheel_page: usize,
     wheel_slot: usize,
+    wheel_preview: Rc<RefCell<WheelPreview>>,
     swap_source: Option<WheelSlot>,
     pending_image: Option<WheelSlot>,
     recording: Option<Wheel>,
@@ -1395,28 +1409,6 @@ impl Settings {
         let selected = slots[self.wheel_slot];
         let (name, _) = wheel_emote_preview(selected, desktop, library);
 
-        // Match the overlay's clockwise sector order while keeping the center unassigned.
-        // 按悬浮轮盘的顺时针扇区顺序排列，中心不分配表情。
-        let grid = div().flex().flex_col().gap_2().max_w(rems(24.)).children(
-            [
-                [Some(7), Some(0), Some(1)],
-                [Some(6), None, Some(2)],
-                [Some(5), Some(4), Some(3)],
-            ]
-            .map(|row| {
-                div().flex().gap_2().children(row.map(|slot| {
-                    div().flex_1().min_w_0().when_some(slot, |cell, slot| {
-                        let preview = wheel_emote_preview(slots[slot], desktop, library);
-                        cell.child(self.wheel_slot_button(
-                            WheelSlot { page, sector: slot },
-                            preview,
-                            cx,
-                        ))
-                    })
-                }))
-            }),
-        );
-
         div()
             .flex()
             .flex_col()
@@ -1496,7 +1488,7 @@ impl Settings {
                     .flex()
                     .items_start()
                     .gap_4()
-                    .child(grid.flex_1().min_w_0())
+                    .child(self.wheel_surface(cx))
                     .child(self.wheel_emote_library(selected, cx)),
             )
             .child(div().text_sm().child(if let Some(slot) = self.swap_source {
@@ -1558,66 +1550,132 @@ impl Settings {
             })
     }
 
+    fn wheel_surface(&self, cx: &Context<Self>) -> Stateful<Div> {
+        let desktop = cx.global::<Desktop>();
+        let library = desktop.library.read(cx);
+        let page = self.wheel_page;
+        let slots = self.emote_pages[page];
+        let wheel = WheelFrame::emote(slots, page, self.emote_pages.len());
+        let selection = self.wheel_slot;
+        let store = library.store.clone();
+        let preview = self.wheel_preview.clone();
+        let bounds = Rc::new(Cell::new(Bounds::default()));
+        let artwork = canvas(
+            {
+                let measured = bounds.clone();
+                move |bounds, window, cx| {
+                    measured.set(bounds);
+                    let selected = if cx.has_active_drag()
+                        && window
+                            .content_mask()
+                            .bounds
+                            .contains(&window.mouse_position())
+                    {
+                        wheel_sector_at(bounds, window.mouse_position()).unwrap_or(selection)
+                    } else {
+                        selection
+                    };
+                    preview
+                        .borrow_mut()
+                        .image(wheel, selected, &store, window, cx)
+                }
+            },
+            |bounds, image, window, _| {
+                if let Some(image) = image {
+                    let _ = window.paint_image(bounds, bounds, Corners::default(), image, 0, false);
+                }
+            },
+        )
+        .absolute()
+        .inset_0()
+        .size_full();
+
+        let slot_at = move |position| {
+            wheel_sector_at(bounds.get(), position).map(|sector| WheelSlot { page, sector })
+        };
+        let can_drop = slot_at.clone();
+        let swap_target = slot_at.clone();
+        let library_target = slot_at.clone();
+        let file_target = slot_at.clone();
+
+        // One ring hit area routes drops by angle; the icon buttons supply focus and drag origins.
+        // 整个环按角度分配拖放目标，图标按钮处理键盘焦点和拖动起点。
+        div()
+            .id("wheel-surface")
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .max_w(rems(24.))
+            .aspect_ratio(1.)
+            .child(artwork)
+            .children(slots.into_iter().enumerate().map(|(sector, emote)| {
+                let preview = wheel_emote_preview(emote, desktop, library);
+                self.wheel_slot_button(WheelSlot { page, sector }, preview, cx)
+            }))
+            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                if let Some(slot) = slot_at(event.position()) {
+                    this.select_wheel_slot(slot, cx);
+                }
+            }))
+            .can_drop(move |_, window, _| can_drop(window.mouse_position()).is_some())
+            .on_drop(cx.listener(move |this, source: &WheelSlot, window, cx| {
+                if let Some(target) = swap_target(window.mouse_position()) {
+                    this.swap_source = None;
+                    this.swap_wheel_slots(*source, target);
+                    this.wheel_slot = target.sector;
+                    cx.notify();
+                }
+            }))
+            .on_drop(cx.listener(move |this, emote: &WheelEmote, window, cx| {
+                if let Some(target) = library_target(window.mouse_position()) {
+                    this.wheel_slot = target.sector;
+                    this.set_wheel_slot(target, Some(*emote), cx);
+                }
+            }))
+            .on_drop(cx.listener(move |this, paths: &ExternalPaths, window, cx| {
+                if let Some(target) = file_target(window.mouse_position()) {
+                    this.drop_wheel_image(target, paths, cx);
+                }
+            }))
+    }
+
     fn wheel_slot_button(
         &self,
         target: WheelSlot,
         (name, image): (String, Option<ImageSource>),
         cx: &Context<Self>,
-    ) -> Button {
+    ) -> BaseButton {
         let sector = target.sector;
         let direction = SLOT_DIRECTIONS[sector];
         let label = format!("{direction} · {name}");
-        Button::new(("wheel-slot", sector))
-            .outline()
-            .w_full()
-            .h(rems(3.5))
-            .selected(self.wheel_slot == sector)
-            .toggled(self.wheel_slot == sector)
+        let [x, y] = platform::slot_center(sector);
+        let edge = 0.12;
+        let theme = cx.theme();
+        let focus_ring = theme.ring;
+        BaseButton::new(("wheel-slot", sector))
+            .absolute()
+            .left(relative(x - edge / 2.))
+            .top(relative(y - edge / 2.))
+            .w(relative(edge))
+            .h(relative(edge))
+            .rounded_full()
+            .border_1()
+            .border_color(theme.transparent)
+            .focus_visible(move |style| style.border_color(focus_ring))
+            .aria_toggled(if self.wheel_slot == sector {
+                Toggled::True
+            } else {
+                Toggled::False
+            })
             .accessibility_label(label.clone())
-            .tooltip(label)
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap_1()
-                    .child(div().size_6().when_some(image.clone(), |preview, image| {
-                        preview.child(img(image).size_6().object_fit(ObjectFit::Contain))
-                    }))
-                    .child(div().text_xs().child(direction)),
-            )
-            .on_click(cx.listener(move |this, _, _, cx| this.select_wheel_slot(target, cx)))
+            .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.select_wheel_slot(target, cx);
+            }))
             .when_some(image, |button, image| {
                 draggable_emote(button, target, image)
             })
-            .drag_over(move |style, source: &WheelSlot, _, cx| {
-                if *source == target {
-                    style
-                } else {
-                    wheel_drop_style(style, cx)
-                }
-            })
-            .on_drop(cx.listener(move |this, source: &WheelSlot, _, cx| {
-                this.swap_source = None;
-                this.swap_wheel_slots(*source, target);
-                this.wheel_slot = target.sector;
-                cx.notify();
-            }))
-            .drag_over(|style, _: &WheelEmote, _, cx| wheel_drop_style(style, cx))
-            .on_drop(cx.listener(move |this, emote: &WheelEmote, _, cx| {
-                this.wheel_slot = target.sector;
-                this.set_wheel_slot(target, Some(*emote), cx);
-            }))
-            .drag_over(|style, paths: &ExternalPaths, _, cx| {
-                if paths.paths().len() == 1 {
-                    wheel_drop_style(style, cx)
-                } else {
-                    style
-                }
-            })
-            .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
-                this.drop_wheel_image(target, paths, cx)
-            }))
     }
 
     fn wheel_emote_library(&self, selected: Option<WheelEmote>, cx: &Context<Self>) -> Div {
@@ -1771,6 +1829,7 @@ impl Settings {
             emote_pages,
             wheel_page: 0,
             wheel_slot: 0,
+            wheel_preview: Rc::default(),
             swap_source: None,
             pending_image: None,
             recording: None,
