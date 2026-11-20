@@ -79,6 +79,16 @@ git push origin refs/tags/v0.1.0
 
 GitHub Actions 会使用 `release-small` 构建 Windows x64 安装包和便携 ZIP，以及 macOS Apple Silicon 应用 ZIP。三份产物全部就绪后，流水线会在 [GitHub Releases](https://github.com/zhaiyanqi/pingpingping/releases) 发布并附上自动生成的发布说明。macOS 应用使用临时签名。
 
+### Windows 发布签名
+
+Windows 发布签名默认关闭。启用后，流水线会为 `pingpingping.exe`、安装包、Inno Setup 运行时解包的临时程序和卸载程序生成带时间戳的 Authenticode 签名。便携 ZIP 包含已签名的 `pingpingping.exe`。任何签名或验证失败都会停止发布。
+
+1. 在 Azure 创建 Artifact Signing Public Trust 证书配置文件，完成发布者身份验证。把 **Artifact Signing Certificate Profile Signer** 角色授予负责签名的 Microsoft Entra 服务主体。[微软配置文档](https://learn.microsoft.com/azure/artifact-signing/quickstart)
+2. 在 GitHub 仓库中配置 `windows-release` 环境，将部署范围限制到用于发布的标签，并为该环境配置 Entra OIDC 联合凭据。当前仓库采用不可变主题 `repo:zhaiyanqi@27220203/pingpingping@1463631015:environment:windows-release`。[微软联合凭据配置文档](https://learn.microsoft.com/entra/workload-id/workload-identities-github-immutable-subjects)
+3. 在 `windows-release` 环境中添加 Secrets `AZURE_CLIENT_ID`、`AZURE_TENANT_ID` 和 `AZURE_SUBSCRIPTION_ID`。在仓库 Variables 中填写 `AZURE_SIGNING_ENDPOINT`、`AZURE_SIGNING_ACCOUNT` 和 `AZURE_SIGNING_PROFILE`，再把 `WINDOWS_SIGNING_ENABLED` 设为 `true`。下一次推送发布标签时会使用该证书签名。
+
+使用其他支持 Windows SDK SignTool 的证书或签名服务时，在 Windows 上将 `PINGPINGPING_SIGNTOOL_PATH` 设置为 `signtool.exe` 的完整路径，将 `PINGPINGPING_SIGNTOOL_ARGS` 设置为签名服务参数的 JSON 字符串数组，包括 `/tr` 和时间戳地址，然后运行 `.\script\package-windows.ps1 -Sign`。脚本会设置 SHA-256 并检查签名和时间戳。
+
 `v0.1.0` 或 `0.1.0` 这类版本 tag 会决定包的版本号。`v0.1.0-rc.1` 这类 tag 会发布为预发行版。其他 tag 使用 `Cargo.toml` 中的包版本号。
 
 ## 局域网连接

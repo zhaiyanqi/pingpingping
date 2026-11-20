@@ -4,6 +4,7 @@ param(
     [ValidateSet('Both', 'Setup', 'Portable')]
     [string]$Package = 'Both',
     [switch]$StandardRelease,
+    [switch]$Sign,
     [string]$IsccPath,
     [ValidatePattern('\A[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\z')]
     [string]$Version
@@ -12,6 +13,9 @@ param(
 $ErrorActionPreference = 'Stop'
 if ([Environment]::OSVersion.Platform -ne 'Win32NT') {
     throw 'Run this script on Windows with the x64 MSVC build tools installed.'
+}
+if ($Sign -and (-not $env:PINGPINGPING_SIGNTOOL_PATH -or -not $env:PINGPINGPING_SIGNTOOL_ARGS)) {
+    throw 'Signing requires PINGPINGPING_SIGNTOOL_PATH and PINGPINGPING_SIGNTOOL_ARGS.'
 }
 
 if ($Package -ne 'Portable') {
@@ -71,18 +75,27 @@ $packaging = Join-Path $root 'packaging'
 $dist = Join-Path $root 'dist\windows'
 $staging = Join-Path $dist ('.package-' + [Guid]::NewGuid().ToString('N'))
 $payload = Join-Path $staging 'payload'
+$signScript = Join-Path $PSScriptRoot 'sign-windows.ps1'
 
 try {
     # Stage a single build and finish every requested package before publishing any of them.
     # 使用同一份构建产物，所有选定的包都生成后再移入输出目录。
     [void][IO.Directory]::CreateDirectory($payload)
     Copy-Item -LiteralPath $exe -Destination $payload
+    $binary = Join-Path $payload 'pingpingping.exe'
+    if ($Sign) { & $signScript $binary }
     $artifacts = @()
 
     if ($Package -ne 'Portable') {
         $spec = Join-Path $packaging 'windows-setup.iss'
-        $binary = Join-Path $payload 'pingpingping.exe'
-        & $IsccPath "/DAppVersion=$Version" "/DAppBinary=$binary" "/O$staging" "/F$name-setup" $spec
+        $isccArguments = @("/DAppVersion=$Version", "/DAppBinary=$binary", "/O$staging", "/F$name-setup")
+        if ($Sign) {
+            # The compiler signs its unpacked Setup executable and uninstaller before embedding them.
+            # 编译器在嵌入解包后的安装程序和卸载程序之前为它们签名。
+            $signCommand = '/SPingPingPing=powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $q{0}$q $f'
+            $isccArguments += '/DSignWindowsPackage', ($signCommand -f $signScript.Replace('$', '$$'))
+        }
+        & $IsccPath @isccArguments $spec
         if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed (exit code $LASTEXITCODE)." }
         $artifacts += "$name-setup.exe"
     }

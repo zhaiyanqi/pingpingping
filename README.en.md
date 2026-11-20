@@ -79,6 +79,16 @@ git push origin refs/tags/v0.1.0
 
 GitHub Actions builds the Windows x64 installer and portable ZIP and the Apple Silicon macOS app ZIP with `release-small`. Once all three packages are ready, the workflow publishes them with generated notes on [GitHub Releases](https://github.com/zhaiyanqi/pingpingping/releases). The macOS app is ad-hoc signed.
 
+### Windows release signing
+
+Windows release signing is off by default. Once enabled, the workflow applies timestamped Authenticode signatures to `pingpingping.exe`, the installer, the temporary executable that Inno Setup extracts at launch, and the uninstaller. The portable ZIP contains the signed `pingpingping.exe`. Any signing or verification failure stops publication.
+
+1. Create an Artifact Signing Public Trust certificate profile in Azure and complete publisher identity validation. Assign the **Artifact Signing Certificate Profile Signer** role to the Microsoft Entra service principal used for signing. [Microsoft setup guide](https://learn.microsoft.com/azure/artifact-signing/quickstart)
+2. Configure the `windows-release` GitHub environment, limit its deployments to release tags, and set up an Entra OIDC federated credential for that environment. This repository uses the immutable subject `repo:zhaiyanqi@27220203/pingpingping@1463631015:environment:windows-release`. [Microsoft federated credential guide](https://learn.microsoft.com/entra/workload-id/workload-identities-github-immutable-subjects)
+3. Add `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and `AZURE_SUBSCRIPTION_ID` as Secrets in the `windows-release` environment. Set repository Variables `AZURE_SIGNING_ENDPOINT`, `AZURE_SIGNING_ACCOUNT`, and `AZURE_SIGNING_PROFILE`, then set `WINDOWS_SIGNING_ENABLED` to `true`. The next release tag push will use that certificate profile.
+
+To build with another certificate or service that supports Windows SDK SignTool, set `PINGPINGPING_SIGNTOOL_PATH` to the full path to `signtool.exe` and `PINGPINGPING_SIGNTOOL_ARGS` to a JSON array of provider arguments, including `/tr` and the timestamp URL. Run `.\script\package-windows.ps1 -Sign` on Windows. The script selects SHA-256 and verifies the signatures and timestamps.
+
 Version tags such as `v0.1.0` and `0.1.0` set the package version. A tag such as `v0.1.0-rc.1` publishes a prerelease. Other tags use the package version in `Cargo.toml`.
 
 ## Connect on a LAN

@@ -51,8 +51,13 @@ jobs:
     needs: version
     runs-on: windows-2025
     timeout-minutes: 60
+    environment: windows-release
+    permissions:
+      contents: read
+      id-token: write
     env:
       RELEASE_VERSION: ${{ needs.version.outputs.package }}
+      WINDOWS_SIGNING_ENABLED: ${{ vars.WINDOWS_SIGNING_ENABLED }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -60,9 +65,56 @@ jobs:
       - name: Install Rust MSVC toolchain
         shell: powershell
         run: rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
+      - name: Log in to Azure for signing
+        if: ${{ vars.WINDOWS_SIGNING_ENABLED == 'true' }}
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Configure Azure Artifact Signing
+        if: ${{ vars.WINDOWS_SIGNING_ENABLED == 'true' }}
+        shell: pwsh
+        env:
+          SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          SIGNING_PROFILE: ${{ vars.AZURE_SIGNING_PROFILE }}
+        run: |
+          if (!$env:SIGNING_ENDPOINT -or !$env:SIGNING_ACCOUNT -or !$env:SIGNING_PROFILE) {
+            throw 'Set AZURE_SIGNING_ENDPOINT, AZURE_SIGNING_ACCOUNT, and AZURE_SIGNING_PROFILE.'
+          }
+          $sdkTools = "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe"
+          $signTool = Get-ChildItem -Path $sdkTools -File |
+            Sort-Object { [version]$_.Directory.Parent.Name } -Descending | Select-Object -First 1
+          if (!$signTool) { throw 'Windows SDK SignTool was not found.' }
+
+          $client = Join-Path $env:RUNNER_TEMP 'artifact-signing-client'
+          $archive = "$client.zip"
+          $packageUrl = 'https://api.nuget.org/v3-flatcontainer/microsoft.artifactsigning.client/1.0.151/microsoft.artifactsigning.client.1.0.151.nupkg'
+          Invoke-WebRequest -Uri $packageUrl -OutFile $archive
+          $expectedHash = '35375a4bc4e1102da729fc3d8d9925f774c3baae6b8b7ff6398d948ca9ab0d8a'
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $expectedHash) {
+            throw 'Artifact Signing client checksum did not match.'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $client
+          $dlib = Join-Path $client 'bin\x64\Azure.CodeSigning.Dlib.dll'
+          if (!(Test-Path -LiteralPath $dlib -PathType Leaf)) { throw 'Artifact Signing Dlib was not found.' }
+
+          $metadata = Join-Path $env:RUNNER_TEMP 'artifact-signing.json'
+          @{
+            Endpoint = $env:SIGNING_ENDPOINT
+            CodeSigningAccountName = $env:SIGNING_ACCOUNT
+            CertificateProfileName = $env:SIGNING_PROFILE
+          } | ConvertTo-Json | Set-Content -LiteralPath $metadata -Encoding utf8
+          $signArgs = ConvertTo-Json -Compress -InputObject @('/tr', 'http://timestamp.acs.microsoft.com', '/dlib', $dlib, '/dmdf', $metadata)
+          "PINGPINGPING_SIGNTOOL_PATH=$($signTool.FullName)" >> $env:GITHUB_ENV
+          "PINGPINGPING_SIGNTOOL_ARGS=$signArgs" >> $env:GITHUB_ENV
       - name: Build size-optimized installer and portable ZIP
         shell: powershell
-        run: .\script\package-windows.ps1 -Version $env:RELEASE_VERSION
+        run: |
+          $sign = $env:WINDOWS_SIGNING_ENABLED -eq 'true'
+          if (!$sign) { Write-Host '::notice::Windows code signing is disabled.' }
+          .\script\package-windows.ps1 -Version $env:RELEASE_VERSION -Sign:$sign
       - uses: actions/upload-artifact@v7
         with:
           name: windows-x64

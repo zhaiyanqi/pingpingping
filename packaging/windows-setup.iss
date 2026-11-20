@@ -12,6 +12,10 @@ SetupIconFile=pingpingping.ico
 Compression=lzma2/ultra
 SolidCompression=yes
 WizardStyle=modern
+#ifdef SignWindowsPackage
+SignTool=PingPingPing
+SignedUninstaller=yes
+#endif
 
 [Files]
 Source: "{#AppBinary}"; DestDir: "{app}"; Flags: ignoreversion
