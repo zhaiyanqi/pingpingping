@@ -426,11 +426,39 @@ fn point(position: Position) -> POINT {
     }
 }
 
-fn palette_hwnd(window: &Window) -> Option<HWND> {
+fn window_hwnd(window: &Window) -> Option<HWND> {
     match HasWindowHandle::window_handle(window).ok()?.as_raw() {
         RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as HWND),
         _ => None,
     }
+}
+
+pub(crate) fn use_system_close_button(window: &Window) {
+    if let Some(hwnd) = window_hwnd(window)
+        && unsafe { SetWindowSubclass(hwnd, Some(system_close_button_proc), 1, 0) } == 0
+    {
+        eprintln!("无法注册系统标题栏关闭按钮处理程序");
+    }
+}
+
+unsafe extern "system" fn system_close_button_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    id: usize,
+    _: usize,
+) -> LRESULT {
+    match message {
+        WM_NCLBUTTONDOWN | WM_NCLBUTTONUP | WM_NCLBUTTONDBLCLK if wparam == HTCLOSE as usize => {
+            // Let Windows track the caption click through release. WM_CLOSE still goes to GPUI.
+            // 由 Windows 跟踪标题栏点击直到松开，WM_CLOSE 仍交给 GPUI 处理。
+            return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+        }
+        WM_NCDESTROY => unsafe { RemoveWindowSubclass(hwnd, Some(system_close_button_proc), id) },
+        _ => 0,
+    };
+    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
 }
 
 pub(crate) struct PaletteMove {
@@ -441,7 +469,7 @@ pub(crate) struct PaletteMove {
 impl PaletteMove {
     pub(crate) fn new(window: &Window, grab: Point<Pixels>) -> Option<Self> {
         Some(Self {
-            hwnd: palette_hwnd(window)?,
+            hwnd: window_hwnd(window)?,
             grab,
         })
     }
@@ -484,7 +512,7 @@ impl PaletteResize {
         press: Point<Pixels>,
         minimum: Size<Pixels>,
     ) -> Option<Self> {
-        let hwnd = palette_hwnd(window)?;
+        let hwnd = window_hwnd(window)?;
         let scale = f64::from(window.scale_factor());
         let physical = |value: Pixels| (f64::from(value) * scale).round() as i32;
         let mut press = POINT {
@@ -539,7 +567,7 @@ fn release_palette_capture(hwnd: HWND) {
 }
 
 pub(crate) fn configure_palette(window: &Window, pinned: bool) -> bool {
-    let Some(hwnd) = palette_hwnd(window) else {
+    let Some(hwnd) = window_hwnd(window) else {
         return false;
     };
     unsafe {
@@ -560,7 +588,7 @@ pub(crate) fn configure_palette(window: &Window, pinned: bool) -> bool {
 }
 
 pub(crate) fn set_palette_pinned(window: &Window, pinned: bool) -> bool {
-    palette_hwnd(window).is_some_and(|hwnd| unsafe {
+    window_hwnd(window).is_some_and(|hwnd| unsafe {
         SetWindowPos(
             hwnd,
             if pinned { HWND_TOPMOST } else { HWND_NOTOPMOST },
@@ -590,12 +618,12 @@ unsafe extern "system" fn palette_proc(
 }
 
 pub(crate) fn palette_drop(window: &Window, release: Position) -> Option<Position> {
-    release_palette_capture(palette_hwnd(window)?);
+    release_palette_capture(window_hwnd(window)?);
     palette_outside(window, release)
 }
 
 pub(crate) fn palette_outside(window: &Window, pointer: Position) -> Option<Position> {
-    let hwnd = palette_hwnd(window)?;
+    let hwnd = window_hwnd(window)?;
     let mut bounds = RECT::default();
     let mut client_point = point(pointer);
     let outside = unsafe {

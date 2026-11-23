@@ -202,7 +202,9 @@ pub(crate) fn start(cx: &mut App) {
 fn register_window_actions(cx: &mut App) {
     cx.on_action(|_: &OpenChat, cx| open_chat(cx));
     cx.on_action(|_: &OpenHistory, cx| open_history(cx));
-    cx.on_action(|_: &OpenSettings, cx| open_settings(cx));
+    // The shortcut can run inside Settings' own update. Restore its handle after dispatch.
+    // 快捷键可能在设置窗口自身的更新中触发，待分发结束后再使用窗口句柄。
+    cx.on_action(|_: &OpenSettings, cx| cx.defer(open_settings));
     cx.on_action(|_: &CloseWindow, cx| close_active_window(cx));
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.bind_keys([
@@ -548,7 +550,9 @@ fn open_settings(cx: &mut App) {
         |window, cx| cx.new(|cx| Settings::new(window, cx)),
     ) {
         cx.global_mut::<Desktop>().settings = Some(handle);
-        cx.activate(true);
+        // On Windows, activating the app alone can leave focus on the tray menu's owner.
+        // Windows 上只激活应用时，焦点可能仍在托盘菜单的所属窗口。
+        focus_window(Some(handle), cx);
     }
 }
 
@@ -2237,6 +2241,8 @@ impl Settings {
 
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         close_to_tray(window, cx);
+        #[cfg(target_os = "windows")]
+        platform::use_system_close_button(window);
         let model = cx.global::<Desktop>().model.clone();
         let Profile {
             name,
@@ -3162,7 +3168,7 @@ mod tests {
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
         AnyWindowHandle, AppContext, ElementId, QuitMode, ScrollDelta, SharedString,
-        TestAppContext, WindowVisibility, point, px, size,
+        TestAppContext, VisualTestContext, WindowVisibility, point, px, size,
     };
     use image::{Rgba, RgbaImage};
     use uuid::Uuid;
@@ -3198,12 +3204,7 @@ mod tests {
             open_chat(cx);
             open_settings(cx);
             let desktop = cx.global::<Desktop>();
-            let chat = desktop.chat.unwrap();
-            let settings = desktop.settings.unwrap();
-            settings
-                .update(cx, |_, window, _| window.activate_window())
-                .unwrap();
-            (chat, settings, data)
+            (desktop.chat.unwrap(), desktop.settings.unwrap(), data)
         })
     }
 
@@ -3295,6 +3296,23 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn settings_opens_active_and_accepts_a_native_close_after_losing_focus(
+        cx: &mut TestAppContext,
+    ) {
+        let (chat, settings, _) = settings_desktop(cx);
+        assert_eq!(cx.update(|cx| cx.active_window()), Some(settings));
+
+        cx.simulate_keystrokes(settings, &shortcut(","));
+        assert_eq!(cx.windows().len(), 2);
+        assert_eq!(cx.update(|cx| cx.active_window()), Some(settings));
+
+        cx.update(open_chat);
+        assert_eq!(cx.update(|cx| cx.active_window()), Some(chat));
+        assert!(VisualTestContext::from_window(settings, cx).simulate_close());
+        assert_eq!(cx.update(|cx| cx.active_window()), Some(chat));
+    }
+
+    #[gpui_kit::test]
     fn close_shortcut_dismisses_settings_during_shortcut_recording(cx: &mut TestAppContext) {
         let (chat, settings, _) = settings_desktop(cx);
         let paused = start_shortcut_recording(settings, cx);
@@ -3343,16 +3361,15 @@ mod tests {
     fn hiding_settings_cancels_shortcut_recording_and_reopening_keeps_the_view(
         cx: &mut TestAppContext,
     ) {
-        let (_, settings, _) = settings_desktop(cx);
+        let (chat, settings, _) = settings_desktop(cx);
         let paused = start_shortcut_recording(settings, cx);
         cx.simulate_window_visibility_change(settings, WindowVisibility::Hidden);
         assert!(!paused.load(Ordering::Relaxed));
 
+        cx.update(open_chat);
+        assert_eq!(cx.update(|cx| cx.active_window()), Some(chat));
         cx.update(open_settings);
-        assert_eq!(
-            cx.update(|cx| cx.global::<Desktop>().settings),
-            Some(settings)
-        );
+        assert_eq!(cx.update(|cx| cx.active_window()), Some(settings));
         cx.update_window(settings, |_, window, cx| {
             let settings = Root::read(window, cx)
                 .view()
