@@ -12,7 +12,7 @@ use uuid::Uuid;
 use async_channel::Sender;
 use chrono::{DateTime, Local};
 use gpui_kit::assets::IconName;
-use gpui_kit::base::{Button as BaseButton, InteractiveElementExt, Root};
+use gpui_kit::base::{Button as BaseButton, InteractiveElementExt, Root, TestSupportExt};
 use gpui_kit::component::{
     ActiveTheme, Disableable, IndexPath, Selectable, Sizable,
     button::{Button, ButtonVariants},
@@ -469,6 +469,15 @@ fn options(title: &str, width: f32, height: f32, cx: &App) -> WindowOptions {
     }
 }
 
+fn workspace_options(title: &str, width: f32, height: f32, cx: &App) -> WindowOptions {
+    let mut options = options(title, width, height, cx);
+    if let Some(titlebar) = &mut options.titlebar {
+        titlebar.appears_transparent = true;
+    }
+    options.app_owns_titlebar_drag = true;
+    options
+}
+
 fn should_close_window(window: &Window, cx: &mut App) -> bool {
     let desktop = cx.global::<Desktop>();
     let has_tray = desktop.tray.is_some();
@@ -525,12 +534,16 @@ pub(crate) fn open_chat(cx: &mut App) {
         return;
     }
     if let Ok((handle, _)) = gpui_kit::open_window(
-        options("PingPingPing · 聊天", 720., 650., cx),
+        workspace_options("PingPingPing · 聊天", 780., 650., cx),
         cx,
-        |window, cx| cx.new(|cx| Conversation::new(false, window, cx)),
+        |window, cx| {
+            #[cfg(target_os = "macos")]
+            platform::hide_native_titlebar_buttons(window);
+            cx.new(|cx| Conversation::new(false, window, cx))
+        },
     ) {
         cx.global_mut::<Desktop>().chat = Some(handle);
-        cx.activate(true);
+        focus_window(Some(handle), cx);
     }
 }
 
@@ -552,24 +565,17 @@ fn open_settings(cx: &mut App) {
     if focus_window(cx.global::<Desktop>().settings, cx) {
         return;
     }
-    create_settings_window(cfg!(target_os = "windows"), cx);
-}
-
-const SETTINGS_TITLE: &str = "PingPingPing · 设置";
-
-fn create_settings_window(client_titlebar: bool, cx: &mut App) {
-    let options = options(SETTINGS_TITLE, 700., 655., cx);
     if let Ok((handle, _)) = gpui_kit::open_window(
         WindowOptions {
-            titlebar: options.titlebar.map(|titlebar| TitlebarOptions {
-                appears_transparent: client_titlebar,
-                ..titlebar
-            }),
             window_min_size: Some(size(px(560.), px(400.))),
-            ..options
+            ..workspace_options("PingPingPing · 设置", 700., 655., cx)
         },
         cx,
-        |window, cx| cx.new(|cx| Settings::new(client_titlebar, window, cx)),
+        |window, cx| {
+            #[cfg(target_os = "macos")]
+            platform::hide_native_titlebar_buttons(window);
+            cx.new(|cx| Settings::new(window, cx))
+        },
     ) {
         cx.global_mut::<Desktop>().settings = Some(handle);
         // On Windows, activating the app alone can leave focus on the tray menu's owner.
@@ -1283,7 +1289,7 @@ fn bubble(message: &Message, mine: bool, action: Option<Div>, cx: &App) -> impl 
 }
 
 impl Render for Conversation {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let model = self.model.read(cx);
         let joined = model.joined();
         let error = self.error.clone().or_else(|| model.room_error.clone());
@@ -1364,13 +1370,8 @@ impl Render for Conversation {
                 .py_2()
                 .into_any_element()
             };
-        let mut view = div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(theme.background)
-            .text_color(theme.foreground)
-            .child(
+        let header =
+            if self.history {
                 div()
                     .flex()
                     .flex_shrink_0()
@@ -1385,70 +1386,89 @@ impl Render for Conversation {
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(
-                                if self.history {
-                                    "历史记录"
-                                } else {
-                                    "局域网聊天"
-                                },
-                            ))
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("历史记录"),
+                            )
                             .child(div().text_xs().text_color(theme.muted_foreground).child(
-                                if self.history {
-                                    format!(
-                                        "{} · {count} 条记录",
-                                        if self.all_rooms {
-                                            "所有会话"
-                                        } else {
-                                            "当前会话"
-                                        }
-                                    )
-                                } else if let Some(connection) = model.connection() {
-                                    format!(
-                                        "{} · {}",
-                                        match connection {
-                                            RoomConfig::Host(_) => "正在监听",
-                                            RoomConfig::Join(_) => "已连接",
-                                        },
-                                        connection.address()
-                                    )
-                                } else if model.is_reconnecting() {
-                                    "本机 · 自动重连中".into()
-                                } else if let Some(config) = model.pending_room() {
-                                    pending_room_label(config).into()
-                                } else {
-                                    "本机 · 未加入房间".into()
-                                },
+                                format!(
+                                    "{} · {count} 条记录",
+                                    if self.all_rooms {
+                                        "所有会话"
+                                    } else {
+                                        "当前会话"
+                                    }
+                                ),
                             )),
                     )
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .when(!self.history, |row| {
-                                row.child(
-                                    Button::new("palette")
-                                        .ghost()
-                                        .label("快捷浮窗")
-                                        .selected(palette::is_open(cx))
-                                        .toggled(palette::is_open(cx))
-                                        .on_click(|_, _, cx| palette::toggle(cx)),
-                                )
-                                .child(
-                                    Button::new("history")
-                                        .ghost()
-                                        .label("历史记录…")
-                                        .on_click(|_, _, cx| open_history(cx)),
-                                )
-                            })
-                            .child(
-                                Button::new("settings")
-                                    .ghost()
-                                    .label("设置…")
-                                    .on_click(|_, _, cx| open_settings(cx)),
-                            ),
-                    ),
-            );
+                        Button::new("settings")
+                            .ghost()
+                            .label("设置…")
+                            .on_click(|_, _, cx| open_settings(cx)),
+                    )
+            } else {
+                let status = if let Some(connection) = model.connection() {
+                    format!(
+                        "{} · {}",
+                        match connection {
+                            RoomConfig::Host(_) => "正在监听",
+                            RoomConfig::Join(_) => "已连接",
+                        },
+                        connection.address()
+                    )
+                } else if model.is_reconnecting() {
+                    "本机 · 自动重连中".into()
+                } else if let Some(config) = model.pending_room() {
+                    pending_room_label(config).into()
+                } else {
+                    "本机 · 未加入房间".into()
+                };
+                let show_labels = window.viewport_size().width >= px(680.);
+                let action = |id: &'static str, label: &'static str, icon: IconName| {
+                    Button::new(id)
+                        .ghost()
+                        .small()
+                        .accessibility_label(label)
+                        .tooltip(label)
+                        .map(|button| {
+                            if show_labels {
+                                button.label(label)
+                            } else {
+                                button.icon(icon)
+                            }
+                        })
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                };
+                let actions = div()
+                    .flex()
+                    .items_center()
+                    .pr_2()
+                    .child(
+                        action("palette", "快捷浮窗", IconName::AppWindow)
+                            .selected(palette::is_open(cx))
+                            .toggled(palette::is_open(cx))
+                            .on_click(|_, _, cx| palette::toggle(cx)),
+                    )
+                    .child(
+                        action("history", "历史记录", IconName::Clock)
+                            .on_click(|_, _, cx| open_history(cx)),
+                    )
+                    .child(
+                        action("settings", "设置", IconName::Settings)
+                            .on_click(|_, _, cx| open_settings(cx)),
+                    );
+                window_titlebar("局域网聊天", Some(status), Some(actions), window, cx)
+            };
+        let mut view = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme.background)
+            .text_color(theme.foreground)
+            .child(header);
         if self.history {
             view = view.child(
                 div().flex().px_5().pt_2().child(
@@ -1494,7 +1514,34 @@ impl Render for Conversation {
                     ),
             );
         }
-        view = view.child(feed);
+        view = if !self.history && joined {
+            view.child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(div().flex().flex_col().flex_1().min_w_0().child(feed))
+                    .child(
+                        div()
+                            .w(relative(0.28))
+                            .max_w(px(204.))
+                            .flex_shrink_0()
+                            .border_l_1()
+                            .border_color(theme.border)
+                            .bg(theme.sidebar)
+                            .child(
+                                div()
+                                    .size_full()
+                                    .p_3()
+                                    .child(online_users(model, cx))
+                                    .overflow_y_scrollbar()
+                                    .id("chat-members"),
+                            ),
+                    ),
+            )
+        } else {
+            view.child(feed)
+        };
         if let (Some(input), Some(effect)) = (&self.input, &self.text_effect) {
             let empty = input.read(cx).value().trim().is_empty();
             view = view.child(
@@ -1744,7 +1791,6 @@ fn overlay_select_field<T: Copy + PartialEq + 'static>(
 
 struct Settings {
     model: Entity<Model>,
-    client_titlebar: bool,
     category: SettingsCategory,
     name: Entity<InputState>,
     ip: Entity<InputState>,
@@ -2263,7 +2309,7 @@ impl Settings {
             )
     }
 
-    fn new(client_titlebar: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         close_to_tray(window, cx);
         let model = cx.global::<Desktop>().model.clone();
         let Profile {
@@ -2363,7 +2409,6 @@ impl Settings {
         );
         Self {
             model,
-            client_titlebar,
             category: SettingsCategory::General,
             name,
             ip,
@@ -2727,68 +2772,9 @@ impl Settings {
                             .on_click(cx.listener(|this, _, _, cx| this.disconnect(cx))))))
                 .when_some(connection, |group, config| group
                     .child(div().text_sm().text_color(theme.muted_foreground).child(format!("{} · {}", if matches!(config, RoomConfig::Host(_)) { "正在监听" } else { "已连接" }, config.address())))
-                    .child(self.online_users(cx)))
+                    .child(div().mt_3().pt_4().border_t_1().border_color(theme.border).child(online_users(self.model.read(cx), cx))))
                 .when_some(room_error, |group, error| group
                     .child(div().text_sm().text_color(theme.danger).child(error)))
-    }
-
-    fn online_users(&self, cx: &Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let section = div()
-            .id("online-users")
-            .mt_3()
-            .pt_4()
-            .border_t_1()
-            .border_color(theme.border)
-            .flex()
-            .flex_col()
-            .gap_2();
-        match self.model.read(cx).room_members() {
-            Some((local_id, members)) if !members.is_empty() => section
-                .child(
-                    div()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(format!("在线用户（{}）", members.len())),
-                )
-                .children(members.iter().enumerate().map(|(index, member)| {
-                    let role = match (index == 0, member.id() == local_id) {
-                        (true, true) => Some("主机 · 你"),
-                        (true, false) => Some("主机"),
-                        (false, true) => Some("你"),
-                        (false, false) => None,
-                    };
-                    div()
-                        .id(member.id())
-                        .flex()
-                        .items_start()
-                        .gap_3()
-                        .text_sm()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .whitespace_normal()
-                                .child(member.name().unwrap_or("旧版访客").to_owned()),
-                        )
-                        .when_some(role, |row, role| {
-                            row.child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_color(theme.muted_foreground)
-                                    .child(role),
-                            )
-                        })
-                })),
-            members => section
-                .child(div().font_weight(FontWeight::SEMIBOLD).child("在线用户"))
-                .child(div().text_sm().text_color(theme.muted_foreground).child(
-                    if members.is_some() {
-                        "正在获取在线用户…"
-                    } else {
-                        "请更新主机版本以查看在线用户。"
-                    },
-                )),
-        }
     }
 
     fn wheel_shortcuts(&self, cx: &Context<Self>) -> Div {
@@ -3081,7 +3067,65 @@ impl Settings {
     }
 }
 
-fn settings_titlebar(window: &Window, cx: &App) -> Div {
+fn online_users(model: &Model, cx: &App) -> Stateful<Div> {
+    let theme = cx.theme();
+    let section = div().id("online-users").flex().flex_col().gap_2();
+    match model.room_members() {
+        Some((local_id, members)) if !members.is_empty() => section
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(format!("在线用户（{}）", members.len())),
+            )
+            .children(members.iter().enumerate().map(|(index, member)| {
+                let role = match (index == 0, member.id() == local_id) {
+                    (true, true) => Some("主机 · 你"),
+                    (true, false) => Some("主机"),
+                    (false, true) => Some("你"),
+                    (false, false) => None,
+                };
+                div()
+                    .id(member.id())
+                    .test_support()
+                    .flex()
+                    .items_start()
+                    .gap_3()
+                    .text_sm()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_normal()
+                            .child(member.display_name().to_owned()),
+                    )
+                    .when_some(role, |row, role| {
+                        row.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_color(theme.muted_foreground)
+                                .child(role),
+                        )
+                    })
+            })),
+        members => section
+            .child(div().font_weight(FontWeight::SEMIBOLD).child("在线用户"))
+            .child(div().text_sm().text_color(theme.muted_foreground).child(
+                if members.is_some() {
+                    "正在获取在线用户…"
+                } else {
+                    "请更新主机版本以查看在线用户。"
+                },
+            )),
+    }
+}
+
+fn window_titlebar(
+    title: &'static str,
+    subtitle: Option<String>,
+    actions: Option<Div>,
+    window: &Window,
+    cx: &App,
+) -> Div {
     let theme = cx.theme();
     let button = |id: &'static str, icon: IconName, label: &'static str| {
         Button::new(id)
@@ -3104,29 +3148,58 @@ fn settings_titlebar(window: &Window, cx: &App) -> Div {
     div()
         .flex()
         .items_center()
-        .h(gpui_kit::component::TITLE_BAR_HEIGHT)
+        .h(if subtitle.is_some() {
+            px(52.)
+        } else {
+            gpui_kit::component::TITLE_BAR_HEIGHT
+        })
         .flex_shrink_0()
-        .bg(theme.title_bar)
+        .border_b_1()
+        .border_color(theme.border)
+        .bg(theme.background)
         .text_sm()
         .child(
             div()
                 .flex_1()
+                .min_w_0()
                 .h_full()
                 .flex()
-                .items_center()
-                .pl_3()
-                .when(!window.is_window_active(), |title| {
-                    title.text_color(theme.muted_foreground)
-                })
+                .flex_col()
+                .justify_center()
+                .px_3()
                 .window_control_area(WindowControlArea::Drag)
-                .child(SETTINGS_TITLE),
+                .when(cfg!(target_os = "macos"), |caption| {
+                    caption.on_mouse_down(MouseButton::Left, |event, window, _| {
+                        if event.click_count == 2 {
+                            window.titlebar_double_click();
+                        } else {
+                            window.start_window_move();
+                        }
+                    })
+                })
+                .child(
+                    div()
+                        .truncate()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(title),
+                )
+                .when_some(subtitle, |caption, subtitle| {
+                    caption.child(
+                        div()
+                            .truncate()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(subtitle),
+                    )
+                }),
         )
+        .children(actions)
         .child(
-            button("settings-minimize", IconName::WindowMinimize, "最小化")
+            button("titlebar-minimize", IconName::WindowMinimize, "最小化")
                 .on_click(|_, window, _| window.minimize_window()),
         )
         .child(
-            button("settings-maximize", zoom_icon, zoom_label)
+            button("titlebar-maximize", zoom_icon, zoom_label)
                 .window_control_area(WindowControlArea::Max)
                 .on_click(|_, window, cx| {
                     cx.stop_propagation();
@@ -3136,10 +3209,10 @@ fn settings_titlebar(window: &Window, cx: &App) -> Div {
                     window.zoom_window();
                 }),
         )
-        // Keep × in the client area so a click uses the same close path as the footer.
-        // × 位于客户区，点击时与底部按钮使用同一条关闭路径。
+        // Keep × in the client area so a click closes the window that received it.
+        // × 位于客户区，点击时关闭实际收到事件的窗口。
         .child(
-            button("settings-titlebar-close", IconName::WindowClose, "关闭设置").on_click(
+            button("titlebar-close", IconName::WindowClose, "关闭窗口").on_click(
                 |_, window, cx| {
                     cx.stop_propagation();
                     close_window(window, cx);
@@ -3287,9 +3360,7 @@ impl Render for Settings {
             .flex_col()
             .bg(theme.background)
             .text_color(theme.foreground)
-            .when(self.client_titlebar && !window.is_fullscreen(), |root| {
-                root.child(settings_titlebar(window, cx))
-            })
+            .child(window_titlebar("设置", None, None, window, cx))
             .child(content)
             .child(
                 div()
@@ -3384,9 +3455,7 @@ mod tests {
             cx.set_global(desktop);
             register_window_actions(cx);
             open_chat(cx);
-            // Headless windows have no OS caption. Exercise the Windows caption on every host.
-            // 无头窗口没有系统标题栏，在所有测试主机上验证 Windows 设置标题栏。
-            super::create_settings_window(true, cx);
+            open_settings(cx);
             let desktop = cx.global::<Desktop>();
             (desktop.chat.unwrap(), desktop.settings.unwrap(), data)
         })
@@ -3505,7 +3574,7 @@ mod tests {
         cx.simulate_window_scale_factor_change(settings, 1.);
         cx.update_window(settings, |_, window, cx| {
             window.render_frame(cx);
-            window.drag_to("settings-titlebar-close", "settings-name", cx);
+            window.drag_to("titlebar-close", "settings-name", cx);
         })
         .unwrap();
         assert_eq!(cx.windows().len(), 2);
@@ -3514,7 +3583,7 @@ mod tests {
         let mut view = VisualTestContext::from_window(settings, cx);
         let target = view.update(|window, cx| {
             window.render_frame(cx);
-            let close = window.find("settings-titlebar-close").bounds();
+            let close = window.find("titlebar-close").bounds();
             assert_eq!(close.right(), window.viewport_size().width);
             assert_eq!(close.top(), px(0.));
             assert_eq!(cx.active_window(), Some(chat));
@@ -3522,6 +3591,83 @@ mod tests {
         });
         view.simulate_click(target, Default::default());
         assert_eq!(cx.windows(), vec![chat]);
+    }
+
+    #[gpui_kit::test]
+    #[ignore = "requires TCP loopback access"]
+    async fn chat_shows_the_room_roster_on_the_right_until_disconnected(cx: &mut TestAppContext) {
+        use crate::room::{RoomConfig, RoomEvent};
+        use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+
+        let (chat, _, _) = settings_desktop(cx);
+        let model = cx.update(|cx| cx.global::<Desktop>().model.clone());
+        let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let SocketAddr::V4(address) = reservation.local_addr().unwrap() else {
+            unreachable!()
+        };
+        drop(reservation);
+        let (events, inbox) = async_channel::bounded(8);
+        model.update(cx, |model, cx| {
+            model.open_room(RoomConfig::Host(address), events, cx)
+        });
+        cx.condition(&model, |model, _| model.joined()).await;
+        let RoomEvent::Members(id, members) = inbox.recv().await.unwrap() else {
+            panic!("expected host roster")
+        };
+        let host = members[0].id();
+        model.update(cx, |model, cx| {
+            assert!(model.update_room_members(id, members));
+            cx.notify();
+        });
+        for width in [440., 780.] {
+            cx.simulate_window_resize(chat, size(px(width), px(500.)));
+            cx.update_window(chat, |_, window, cx| {
+                window.render_frame(cx);
+                let row = window.find(host).bounds();
+                assert!(row.left() > px(width * 0.6) && row.right() <= px(width));
+                assert!(row.size.width >= px(90.) && row.size.height > px(0.));
+                assert!(row.bottom() <= window.find("emote-picker").bounds().top());
+            })
+            .unwrap();
+        }
+        model.update(cx, |model, cx| {
+            model.disconnect();
+            cx.notify();
+        });
+        cx.update_window(chat, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find(host).is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn chat_caption_controls_fit_at_minimum_width_and_close_only_chat(cx: &mut TestAppContext) {
+        let (chat, settings, _) = settings_desktop(cx);
+        cx.simulate_window_scale_factor_change(chat, 1.5);
+        cx.simulate_window_resize(chat, size(px(440.), px(400.)));
+        let mut chat_view = VisualTestContext::from_window(chat, cx);
+        let target = chat_view.update(|window, cx| {
+            window.render_frame(cx);
+            let mut previous_right = px(0.);
+            for id in [
+                "palette",
+                "history",
+                "settings",
+                "titlebar-minimize",
+                "titlebar-maximize",
+                "titlebar-close",
+            ] {
+                let bounds = window.find(id).bounds();
+                assert!(bounds.left() >= previous_right && bounds.size.width > px(0.));
+                previous_right = bounds.right();
+            }
+            assert_eq!(previous_right, window.viewport_size().width);
+            assert_eq!(cx.active_window(), Some(settings));
+            window.find("titlebar-close").bounds().center()
+        });
+        chat_view.simulate_click(target, Default::default());
+        assert_eq!(cx.windows(), vec![settings]);
     }
 
     #[gpui_kit::test]

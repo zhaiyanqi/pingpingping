@@ -37,7 +37,7 @@ use objc2::{
 use objc2_app_kit::{
     NSApplication, NSBackingStoreType, NSColor, NSEventType, NSFloatingWindowLevel, NSFont,
     NSFontWeightSemibold, NSLineBreakMode, NSNormalWindowLevel, NSPanel, NSScreen,
-    NSStatusWindowLevel, NSTextField, NSView, NSWindow, NSWindowCollectionBehavior,
+    NSStatusWindowLevel, NSTextField, NSView, NSWindow, NSWindowButton, NSWindowCollectionBehavior,
     NSWindowStyleMask, NSWorkspace,
 };
 use objc2_core_graphics::CGImage;
@@ -328,7 +328,7 @@ fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
 }
 
-fn palette_panel(window: &Window) -> Option<Retained<NSPanel>> {
+fn native_window(window: &Window) -> Option<Retained<NSWindow>> {
     let RawWindowHandle::AppKit(handle) = HasWindowHandle::window_handle(window).ok()?.as_raw()
     else {
         return None;
@@ -336,7 +336,25 @@ fn palette_panel(window: &Window) -> Option<Retained<NSPanel>> {
     // SAFETY: GPUI lends its live main-thread view for the duration of this call.
     // 安全性：GPUI 在本次调用期间借出主线程上的有效视图。
     let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
-    view.window()?.downcast().ok()
+    view.window()
+}
+
+pub(crate) fn hide_native_titlebar_buttons(window: &Window) {
+    if let Some(window) = native_window(window) {
+        for kind in [
+            NSWindowButton::CloseButton,
+            NSWindowButton::MiniaturizeButton,
+            NSWindowButton::ZoomButton,
+        ] {
+            if let Some(button) = window.standardWindowButton(kind) {
+                button.setHidden(true);
+            }
+        }
+    }
+}
+
+fn palette_panel(window: &Window) -> Option<Retained<NSPanel>> {
+    native_window(window)?.downcast().ok()
 }
 
 pub(crate) fn configure_palette(window: &Window, pinned: bool) -> bool {

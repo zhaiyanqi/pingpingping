@@ -6,13 +6,25 @@ use std::borrow::Cow;
 use gpui_kit::assets::{Assets, icon_assets};
 use gpui_kit::{AssetSource, Result, SharedString};
 
-icon_assets!(PaletteIcons, [GripVertical, MoveDiagonal2, Pin, PinOff, X]);
+icon_assets!(
+    AppIcons,
+    [
+        AppWindow,
+        Clock,
+        GripVertical,
+        MoveDiagonal2,
+        Pin,
+        PinOff,
+        Settings,
+        X
+    ]
+);
 
 pub(crate) struct AppAssets;
 
 impl AssetSource for AppAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
-        match PaletteIcons.load(path)? {
+        match AppIcons.load(path)? {
             Some(icon) => Ok(Some(icon)),
             None => Assets.load(path),
         }
@@ -20,7 +32,7 @@ impl AssetSource for AppAssets {
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         let mut files = Assets.list(path)?;
-        files.extend(PaletteIcons.list(path)?);
+        files.extend(AppIcons.list(path)?);
         files.sort_unstable();
         files.dedup();
         Ok(files)
@@ -103,6 +115,13 @@ mod tests {
     #[test]
     fn app_assets_include_palette_and_component_svgs() {
         for icon in [
+            IconName::AppWindow,
+            IconName::Clock,
+            IconName::Settings,
+            IconName::WindowMinimize,
+            IconName::WindowMaximize,
+            IconName::WindowClose,
+            IconName::WindowRestore,
             IconName::GripVertical,
             IconName::MoveDiagonal2,
             IconName::Pin,

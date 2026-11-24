@@ -1,7 +1,7 @@
 //! Direct TCP rooms on local IPv4 endpoints, with one host forwarding room messages.
 //! 使用局域网 IPv4 地址直连的 TCP 房间，由一台主机转发房间消息。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -90,6 +90,10 @@ impl RoomMember {
 
     pub(crate) fn name(&self) -> Option<&str> {
         self.name.as_deref()
+    }
+
+    pub(crate) fn display_name(&self) -> &str {
+        self.name().unwrap_or("旧版访客")
     }
 }
 
@@ -182,6 +186,10 @@ impl Room {
                             },
                             |()| "已断开连接".into(),
                         );
+                    // Record the lost host in this room before the UI switches to reconnecting.
+                    // 界面切换至重连状态前，先把与主机断开的通知记入当前房间。
+                    let notice = room_notice(id, "与房间主机的连接已断开".into());
+                    let _ = report_event(&incoming, RoomEvent::Message(id, notice)).await;
                     let _ = incoming.send(RoomEvent::Closed(id, reason)).await;
                 });
                 (member_id, task)
@@ -590,6 +598,25 @@ struct Peer {
     _task: Task<()>,
 }
 
+fn room_notice(sender: Uuid, text: String) -> Message {
+    Message::new(sender, "房间通知".into(), Body::Text(text))
+}
+
+enum MembershipChange {
+    Joined(RoomMember),
+    Left(RoomMember),
+}
+
+impl MembershipChange {
+    fn notice(self, host_id: Uuid) -> Message {
+        let (member, status) = match self {
+            Self::Joined(member) => (member, "已上线"),
+            Self::Left(member) => (member, "已离开房间"),
+        };
+        room_notice(host_id, format!("{} {status}", member.display_name()))
+    }
+}
+
 async fn host(
     mut host: RoomMember,
     listener: TcpListener,
@@ -633,7 +660,8 @@ async fn host(
             ),
         )
         .await?;
-        let members_changed = match wake {
+        let mut changes = VecDeque::new();
+        let renamed = match wake {
             HostWake::Accepted(mut stream, address)
                 if local_peer(address) && peers.len() < MAX_PEERS =>
             {
@@ -691,12 +719,17 @@ async fn host(
                     continue;
                 };
                 peer.has_members = name.is_some();
-                peer.member = Some(RoomMember { id, name });
-                true
+                let member = RoomMember { id, name };
+                peer.member = Some(member.clone());
+                changes.push_back(MembershipChange::Joined(member));
+                false
             }
-            HostWake::Peer(HostEvent::Disconnected(peer)) => peers
-                .remove(&peer)
-                .is_some_and(|peer| peer.member.is_some()),
+            HostWake::Peer(HostEvent::Disconnected(peer)) => {
+                if let Some(member) = peers.remove(&peer).and_then(|peer| peer.member) {
+                    changes.push_back(MembershipChange::Left(member));
+                }
+                false
+            }
             HostWake::Peer(HostEvent::Incoming(id, Packet::Message(message))) => {
                 let Some(peer) = peers.get_mut(&id) else {
                     continue;
@@ -708,9 +741,9 @@ async fn host(
                         .member
                         .as_mut()
                         .is_some_and(|member| update_name(member, &message.name));
-                let removed = broadcast(&mut peers, Some(id), message.clone());
+                broadcast(&mut peers, Some(id), &message, &mut changes);
                 report_event(incoming, RoomEvent::Message(host.id, message)).await?;
-                renamed || removed
+                renamed
             }
             HostWake::Peer(HostEvent::Incoming(id, Packet::Presence(Presence::Name(name)))) => {
                 peers
@@ -723,10 +756,20 @@ async fn host(
             | HostWake::Peer(HostEvent::Incoming(_, Packet::Presence(Presence::Members(_)))) => {
                 return Err(invalid_packet());
             }
-            HostWake::Local(message) => broadcast(&mut peers, None, message),
+            HostWake::Local(message) => {
+                broadcast(&mut peers, None, &message, &mut changes);
+                false
+            }
             HostWake::Stop => return Ok(()),
         };
-        if members_changed {
+        if renamed || !changes.is_empty() {
+            // Send transitions as ordered chat messages, even if roster snapshots are coalesced.
+            // 名单快照可以合并，但每次上下线仍按顺序作为普通聊天消息送达。
+            while let Some(change) = changes.pop_front() {
+                let notice = change.notice(host.id);
+                broadcast(&mut peers, None, &notice, &mut changes);
+                report_event(incoming, RoomEvent::Message(host.id, notice)).await?;
+            }
             publish_members(&host, &peers, incoming).await?;
         }
     }
@@ -758,10 +801,24 @@ async fn publish_members(
 
 // Drop peers whose queues are full so a slow reader cannot block the rest of the room.
 // 断开发送队列已满的对端，避免一个读取缓慢的客户端拖住整个房间。
-fn broadcast(peers: &mut HashMap<Uuid, Peer>, origin: Option<Uuid>, message: Message) -> bool {
-    let count = peers.len();
-    peers.retain(|id, peer| Some(*id) == origin || peer.outgoing.try_send(message.clone()).is_ok());
-    peers.len() != count
+fn broadcast(
+    peers: &mut HashMap<Uuid, Peer>,
+    origin: Option<Uuid>,
+    message: &Message,
+    changes: &mut VecDeque<MembershipChange>,
+) {
+    peers.retain(|id, peer| {
+        if Some(*id) == origin
+            || peer.member.is_none()
+            || peer.outgoing.try_send(message.clone()).is_ok()
+        {
+            return true;
+        }
+        if let Some(member) = peer.member.take() {
+            changes.push_back(MembershipChange::Left(member));
+        }
+        false
+    });
 }
 
 #[cfg(test)]
@@ -773,7 +830,11 @@ mod tests {
     use crate::model::TextEffect;
 
     async fn expect_members(inbox: &Receiver<RoomEvent>, room: &Room, names: &[&str]) {
-        let RoomEvent::Members(id, members) = inbox.recv().await.unwrap() else {
+        assert_members(inbox.recv().await.unwrap(), room, names);
+    }
+
+    fn assert_members(event: RoomEvent, room: &Room, names: &[&str]) {
+        let RoomEvent::Members(id, members) = event else {
             panic!("expected a room member list");
         };
         assert_eq!(id, room.id());
@@ -782,10 +843,38 @@ mod tests {
         assert_eq!(
             members
                 .iter()
-                .map(|member| member.name())
+                .map(|member| member.name().unwrap_or("旧版访客"))
                 .collect::<Vec<_>>(),
-            names.iter().copied().map(Some).collect::<Vec<_>>()
+            names
         );
+    }
+
+    fn assert_notice(event: RoomEvent, room: &Room, text: &str) -> Uuid {
+        let RoomEvent::Message(id, message) = event else {
+            panic!("expected a room notice");
+        };
+        assert_eq!(id, room.id());
+        assert_eq!(message.name, "房间通知");
+        assert!(message.valid());
+        assert!(matches!(message.body, Body::Text(body) if body == text));
+        message.id
+    }
+
+    async fn expect_change(
+        inbox: &Receiver<RoomEvent>,
+        room: &Room,
+        names: &[&str],
+        text: &str,
+    ) -> Uuid {
+        let first = inbox.recv().await.unwrap();
+        let second = inbox.recv().await.unwrap();
+        let (roster, notice) = if matches!(first, RoomEvent::Members(..)) {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        assert_members(roster, room, names);
+        assert_notice(notice, room, text)
     }
 
     fn loopback_address(address: SocketAddr) -> SocketAddrV4 {
@@ -831,11 +920,12 @@ mod tests {
                 let mut hello = [0; 4];
                 guest.read_exact(&mut hello).await.unwrap();
                 assert_eq!(hello, LEGACY_HELLO);
-                let RoomEvent::Members(_, members) = inbox.recv().await.unwrap() else {
-                    panic!("expected a room member list");
-                };
-                assert_eq!(members.len(), 2);
-                assert_eq!(members[1].name(), None);
+                let joined =
+                    expect_change(&inbox, &host, &["主机", "旧版访客"], "旧版访客 已上线").await;
+                let mut tag = [0];
+                guest.read_exact(&mut tag).await.unwrap();
+                assert_eq!(tag[0], MESSAGE);
+                assert_eq!(read_message(&mut guest).await.unwrap().id, joined);
 
                 let text = Message::new(Uuid::new_v4(), "旧版".into(), Body::Text("你好".into()));
                 write_frame(&mut guest, MESSAGE, &text).await.unwrap();
@@ -950,8 +1040,12 @@ mod tests {
                 .await
                 .unwrap();
                 first.activate();
-                expect_members(&host_inbox, &host, &["主机", "访客 A"]).await;
-                expect_members(&first_inbox, &first, &["主机", "访客 A"]).await;
+                let names = ["主机", "访客 A"];
+                let joined = expect_change(&host_inbox, &host, &names, "访客 A 已上线").await;
+                assert_eq!(
+                    expect_change(&first_inbox, &first, &names, "访客 A 已上线").await,
+                    joined
+                );
                 let (second_events, second_inbox) = async_channel::bounded(8);
                 let mut second = Room::open(
                     RoomConfig::Join(address),
@@ -963,9 +1057,13 @@ mod tests {
                 .unwrap();
                 second.activate();
                 let names = ["主机", "访客 A", "访客 B"];
-                expect_members(&host_inbox, &host, &names).await;
-                expect_members(&first_inbox, &first, &names).await;
-                expect_members(&second_inbox, &second, &names).await;
+                let joined = expect_change(&host_inbox, &host, &names, "访客 B 已上线").await;
+                for (inbox, guest) in [(&first_inbox, &first), (&second_inbox, &second)] {
+                    assert_eq!(
+                        expect_change(inbox, guest, &names, "访客 B 已上线").await,
+                        joined
+                    );
+                }
                 first.set_name("访客 C".into());
                 let names = ["主机", "访客 B", "访客 C"];
                 expect_members(&host_inbox, &host, &names).await;
@@ -1037,8 +1135,12 @@ mod tests {
                     matches!(second_inbox.recv().await.unwrap(), RoomEvent::Message(_, received) if received.id == cached.id)
                 );
                 drop(first);
-                expect_members(&host_inbox, &host, &["主机", "访客 B"]).await;
-                expect_members(&second_inbox, &second, &["主机", "访客 B"]).await;
+                let names = ["主机", "访客 B"];
+                let left = expect_change(&host_inbox, &host, &names, "访客 C 已离开房间").await;
+                assert_eq!(
+                    expect_change(&second_inbox, &second, &names, "访客 C 已离开房间").await,
+                    left
+                );
                 fs::remove_dir_all(host_data).unwrap();
                 let cached =
                     Message::new(Uuid::new_v4(), "主机".into(), Body::CustomEmote(local_id));
@@ -1047,6 +1149,11 @@ mod tests {
                     matches!(second_inbox.recv().await.unwrap(), RoomEvent::Message(_, received) if received.id == cached.id)
                 );
                 drop(host);
+                assert_notice(
+                    second_inbox.recv().await.unwrap(),
+                    &second,
+                    "与房间主机的连接已断开",
+                );
                 assert!(
                     matches!(second_inbox.recv().await.unwrap(), RoomEvent::Closed(id, _) if id == second.id())
                 );

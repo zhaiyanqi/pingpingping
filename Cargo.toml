@@ -32,7 +32,7 @@ core-foundation = "0.10"
 core-graphics = "0.24"
 foreign-types = "0.5"
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSAccessibility", "NSApplication", "NSCell", "NSColor", "NSControl", "NSEvent", "NSFont", "NSFontDescriptor", "NSGraphics", "NSGraphicsContext", "NSImage", "NSImageRep", "NSLayoutConstraint", "NSPanel", "NSParagraphStyle", "NSResponder", "NSScreen", "NSTextField", "NSView", "NSWindow", "NSWorkspace", "objc2-core-graphics", "objc2-quartz-core"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSAccessibility", "NSApplication", "NSButton", "NSCell", "NSColor", "NSControl", "NSEvent", "NSFont", "NSFontDescriptor", "NSGraphics", "NSGraphicsContext", "NSImage", "NSImageRep", "NSLayoutConstraint", "NSPanel", "NSParagraphStyle", "NSResponder", "NSScreen", "NSTextField", "NSView", "NSWindow", "NSWorkspace", "objc2-core-graphics", "objc2-quartz-core"] }
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGColor", "CGColorSpace", "CGDataProvider", "CGImage"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSBundle", "NSData", "NSDate", "NSGeometry", "NSString", "NSObject"] }
 objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "CALayer", "CATransaction", "objc2-core-foundation", "objc2-core-graphics"] }
