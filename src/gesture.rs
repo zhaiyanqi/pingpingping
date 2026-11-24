@@ -145,6 +145,13 @@ pub(crate) struct WheelInput {
 }
 
 impl WheelInput {
+    #[cfg(any(target_os = "windows", test))]
+    pub(crate) fn release_missing_keys(&mut self, is_down: impl Fn(u16) -> bool) -> bool {
+        let previous = self.keys.len();
+        self.keys.retain(|&key| is_down(key));
+        self.keys.len() != previous
+    }
+
     #[cfg(any(target_os = "macos", test))]
     pub(crate) fn reset_after_gap(&mut self) {
         // If the withheld press is still held, its eventual release must also be consumed.
@@ -536,6 +543,75 @@ mod tests {
         input.reset_after_gap();
         assert_eq!(side(&mut input, true), MouseDelivery::HoldDown);
         assert_eq!(side(&mut input, false), MouseDelivery::ReplayClick);
+    }
+
+    #[test]
+    fn a_missed_key_release_rearms_the_next_shortcut_after_a_chord() {
+        const L: u16 = 0x4c;
+        let config = Triggers::default();
+        let at = Position { x: 0., y: 0. };
+        let mut input = WheelInput::default();
+        let event = |state: &mut WheelInput, modifiers, kind| {
+            state.event(&config, modifiers, kind, at, false, || 1.).1
+        };
+
+        event(&mut input, SUPER, InputEvent::Key(L, true));
+        assert!(input.release_missing_keys(|_| false));
+        event(&mut input, 0, InputEvent::Modifier);
+        event(&mut input, ALT, InputEvent::Modifier);
+        assert_eq!(
+            event(&mut input, ALT, InputEvent::Left(true)),
+            MouseDelivery::HoldDown
+        );
+    }
+
+    #[test]
+    fn reconciling_keys_keeps_a_held_chord_suppressed_and_cancels_a_lost_drag() {
+        const K: u16 = 0x4b;
+        const L: u16 = 0x4c;
+        let config = Triggers {
+            ping_key: TriggerKey::Keyboard {
+                code: K,
+                label: "K".into(),
+            },
+            ..Triggers::default()
+        };
+        let mut input = WheelInput::default();
+        let event = |state: &mut WheelInput, kind, x| {
+            state.event(&config, 0, kind, Position { x, y: 0. }, false, || 1.)
+        };
+        event(&mut input, InputEvent::Key(K, true), 0.);
+        event(&mut input, InputEvent::Key(L, true), 0.);
+        assert!(input.release_missing_keys(|key| key == K));
+        event(&mut input, InputEvent::Modifier, 0.);
+        assert_eq!(
+            event(&mut input, InputEvent::Left(true), 0.).1,
+            MouseDelivery::Pass
+        );
+        assert_eq!(
+            event(&mut input, InputEvent::Left(false), 0.).1,
+            MouseDelivery::Pass
+        );
+
+        event(&mut input, InputEvent::Key(K, false), 0.);
+        event(&mut input, InputEvent::Key(K, true), 0.);
+        assert_eq!(
+            event(&mut input, InputEvent::Left(true), 0.).1,
+            MouseDelivery::HoldDown
+        );
+        assert_eq!(
+            event(&mut input, InputEvent::Move, 100.).1,
+            MouseDelivery::WheelMove
+        );
+        assert!(input.release_missing_keys(|_| false));
+        assert_eq!(
+            event(&mut input, InputEvent::Modifier, 0.).0,
+            [GestureEvent::Finish(None)]
+        );
+        assert_eq!(
+            event(&mut input, InputEvent::Left(false), 100.),
+            (vec![], MouseDelivery::Swallow)
+        );
     }
 
     #[test]

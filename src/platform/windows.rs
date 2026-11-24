@@ -84,7 +84,7 @@ impl InputMonitor {
                         gesture: WheelInput::default(),
                         move_window,
                         paused,
-                        keys: initial_keys(),
+                        keys: pressed_modifiers(),
                         palette_pointer: hook_pointer,
                     });
                 });
@@ -173,7 +173,7 @@ const MODIFIERS: [u32; 8] = [
     VK_LWIN as u32,
     VK_RWIN as u32,
 ];
-fn initial_keys() -> u16 {
+fn pressed_modifiers() -> u16 {
     MODIFIERS.iter().enumerate().fold(0, |keys, (index, key)| {
         if unsafe { GetAsyncKeyState(*key as i32) } < 0 {
             keys | (1 << index)
@@ -184,6 +184,23 @@ fn initial_keys() -> u16 {
 }
 
 impl Input {
+    fn reconcile_keyboard(&mut self) {
+        if self.triggers.is_none() {
+            return;
+        }
+        // A release can go to another input desktop, for example while Windows is locked.
+        // Deliver missed releases before starting or confirming another gesture.
+        // 锁屏等情况下，松键可能发生在另一个输入桌面。开始或确认手势前先补上遗漏的松键。
+        let modifiers = pressed_modifiers();
+        let released = self
+            .gesture
+            .release_missing_keys(|key| unsafe { GetAsyncKeyState(i32::from(key)) } < 0);
+        if released || self.keys != modifiers {
+            self.keys = modifiers;
+            self.dispatch(POINT::default(), InputEvent::Modifier);
+        }
+    }
+
     fn forward_palette_pointer(&self, message: u32, point: POINT) {
         match message {
             WM_MOUSEMOVE => {
@@ -273,6 +290,11 @@ unsafe extern "system" fn keyboard_hook(code: i32, message: WPARAM, data: LPARAM
         INPUT.with(|cell| {
             let mut cell = cell.borrow_mut();
             let Some(input) = cell.as_mut() else { return };
+            if down {
+                // The asynchronous state still precedes this low-level keyboard event.
+                // 此时系统异步按键状态仍对应本次低级键盘事件之前的状态。
+                input.reconcile_keyboard();
+            }
             let kind = if let Some(index) = MODIFIERS.iter().position(|key| *key == event.vkCode) {
                 if down {
                     input.keys |= 1 << index;
@@ -283,10 +305,9 @@ unsafe extern "system" fn keyboard_hook(code: i32, message: WPARAM, data: LPARAM
             } else {
                 InputEvent::Key(event.vkCode as u16, down)
             };
-            let mut cursor = POINT::default();
-            if unsafe { GetCursorPos(&mut cursor) } != 0 {
-                input.dispatch(cursor, kind);
-            }
+            // Only mouse events use coordinates. Always process key releases across desktop changes.
+            // 只有鼠标事件需要坐标。切换桌面时也应处理收到的松键。
+            input.dispatch(POINT::default(), kind);
         });
     }
     unsafe { CallNextHookEx(null_mut(), code, message, data) }
@@ -355,6 +376,9 @@ unsafe extern "system" fn mouse_hook(code: i32, message: WPARAM, data: LPARAM) -
                 WM_MOUSEHWHEEL => InputEvent::Scroll(0),
                 _ => return MouseDelivery::Pass,
             };
+            if matches!(kind, InputEvent::Left(_) | InputEvent::Side(..)) {
+                input.reconcile_keyboard();
+            }
             input.dispatch(event.pt, kind)
         });
         match delivery {
