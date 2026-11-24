@@ -46,7 +46,7 @@ use objc2_quartz_core::{CALayer, CATransaction};
 
 use crate::gesture::{
     ALT, CTRL, GestureEvent, InputEvent, MouseDelivery, Position, SCROLL_STEP, SHIFT, SUPER,
-    Triggers, WHEEL_SIZE, WheelInput,
+    TriggerMode, Triggers, WHEEL_SIZE, WheelInput,
 };
 use crate::model::{Location, TextPosition};
 
@@ -605,6 +605,7 @@ impl Overlay {
         contents: WheelContents,
         position: Position,
         selected: Option<usize>,
+        mode: TriggerMode,
         tick_volume: Option<f32>,
         cx: &App,
     ) {
@@ -638,7 +639,7 @@ impl Overlay {
             }
         });
         let tick = self.wheel_view.open(contents, size, selected, present, cx);
-        if !self.wheel.isKeyWindow() {
+        if mode == TriggerMode::MouseDrag && !self.wheel.isKeyWindow() {
             let app = NSApplication::sharedApplication(self.mtm);
             self.previous_key = app.keyWindow().filter(|_| app.isActive());
             self.wheel.setIgnoresMouseEvents(false);

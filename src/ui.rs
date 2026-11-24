@@ -18,6 +18,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
     popover::{Popover, PopoverState},
+    radio::RadioGroup,
     scroll::ScrollableElement,
     select::{Select, SelectItem, SelectState},
     slider::{Slider, SliderState},
@@ -29,7 +30,9 @@ use gpui_kit::*;
 
 use crate::assets::{EMOTES, PINGS};
 use crate::emotes::{EmoteId, EmoteStore, LibraryEmote};
-use crate::gesture::{GestureEvent, TriggerKey, Triggers, Wheel};
+use crate::gesture::{
+    ALT, CTRL, GestureEvent, SHIFT, SUPER, Shortcut, TriggerKey, TriggerMode, Triggers, Wheel,
+};
 use crate::model::{
     ANIMATION_TIMEOUT, Body, EMOTE_SIZE, EmotePage, Location, Message, Model, OverlaySettings,
     PING_SIZE, Profile, ROOM_RECONNECT_INTERVAL, SOUND_VOLUME, TextEffect, TextMotion,
@@ -255,6 +258,13 @@ fn shortcut(key: &str) -> String {
     format!("{modifier}-{key}")
 }
 
+fn shortcut_modifiers(modifiers: Modifiers) -> u8 {
+    (u8::from(modifiers.alt) * ALT)
+        | (u8::from(modifiers.control) * CTRL)
+        | (u8::from(modifiers.shift) * SHIFT)
+        | (u8::from(modifiers.platform) * SUPER)
+}
+
 fn default_data_dir() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     let (base, relative) = ("LOCALAPPDATA", "PingPingPing");
@@ -387,6 +397,7 @@ fn start_input(
 fn handle_gesture(event: GestureEvent, cx: &mut App) {
     let profile = &cx.global::<Desktop>().model.read(cx).profile;
     let enabled = profile.gestures;
+    let mode = profile.triggers.mode;
     let settings = profile.overlay.with_sound(profile.sound);
     let tick_volume = settings.volume().filter(|_| settings.wheel_sound);
     let contents = match event {
@@ -397,7 +408,7 @@ fn handle_gesture(event: GestureEvent, cx: &mut App) {
         GestureEvent::Open(_, origin, selected) if enabled => {
             desktop
                 .overlay
-                .open(contents, origin, selected, tick_volume, cx)
+                .open(contents, origin, selected, mode, tick_volume, cx)
         }
         GestureEvent::Select(index) if enabled => desktop.overlay.select(index, tick_volume, cx),
         GestureEvent::Page(steps, selected) if enabled => {
@@ -1738,6 +1749,7 @@ struct Settings {
     swap_source: Option<WheelSlot>,
     pending_image: Option<WheelSlot>,
     recording: Option<Wheel>,
+    recording_modifiers: u8,
     capture_focus: FocusHandle,
     capture_paused: Arc<AtomicBool>,
     remote_overlay: bool,
@@ -2357,6 +2369,7 @@ impl Settings {
             swap_source: None,
             pending_image: None,
             recording: None,
+            recording_modifiers: 0,
             capture_focus,
             capture_paused: cx.global::<Desktop>().capture_paused.clone(),
             remote_overlay,
@@ -2384,7 +2397,7 @@ impl Settings {
         }
     }
 
-    fn record_key(&mut self, key: TriggerKey, cx: &mut Context<Self>) {
+    fn record_key(&mut self, key: Shortcut, cx: &mut Context<Self>) {
         match self.recording {
             Some(Wheel::Ping) => self.triggers.ping_key = key,
             Some(Wheel::Emote) => self.triggers.emote_key = key,
@@ -2426,7 +2439,14 @@ impl Settings {
         row.child(
             Button::new(SharedString::from(format!("{id}-record")))
                 .label(if listening {
-                    "请按键或鼠标侧键 · Esc 取消".to_owned()
+                    if self.recording_modifiers == 0 {
+                        "按单键或组合键 · Esc 取消".to_owned()
+                    } else {
+                        format!(
+                            "{} · 继续按键或松开",
+                            Shortcut::new(self.recording_modifiers, None).label()
+                        )
+                    }
                 } else {
                     format!("{} · 重新录入", selected.label())
                 })
@@ -2434,6 +2454,7 @@ impl Settings {
                 .disabled(!self.gestures || !enabled)
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.recording = Some(wheel);
+                    this.recording_modifiers = 0;
                     this.capture_paused.store(true, Ordering::Relaxed);
                     this.capture_focus.focus(window, cx);
                     cx.notify();
@@ -2773,24 +2794,97 @@ impl Settings {
         #[cfg(not(target_os = "macos"))]
         let permission_hint = "全局输入监听未启动。";
         let theme = cx.theme();
-        div().flex().flex_col().gap_3().border_t_1().border_color(theme.border).pt_4()
-                .child(div().font_weight(FontWeight::SEMIBOLD).child("轮盘快捷键"))
-                .child(div().text_sm().text_color(theme.muted_foreground).child("键盘触发时，按住快捷键并用左键拖动。鼠标侧键可直接按住拖动，松开确认。拖回中心可取消，表情轮盘打开时可用滚轮翻页。"))
-                .child(Switch::new("gestures").label("启用全局轮盘").checked(self.gestures)
-                    .on_change(cx.listener(|this, value, _, cx| { this.gestures = *value; cx.notify(); })))
-                .child(self.trigger_row(Wheel::Ping, cx))
-                .child(self.trigger_row(Wheel::Emote, cx))
-                .child(Switch::new("quick-ping").label("单击发送普通标记（侧键绑定时单击侧键）").checked(self.triggers.click_ping)
-                    .disabled(!self.gestures || !self.triggers.ping_enabled)
-                    .on_change(cx.listener(|this, value, _, cx| { this.triggers.click_ping = *value; cx.notify(); })))
-                .when(!active, |group| group
-                    .child(div().text_sm().text_color(theme.muted_foreground).child(permission_hint))
+        let mode_selector = RadioGroup::horizontal("wheel-trigger-mode")
+            .child("鼠标触发")
+            .child("按键触发")
+            .selected_index(Some(usize::from(
+                self.triggers.mode == TriggerMode::HoldShortcut,
+            )))
+            .disabled(!self.gestures)
+            .on_change(cx.listener(|this, index, _, cx| {
+                this.triggers.mode = if *index == 0 {
+                    TriggerMode::MouseDrag
+                } else {
+                    TriggerMode::HoldShortcut
+                };
+                cx.notify();
+            }));
+        let mode_hint = match self.triggers.mode {
+            TriggerMode::MouseDrag => {
+                "按住快捷键并用左键拖动，松开左键确认。绑定鼠标侧键时，按住侧键即可拖动。"
+            }
+            TriggerMode::HoldShortcut => {
+                "按下快捷键立即展开轮盘，移动光标选择方向，松开任一绑定键发送。在中心松开可取消。"
+            }
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .border_t_1()
+            .border_color(theme.border)
+            .pt_4()
+            .child(div().font_weight(FontWeight::SEMIBOLD).child("轮盘快捷键"))
+            .child(
+                Switch::new("gestures")
+                    .label("启用全局轮盘")
+                    .checked(self.gestures)
+                    .on_change(cx.listener(|this, value, _, cx| {
+                        this.gestures = *value;
+                        cx.notify();
+                    })),
+            )
+            .child(mode_selector)
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(mode_hint),
+            )
+            .child(self.trigger_row(Wheel::Ping, cx))
+            .child(self.trigger_row(Wheel::Emote, cx))
+            .when(self.triggers.mode == TriggerMode::MouseDrag, |group| {
+                group.child(
+                    Switch::new("quick-ping")
+                        .label("单击发送普通标记（侧键绑定时单击侧键）")
+                        .checked(self.triggers.click_ping)
+                        .disabled(!self.gestures || !self.triggers.ping_enabled)
+                        .on_change(cx.listener(|this, value, _, cx| {
+                            this.triggers.click_ping = *value;
+                            cx.notify();
+                        })),
+                )
+            })
+            .when(!active, |group| {
+                group
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child(permission_hint),
+                    )
                     .child({
                         let row = div().flex().flex_wrap().gap_2();
                         #[cfg(target_os = "macos")]
-                        let row = row.child(Button::new("permission").label(if capture_access { "请求辅助功能权限…" } else { "请求输入监控权限…" }).on_click(move |_, _, _| platform::request_input_access(capture_access)));
-                        row.child(Button::new("retry").ghost().label("重新检测").on_click(cx.listener(|this, _, _, cx| this.retry_input(cx))))
-                    }))
+                        let row = row.child(
+                            Button::new("permission")
+                                .label(if capture_access {
+                                    "请求辅助功能权限…"
+                                } else {
+                                    "请求输入监控权限…"
+                                })
+                                .on_click(move |_, _, _| {
+                                    platform::request_input_access(capture_access)
+                                }),
+                        );
+                        row.child(
+                            Button::new("retry")
+                                .ghost()
+                                .label("重新检测")
+                                .on_click(cx.listener(|this, _, _, cx| this.retry_input(cx))),
+                        )
+                    })
+            })
     }
 
     fn animation_settings(&self, cx: &Context<Self>) -> Div {
@@ -3063,10 +3157,13 @@ impl Render for Settings {
                         this.end_capture(cx);
                     } else if let Some(code) = platform::capture_key_code() {
                         this.record_key(
-                            TriggerKey::Keyboard {
-                                code,
-                                label: stroke.key.to_uppercase(),
-                            },
+                            Shortcut::new(
+                                shortcut_modifiers(window.modifiers() | stroke.modifiers),
+                                Some(TriggerKey::Keyboard {
+                                    code,
+                                    label: stroke.key.to_uppercase(),
+                                }),
+                            ),
                             cx,
                         );
                     } else {
@@ -3076,14 +3173,15 @@ impl Render for Settings {
                     }
                 }))
                 .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _, cx| {
-                    let key = match (event.alt, event.control, event.shift, event.platform) {
-                        (true, false, false, false) => TriggerKey::Alt,
-                        (false, true, false, false) => TriggerKey::Ctrl,
-                        (false, false, true, false) => TriggerKey::Shift,
-                        (false, false, false, true) => TriggerKey::Super,
-                        _ => return,
-                    };
-                    this.record_key(key, cx);
+                    let current = shortcut_modifiers(event.modifiers);
+                    let previous = std::mem::replace(&mut this.recording_modifiers, current);
+                    // Wait for release so the first modifier can become part of a longer chord.
+                    // 等到松键再录入纯修饰键组合，允许在首个修饰键之后继续按键。
+                    if previous & !current != 0 {
+                        this.record_key(Shortcut::new(previous, None), cx);
+                    } else {
+                        cx.notify();
+                    }
                 }))
                 .capture_any_mouse_down(cx.listener(
                     |this, event: &MouseDownEvent, window, cx| {
@@ -3099,7 +3197,10 @@ impl Render for Settings {
                         };
                         window.prevent_default();
                         cx.stop_propagation();
-                        this.record_key(key, cx);
+                        this.record_key(
+                            Shortcut::new(shortcut_modifiers(event.modifiers), Some(key)),
+                            cx,
+                        );
                     },
                 ))
             })
@@ -3310,6 +3411,35 @@ mod tests {
         assert_eq!(cx.update(|cx| cx.active_window()), Some(chat));
         assert!(VisualTestContext::from_window(settings, cx).simulate_close());
         assert_eq!(cx.update(|cx| cx.active_window()), Some(chat));
+    }
+
+    #[gpui_kit::test]
+    fn wheel_settings_record_modifier_chords_and_switch_trigger_mode(cx: &mut TestAppContext) {
+        use crate::gesture::TriggerMode;
+        use gpui_kit::Modifiers;
+
+        let (_, settings, _) = settings_desktop(cx);
+        let paused = start_shortcut_recording(settings, cx);
+        let mut view = VisualTestContext::from_window(settings, cx);
+        view.simulate_modifiers_change(Modifiers::control());
+        view.simulate_modifiers_change(Modifiers::control() | Modifiers::shift());
+        assert!(paused.load(Ordering::Relaxed));
+        view.simulate_modifiers_change(Modifiers::shift());
+        assert!(!paused.load(Ordering::Relaxed));
+        view.simulate_modifiers_change(Modifiers::default());
+        cx.update_window(settings, |_, window, cx| {
+            window.within("wheel-trigger-mode").click(1usize, cx);
+            let entity = Root::read(window, cx)
+                .view()
+                .clone()
+                .downcast::<Settings>()
+                .unwrap();
+            assert_eq!(entity.read(cx).triggers.ping_key.label(), "Ctrl + Shift");
+            assert_eq!(entity.read(cx).triggers.mode, TriggerMode::HoldShortcut);
+            window.within("wheel-trigger-mode").click(0usize, cx);
+            assert_eq!(entity.read(cx).triggers.mode, TriggerMode::MouseDrag);
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

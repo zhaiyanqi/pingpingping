@@ -139,13 +139,18 @@ Right-click the Windows system tray or macOS menu bar icon and select **Mute**. 
 | Chat / History / Settings | Ctrl+1 / Ctrl+2 / Ctrl+, | ⌘1 / ⌘2 / ⌘, |
 | Close the active window | Ctrl+W | ⌘W |
 
-In **Settings → Desktop wheel**, turn each wheel on or off independently. Click the current binding, press a keyboard key or mouse button 4 (Back) or 5 (Forward), then save. Esc cancels recording. Enabled wheels must use different bindings.
+In **Settings → Desktop wheel**, enable each wheel independently. Click its binding to record a single key, or hold one or more modifiers and press a key or mouse button 4 (Back) or 5 (Forward). For example, press Ctrl + Shift + K. For a modifier-only shortcut, hold the modifiers together and release. Esc cancels recording. Choose **Save settings** to apply. Enabled wheels must use different shortcuts.
+
+Both wheels share one trigger mode.
+
+- **Mouse trigger (default).** Hold the shortcut and left-drag. Release the left button to confirm, or release the shortcut first to cancel. For a binding that includes a side button, hold any required modifiers and drag with that button, then release it to confirm. A plain click goes to the foreground app on release. Enabling quick ping also sends a marker when clicking with the ping shortcut.
+- **Key trigger.** The wheel opens at the pointer as soon as the full shortcut is held. Move the pointer to a sector and release any key in the shortcut to close the wheel and send. Release in the center to cancel. No left click is required.
+
+Both modes use the pointer position at release. Return to the center to cancel. While open, the wheel handles mouse movement, clicks, and scrolling.
 
 Under **Emote wheel layout** in the same category, add or remove pages. Each page has eight directional slots. Drag an assigned emote to another slot to swap positions. To browse more emotes, scroll over the library or drag its scrollbar. Click or drag an emote from the library to fill or replace a slot. You can also drag a single GIF, PNG, JPEG, or WebP file from your file manager to import it directly into a slot. Select a slot and click **Clear slot** to remove its emote. You can also press Delete or Backspace when a slot has keyboard focus. Use **Swap positions** to move an emote across pages. Click **Save settings** to apply the layout. With the emote wheel open, scroll down for the next page or up for the previous page. Scrolling wraps between the first and last pages. Reopening the emote wheel returns to the last page you viewed while the app is running. Release over an emote on the current page to send it. Releasing over an empty slot cancels the send.
 
 In **Settings → Emote library**, search built-in and custom emotes by name, import images, and rename or delete custom emotes. You can also open this page with **Manage** beside the wheel. Library changes apply immediately. Deleting an emote removes its library entry. Use **Clear slot** to manage its wheel assignments.
-
-For a keyboard binding, hold the key and left-drag. Releasing the key first cancels. For a side-button binding, hold that button, drag, then release it to confirm. Returning to the center cancels either gesture. A plain click goes to the current app on release. The system pointer moves normally, and its position on release determines the selection. While the wheel is open, it consumes mouse movement, button presses, scrolling, and the release that confirms or cancels the gesture. If quick ping is enabled, a click of the ping wheel’s bound side button sends a marker.
 
 The latest 600 text messages, pings, and emotes are stored locally as JSON. Custom emotes are stored in the `emotes` subdirectory. The app data directory is `%LOCALAPPDATA%\PingPingPing` on Windows or `~/Library/Application Support/PingPingPing` on macOS.
 

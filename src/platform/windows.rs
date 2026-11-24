@@ -37,8 +37,8 @@ use super::{
     AnimationOverlay, AnimationPosition, AudioCue, WheelContents, start_audio, wheel::WheelView,
 };
 use crate::gesture::{
-    ALT, CTRL, GestureEvent, InputEvent, MouseDelivery, Position, SHIFT, SUPER, Triggers,
-    WHEEL_SIZE, WheelInput,
+    ALT, CTRL, GestureEvent, InputEvent, MouseDelivery, Position, SHIFT, SUPER, TriggerMode,
+    Triggers, WHEEL_SIZE, WheelInput,
 };
 use crate::model::{Location, TextPosition};
 
@@ -197,7 +197,7 @@ impl Input {
             .release_missing_keys(|key| unsafe { GetAsyncKeyState(i32::from(key)) } < 0);
         if released || self.keys != modifiers {
             self.keys = modifiers;
-            self.dispatch(POINT::default(), InputEvent::Modifier);
+            self.dispatch(Some(POINT::default()), InputEvent::SyncKeyboard);
         }
     }
 
@@ -229,7 +229,7 @@ impl Input {
         }
     }
 
-    fn dispatch(&mut self, point: POINT, event: InputEvent) -> MouseDelivery {
+    fn dispatch(&mut self, cursor: Option<POINT>, event: InputEvent) -> MouseDelivery {
         let Some(config) = &self.triggers else {
             return MouseDelivery::Pass;
         };
@@ -239,13 +239,14 @@ impl Input {
                 modifiers |= modifier;
             }
         }
+        let point = cursor.unwrap_or_default();
         let at = position(point);
         let (updates, delivery) = self.gesture.event(
             config,
             modifiers,
             event,
             at,
-            self.paused.load(Ordering::Relaxed),
+            self.paused.load(Ordering::Relaxed) || cursor.is_none(),
             || f64::from(screen(point, false).1) / 96.0,
         );
         for update in updates {
@@ -253,7 +254,13 @@ impl Input {
                 GestureEvent::Open(..) if !self.move_window.show() => {
                     self.gesture
                         .event(config, modifiers, InputEvent::Interrupt, at, false, || 1.0);
-                    return MouseDelivery::Pass;
+                    // Keep a claimed side-button down paired with its swallowed release.
+                    // 保持已暂扣的侧键按下与其松开成对拦截。
+                    return if delivery == MouseDelivery::WheelMove {
+                        MouseDelivery::Pass
+                    } else {
+                        delivery
+                    };
                 }
                 GestureEvent::Finish(_) => self.move_window.hide(),
                 _ => {}
@@ -271,7 +278,11 @@ pub(crate) fn capture_key_code() -> Option<u16> {
     if unsafe { GetKeyboardState(state.as_mut_ptr()) } == 0 {
         return None;
     }
-    let mut pressed = (VK_BACK..=0xfe).filter(|code| state[*code as usize] & 0x80 != 0);
+    let mut pressed = (VK_BACK..=0xfe).filter(|code| {
+        state[*code as usize] & 0x80 != 0
+            && !matches!(*code, VK_SHIFT | VK_CONTROL | VK_MENU)
+            && !MODIFIERS.contains(&u32::from(*code))
+    });
     let code = pressed.next()?;
     pressed.next().is_none().then_some(code)
 }
@@ -305,9 +316,16 @@ unsafe extern "system" fn keyboard_hook(code: i32, message: WPARAM, data: LPARAM
             } else {
                 InputEvent::Key(event.vkCode as u16, down)
             };
-            // Only mouse events use coordinates. Always process key releases across desktop changes.
-            // 只有鼠标事件需要坐标。切换桌面时也应处理收到的松键。
-            input.dispatch(POINT::default(), kind);
+            // A key-owned wheel opens and confirms at the cursor. If the desktop is
+            // unavailable, still consume the state transition and cancel the gesture.
+            // 按键轮盘按光标位置开启和确认。桌面不可访问时仍更新按键状态并取消手势。
+            let mut cursor = POINT::default();
+            let needs_cursor = input
+                .triggers
+                .as_ref()
+                .is_some_and(|t| t.mode == TriggerMode::HoldShortcut);
+            let located = !needs_cursor || unsafe { GetCursorPos(&mut cursor) } != 0;
+            input.dispatch(located.then_some(cursor), kind);
         });
     }
     unsafe { CallNextHookEx(null_mut(), code, message, data) }
@@ -379,7 +397,7 @@ unsafe extern "system" fn mouse_hook(code: i32, message: WPARAM, data: LPARAM) -
             if matches!(kind, InputEvent::Left(_) | InputEvent::Side(..)) {
                 input.reconcile_keyboard();
             }
-            input.dispatch(event.pt, kind)
+            input.dispatch(Some(event.pt), kind)
         });
         match delivery {
             // Let Windows advance the real cursor and route WM_MOUSEMOVE to the wheel's input window.
@@ -1067,6 +1085,7 @@ impl Overlay {
         contents: WheelContents,
         position: Position,
         selected: Option<usize>,
+        mode: TriggerMode,
         tick_volume: Option<f32>,
         cx: &App,
     ) {
@@ -1086,7 +1105,9 @@ impl Overlay {
             }
         });
         let tick = self.wheel_view.open(contents, size, selected, present, cx);
-        self.wheel.borrow_mut().focus_wheel();
+        if mode == TriggerMode::MouseDrag {
+            self.wheel.borrow_mut().focus_wheel();
+        }
         if tick && let Some(volume) = tick_volume {
             let _ = self.audio.try_send(AudioCue::Tick(volume));
         }

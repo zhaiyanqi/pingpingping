@@ -1188,17 +1188,26 @@ mod tests {
 
     #[test]
     fn side_binding_survives_save_and_conflicts_leave_the_saved_profile_intact() {
-        use crate::gesture::TriggerKey;
+        use crate::gesture::{CTRL, Shortcut, TriggerKey, TriggerMode};
         let folder = std::env::temp_dir().join(format!("pingpingping-bindings-{}", Uuid::new_v4()));
         let mut model = Model::load(folder.clone()).unwrap();
         let mut profile = model.profile.clone();
-        profile.triggers.emote_key = TriggerKey::Mouse5;
+        profile.triggers.mode = TriggerMode::HoldShortcut;
+        profile.triggers.emote_key = Shortcut::new(CTRL, Some(TriggerKey::Mouse5));
+        profile.triggers.ping_key = Shortcut::Single(TriggerKey::Mouse5);
         model.apply(profile.clone()).unwrap();
-        profile.triggers.ping_key = TriggerKey::Mouse5;
+        profile.triggers.ping_key = profile.triggers.emote_key.clone();
         assert!(model.apply(profile).is_err());
         let saved: Profile = load_json(&folder.join("settings.json")).unwrap().unwrap();
-        assert_eq!(saved.triggers.emote_key, TriggerKey::Mouse5);
-        assert_eq!(saved.triggers.ping_key, TriggerKey::Alt);
+        assert_eq!(saved.triggers.mode, TriggerMode::HoldShortcut);
+        assert_eq!(
+            saved.triggers.emote_key,
+            Shortcut::new(CTRL, Some(TriggerKey::Mouse5))
+        );
+        assert_eq!(
+            saved.triggers.ping_key,
+            Shortcut::Single(TriggerKey::Mouse5)
+        );
         model.finish_writes().unwrap().join().unwrap();
         fs::remove_dir_all(folder).unwrap();
     }

@@ -33,7 +33,17 @@ pub(crate) enum TriggerKey {
 }
 
 impl TriggerKey {
-    pub(crate) fn label(&self) -> &str {
+    fn modifier(&self) -> u8 {
+        match self {
+            Self::Alt => ALT,
+            Self::Ctrl => CTRL,
+            Self::Shift => SHIFT,
+            Self::Super => SUPER,
+            _ => 0,
+        }
+    }
+
+    fn label(&self) -> &str {
         match self {
             Self::Alt if cfg!(target_os = "macos") => "Option",
             Self::Alt => "Alt",
@@ -47,7 +57,7 @@ impl TriggerKey {
         }
     }
 
-    pub(crate) fn same_key(&self, other: &Self) -> bool {
+    fn same_key(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Keyboard { code, .. }, Self::Keyboard { code: other, .. }) => code == other,
             _ => self == other,
@@ -55,11 +65,103 @@ impl TriggerKey {
     }
 }
 
+// The single-key form also reads bindings saved before chord support.
+// 单键形式也用于读取支持组合键之前保存的绑定。
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub(crate) enum Shortcut {
+    Single(TriggerKey),
+    Chord {
+        modifiers: u8,
+        key: Option<TriggerKey>,
+    },
+}
+
+const MODIFIER_KEYS: [TriggerKey; 4] = [
+    TriggerKey::Ctrl,
+    TriggerKey::Alt,
+    TriggerKey::Shift,
+    TriggerKey::Super,
+];
+
+impl Shortcut {
+    pub(crate) fn new(modifiers: u8, key: Option<TriggerKey>) -> Self {
+        match key {
+            Some(key) if modifiers == 0 => Self::Single(key),
+            None if let Some(key) = MODIFIER_KEYS
+                .into_iter()
+                .find(|key| key.modifier() == modifiers) =>
+            {
+                Self::Single(key)
+            }
+            key => Self::Chord { modifiers, key },
+        }
+    }
+
+    fn parts(&self) -> (u8, Option<&TriggerKey>) {
+        let (modifiers, key) = match self {
+            Self::Single(key) => (0, Some(key)),
+            Self::Chord { modifiers, key } => (*modifiers, key.as_ref()),
+        };
+        (
+            modifiers | key.map_or(0, TriggerKey::modifier),
+            key.filter(|key| key.modifier() == 0),
+        )
+    }
+
+    pub(crate) fn label(&self) -> String {
+        let (modifiers, key) = self.parts();
+        MODIFIER_KEYS
+            .iter()
+            .filter(|key| modifiers & key.modifier() != 0)
+            .chain(key)
+            .map(TriggerKey::label)
+            .collect::<Vec<_>>()
+            .join(" + ")
+    }
+
+    pub(crate) fn same_key(&self, other: &Self) -> bool {
+        let (mods, key) = self.parts();
+        let (other_mods, other_key) = other.parts();
+        mods == other_mods
+            && match (key, other_key) {
+                (Some(a), Some(b)) => a.same_key(b),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
+    fn matches(&self, modifiers: u8, keys: &[u16], sides: u8, partial: bool) -> bool {
+        let (required, key) = self.parts();
+        if modifiers & !required != 0 || (!partial && modifiers != required) {
+            return false;
+        }
+        if partial && keys.is_empty() && sides == 0 {
+            return true;
+        }
+        match key {
+            Some(TriggerKey::Keyboard { code, .. }) => keys == [*code] && sides == 0,
+            Some(TriggerKey::Mouse4) => keys.is_empty() && sides == 1,
+            Some(TriggerKey::Mouse5) => keys.is_empty() && sides == 2,
+            None => keys.is_empty() && sides == 0 && required != 0,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum TriggerMode {
+    #[default]
+    MouseDrag,
+    HoldShortcut,
+}
+
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct Triggers {
-    pub(crate) ping_key: TriggerKey,
-    pub(crate) emote_key: TriggerKey,
+    pub(crate) ping_key: Shortcut,
+    pub(crate) emote_key: Shortcut,
+    pub(crate) mode: TriggerMode,
     pub(crate) ping_enabled: bool,
     pub(crate) emote_enabled: bool,
     pub(crate) click_ping: bool,
@@ -68,8 +170,9 @@ pub(crate) struct Triggers {
 impl Default for Triggers {
     fn default() -> Self {
         Self {
-            ping_key: TriggerKey::Alt,
-            emote_key: TriggerKey::Ctrl,
+            ping_key: Shortcut::Single(TriggerKey::Alt),
+            emote_key: Shortcut::Single(TriggerKey::Ctrl),
+            mode: TriggerMode::MouseDrag,
             ping_enabled: true,
             emote_enabled: true,
             click_ping: false,
@@ -83,7 +186,7 @@ impl Triggers {
         self.ping_enabled || self.emote_enabled
     }
 
-    fn match_wheel(&self, matches: impl Fn(&TriggerKey) -> bool) -> Option<Wheel> {
+    fn match_wheel(&self, matches: impl Fn(&Shortcut) -> bool) -> Option<Wheel> {
         match (
             self.ping_enabled && matches(&self.ping_key),
             self.emote_enabled && matches(&self.emote_key),
@@ -104,6 +207,8 @@ pub(crate) const SUPER: u8 = 8;
 pub(crate) enum InputEvent {
     Key(u16, bool),
     Modifier,
+    #[cfg(any(target_os = "windows", test))]
+    SyncKeyboard,
     Side(u8, bool),
     Left(bool),
     OtherButton(u8, bool),
@@ -136,6 +241,7 @@ pub(crate) enum MouseDelivery {
 pub(crate) struct WheelInput {
     gesture: Gesture,
     keys: Vec<u16>,
+    modifiers: u8,
     sides: u8,
     other_buttons: u64,
     held_button: Option<u8>,
@@ -177,6 +283,23 @@ impl WheelInput {
     ) -> (Vec<GestureEvent>, MouseDelivery) {
         let button = event.button();
         let was_open = self.gesture.visible;
+        // Only a new physical edge can open or confirm a held shortcut. Repeats and
+        // keyboard-state reconciliation may cancel a gesture but must never send one.
+        // 只有真实按下或松开才能开启或确认按键轮盘。按键重复和状态校正只能取消手势。
+        let shortcut_edge = match event {
+            InputEvent::Key(code, down) if self.keys.contains(&code) != down => Some(down),
+            InputEvent::Side(bit, down) if (self.sides & bit != 0) != down => Some(down),
+            InputEvent::Modifier if modifiers != self.modifiers => match (
+                modifiers & !self.modifiers != 0,
+                self.modifiers & !modifiers != 0,
+            ) {
+                (true, false) => Some(true),
+                (false, true) => Some(false),
+                _ => None,
+            },
+            _ => None,
+        };
+        self.modifiers = modifiers;
         if let Some((id, true)) = button {
             // A new down also recovers from a release lost while the hook was suspended.
             // 如果监听暂停时丢失了松开事件，新按下事件会重新开始这一对按键。
@@ -195,20 +318,23 @@ impl WheelInput {
         // Resolve ownership before clearing the released button. A side button owns its whole drag.
         // 先判定手势归属，再清除松开的鼠标键。侧键独立完成整个拖动。
         let count = self.keys.len() + (self.sides.count_ones() + modifiers.count_ones()) as usize;
-        let wheel = if count == 1 {
-            config.match_wheel(|key| match key {
-                TriggerKey::Alt => modifiers == ALT,
-                TriggerKey::Ctrl => modifiers == CTRL,
-                TriggerKey::Shift => modifiers == SHIFT,
-                TriggerKey::Super => modifiers == SUPER,
-                TriggerKey::Mouse4 => self.sides == 1,
-                TriggerKey::Mouse5 => self.sides == 2,
-                TriggerKey::Keyboard { code, .. } => self.keys.first() == Some(code),
-            })
-        } else {
-            None
-        };
+        let matches =
+            |key: &Shortcut, partial| key.matches(modifiers, &self.keys, self.sides, partial);
+        let mut wheel = config.match_wheel(|key| matches(key, false));
+        let invalid_chord = count > 1
+            && wheel.is_none()
+            && !(config.ping_enabled && matches(&config.ping_key, true))
+            && !(config.emote_enabled && matches(&config.emote_key, true));
+        let hold = config.mode == TriggerMode::HoldShortcut;
         let action = match event {
+            _ if hold && shortcut_edge == Some(false) && self.gesture.held.is_some() => {
+                wheel = self.gesture.held.map(|(owner, _)| owner);
+                Pointer::Up
+            }
+            _ if hold && shortcut_edge == Some(true) && wheel.is_some() => Pointer::Open,
+            InputEvent::Move => Pointer::Move,
+            InputEvent::Scroll(delta) => Pointer::Scroll(delta),
+            _ if hold => Pointer::Key,
             InputEvent::Side(bit, down) if self.sides == bit => {
                 if down {
                     Pointer::Down
@@ -223,22 +349,19 @@ impl WheelInput {
                     Pointer::Up
                 }
             }
-            InputEvent::Move => Pointer::Move,
-            InputEvent::Scroll(delta) => Pointer::Scroll(delta),
             _ => Pointer::Key,
         };
         self.suppressed |= paused
-            || count > 1
+            || invalid_chord
+            || (hold && self.left)
             || (self.sides != 0 && self.left)
             || matches!(
                 event,
                 InputEvent::Interrupt | InputEvent::OtherButton(_, true)
             );
-        let scale = if action == Pointer::Down && wheel.is_some() && !self.suppressed {
-            scale()
-        } else {
-            1.0
-        };
+        let starts =
+            matches!(action, Pointer::Down | Pointer::Open) && wheel.is_some() && !self.suppressed;
+        let scale = if starts { scale() } else { 1.0 };
         // Hold the initiating press so a drag never leaves the foreground app with a stuck button.
         // 暂扣起始按下事件，避免拖动时前台应用只收到按下、收不到松开。
         let mut delivery = match button {
@@ -247,7 +370,7 @@ impl WheelInput {
                 self.swallowed_buttons |= 1u64 << id;
                 MouseDelivery::Swallow
             }
-            Some((id, true)) if action == Pointer::Down && wheel.is_some() && !self.suppressed => {
+            Some((id, true)) if starts => {
                 self.held_button = Some(id);
                 MouseDelivery::HoldDown
             }
@@ -296,6 +419,7 @@ impl WheelInput {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Pointer {
+    Open,
     Down,
     Up,
     Move,
@@ -339,6 +463,23 @@ impl Gesture {
         scale: f64,
         click_ping: bool,
     ) -> Vec<GestureEvent> {
+        if action == Pointer::Open
+            && !cancel
+            && let Some(wheel) = wheel
+        {
+            let mut updates = Vec::new();
+            if self.visible {
+                updates.push(GestureEvent::Finish(None));
+            }
+            *self = Self {
+                held: Some((wheel, cursor)),
+                visible: true,
+                scale,
+                ..Self::default()
+            };
+            updates.push(GestureEvent::Open(wheel, cursor, None));
+            return updates;
+        }
         let Some((owner, origin)) = self.held else {
             if !cancel && action == Pointer::Down {
                 self.held = wheel.map(|wheel| (wheel, cursor));
@@ -348,8 +489,8 @@ impl Gesture {
         };
         let distance = (cursor.x - origin.x).hypot(cursor.y - origin.y);
         if cancel || wheel != Some(owner) || action == Pointer::Up {
-            // Only button-up confirms. Releasing the shortcut first cancels the pending drag.
-            // 仅松开鼠标时确认；先松开快捷键会取消当前拖动。
+            // The owning release confirms at its own coordinates, even without a last move event.
+            // 按结束手势的松键坐标确认，即使最后一次移动事件尚未送达。
             let finish = !cancel && wheel == Some(owner) && action == Pointer::Up;
             let choice = if finish && self.visible {
                 sector(origin, cursor, self.scale).map(|index| (owner, index, origin))
@@ -406,6 +547,154 @@ impl Gesture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorded_chords_and_legacy_bindings_round_trip() {
+        let mut config: Triggers = serde_json::from_str(
+            r#"{"ping_key":{"Keyboard":{"code":75,"label":"K"}},"emote_key":"Mouse4"}"#,
+        )
+        .unwrap();
+        assert_eq!(config.mode, TriggerMode::MouseDrag);
+        assert_eq!(config.ping_key.label(), "K");
+        assert!(config.emote_key.matches(0, &[], 1, false));
+        config.mode = TriggerMode::HoldShortcut;
+        config.ping_key = Shortcut::new(
+            CTRL | SHIFT,
+            Some(TriggerKey::Keyboard {
+                code: 75,
+                label: "K".into(),
+            }),
+        );
+        config.emote_key = Shortcut::new(CTRL | SHIFT, None);
+        assert_eq!(config.ping_key.label(), "Ctrl + Shift + K");
+        assert!(!config.ping_key.same_key(&config.emote_key));
+        assert!(config.ping_key.same_key(&Shortcut::new(
+            CTRL | SHIFT,
+            Some(TriggerKey::Keyboard {
+                code: 75,
+                label: "Other label".into()
+            })
+        )));
+        let restored: Triggers =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert!(restored == config);
+    }
+
+    #[test]
+    fn hold_mode_uses_real_shortcut_edges_and_final_release_coordinates() {
+        let config = Triggers {
+            mode: TriggerMode::HoldShortcut,
+            ping_key: Shortcut::new(
+                CTRL | SHIFT,
+                Some(TriggerKey::Keyboard {
+                    code: 75,
+                    label: "K".into(),
+                }),
+            ),
+            emote_enabled: false,
+            ..Triggers::default()
+        };
+        let origin = Position { x: 250., y: 300. };
+        let right = Position { x: 450., ..origin };
+        let up = Position { y: 100., ..origin };
+        for release_modifier_first in [false, true] {
+            let mut input = WheelInput::default();
+            let mut event = |mods, kind, at| input.event(&config, mods, kind, at, false, || 2.).0;
+            assert!(event(CTRL, InputEvent::Modifier, origin).is_empty());
+            assert!(event(CTRL | SHIFT, InputEvent::Modifier, origin).is_empty());
+            assert_eq!(
+                event(CTRL | SHIFT, InputEvent::Key(75, true), origin),
+                [GestureEvent::Open(Wheel::Ping, origin, None)]
+            );
+            assert!(event(CTRL | SHIFT, InputEvent::Key(75, true), right).is_empty());
+            assert!(
+                event(
+                    CTRL | SHIFT,
+                    InputEvent::Move,
+                    Position {
+                        x: origin.x + 100.,
+                        ..origin
+                    }
+                )
+                .is_empty()
+            );
+            assert_eq!(
+                event(CTRL | SHIFT, InputEvent::Move, right),
+                [GestureEvent::Select(Some(2))]
+            );
+            let (mods, release) = if release_modifier_first {
+                (CTRL, InputEvent::Modifier)
+            } else {
+                (CTRL | SHIFT, InputEvent::Key(75, false))
+            };
+            assert_eq!(
+                event(mods, release, up),
+                [GestureEvent::Finish(Some((Wheel::Ping, 0, origin)))]
+            );
+            assert!(event(0, InputEvent::Modifier, up).is_empty());
+            assert!(event(0, InputEvent::Key(75, false), up).is_empty());
+        }
+    }
+
+    #[test]
+    fn modifier_and_side_button_chord_obeys_the_shared_mode() {
+        for mode in [TriggerMode::MouseDrag, TriggerMode::HoldShortcut] {
+            let config = Triggers {
+                mode,
+                emote_key: Shortcut::new(CTRL | SHIFT, Some(TriggerKey::Mouse5)),
+                ..Triggers::default()
+            };
+            let at = Position { x: 50., y: 10. };
+            let mut input = WheelInput::default();
+            let mut event = |mods, kind| input.event(&config, mods, kind, at, false, || 1.);
+            event(SHIFT, InputEvent::Modifier);
+            event(CTRL | SHIFT, InputEvent::Modifier);
+            let (updates, delivery) = event(CTRL | SHIFT, InputEvent::Side(2, true));
+            assert_eq!(delivery, MouseDelivery::HoldDown);
+            if mode == TriggerMode::HoldShortcut {
+                assert_eq!(updates, [GestureEvent::Open(Wheel::Emote, at, None)]);
+                assert_eq!(
+                    event(CTRL | SHIFT, InputEvent::Side(2, false)),
+                    (vec![GestureEvent::Finish(None)], MouseDelivery::Swallow)
+                );
+            } else {
+                assert!(updates.is_empty());
+                assert_eq!(
+                    event(CTRL | SHIFT, InputEvent::Side(2, false)),
+                    (vec![], MouseDelivery::ReplayClick)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hold_mode_switches_to_a_longer_binding_and_never_sends_on_resync() {
+        let config = Triggers {
+            mode: TriggerMode::HoldShortcut,
+            emote_key: Shortcut::new(ALT | SHIFT, None),
+            ..Triggers::default()
+        };
+        let at = Position { x: 120., y: 240. };
+        let mut input = WheelInput::default();
+        let mut event = |mods, kind| input.event(&config, mods, kind, at, false, || 1.).0;
+        assert_eq!(
+            event(ALT, InputEvent::Modifier),
+            [GestureEvent::Open(Wheel::Ping, at, None)]
+        );
+        assert_eq!(
+            event(ALT | SHIFT, InputEvent::Modifier),
+            [
+                GestureEvent::Finish(None),
+                GestureEvent::Open(Wheel::Emote, at, None)
+            ]
+        );
+        assert_eq!(
+            event(ALT, InputEvent::SyncKeyboard),
+            [GestureEvent::Finish(None)]
+        );
+        assert!(event(0, InputEvent::Modifier).is_empty());
+        assert!(event(ALT, InputEvent::SyncKeyboard).is_empty());
+    }
 
     #[test]
     fn scrolling_only_turns_open_emote_wheels_and_release_uses_final_coordinates() {
@@ -486,7 +775,7 @@ mod tests {
     #[test]
     fn cancelling_mouse_events_and_their_releases_do_not_leak() {
         let config = Triggers {
-            emote_key: TriggerKey::Mouse5,
+            emote_key: Shortcut::Single(TriggerKey::Mouse5),
             ..Triggers::default()
         };
         for interrupt in [
@@ -526,7 +815,7 @@ mod tests {
     #[test]
     fn a_gap_in_input_cancels_the_held_click_and_accepts_the_next_press() {
         let config = Triggers {
-            emote_key: TriggerKey::Mouse4,
+            emote_key: Shortcut::Single(TriggerKey::Mouse4),
             ..Triggers::default()
         };
         let at = Position { x: 0., y: 0. };
@@ -570,10 +859,10 @@ mod tests {
         const K: u16 = 0x4b;
         const L: u16 = 0x4c;
         let config = Triggers {
-            ping_key: TriggerKey::Keyboard {
+            ping_key: Shortcut::Single(TriggerKey::Keyboard {
                 code: K,
                 label: "K".into(),
-            },
+            }),
             ..Triggers::default()
         };
         let mut input = WheelInput::default();
@@ -617,7 +906,7 @@ mod tests {
     #[test]
     fn side_click_replays_once_but_opening_the_wheel_consumes_the_click_even_after_cancel() {
         let config = Triggers {
-            emote_key: TriggerKey::Mouse5,
+            emote_key: Shortcut::Single(TriggerKey::Mouse5),
             ..Triggers::default()
         };
         let mut input = WheelInput::default();
@@ -661,7 +950,7 @@ mod tests {
             (true, 2, 0, true),
         ] {
             let config = Triggers {
-                emote_key: TriggerKey::Mouse5,
+                emote_key: Shortcut::Single(TriggerKey::Mouse5),
                 emote_enabled: enabled,
                 ..Triggers::default()
             };
@@ -687,8 +976,8 @@ mod tests {
     #[test]
     fn both_side_buttons_use_their_own_press_and_release() {
         let config = Triggers {
-            ping_key: TriggerKey::Mouse4,
-            emote_key: TriggerKey::Mouse5,
+            ping_key: Shortcut::Single(TriggerKey::Mouse4),
+            emote_key: Shortcut::Single(TriggerKey::Mouse5),
             ..Triggers::default()
         };
         let config: Triggers =
@@ -714,7 +1003,7 @@ mod tests {
     #[test]
     fn capture_press_stays_suppressed_through_release() {
         let config = Triggers {
-            ping_key: TriggerKey::Mouse5,
+            ping_key: Shortcut::Single(TriggerKey::Mouse5),
             click_ping: true,
             ..Triggers::default()
         };
@@ -737,18 +1026,26 @@ mod tests {
     }
 
     #[test]
-    fn custom_keyboard_binding_requires_left_drag_and_cancels_on_chords() {
+    fn key_chord_in_mouse_mode_requires_left_drag_and_cancels_on_an_extra_key() {
         let config = Triggers {
-            emote_key: TriggerKey::Keyboard {
-                code: 42,
-                label: "K".into(),
-            },
+            emote_key: Shortcut::new(
+                CTRL | SHIFT,
+                Some(TriggerKey::Keyboard {
+                    code: 42,
+                    label: "K".into(),
+                }),
+            ),
             ..Triggers::default()
         };
         let origin = Position { x: 0., y: 0. };
         let end = Position { x: 100., y: 0. };
         let mut input = WheelInput::default();
-        let mut event = |event, at| input.event(&config, 0, event, at, false, || 1.).0;
+        let mut event = |event, at| {
+            input
+                .event(&config, CTRL | SHIFT, event, at, false, || 1.)
+                .0
+        };
+        assert!(event(InputEvent::Modifier, origin).is_empty());
         for _ in 0..2 {
             assert!(event(InputEvent::Key(42, true), origin).is_empty());
         }
@@ -819,13 +1116,19 @@ mod tests {
     fn disabled_wheel_does_not_claim_its_shortcut() {
         let config = Triggers {
             ping_enabled: false,
-            emote_key: TriggerKey::Shift,
+            emote_key: Shortcut::Single(TriggerKey::Shift),
             ..Triggers::default()
         };
-        assert_eq!(config.match_wheel(|key| *key == TriggerKey::Alt), None);
-        assert_eq!(config.match_wheel(|key| *key == TriggerKey::Ctrl), None);
         assert_eq!(
-            config.match_wheel(|key| *key == TriggerKey::Shift),
+            config.match_wheel(|key| *key == Shortcut::Single(TriggerKey::Alt)),
+            None
+        );
+        assert_eq!(
+            config.match_wheel(|key| *key == Shortcut::Single(TriggerKey::Ctrl)),
+            None
+        );
+        assert_eq!(
+            config.match_wheel(|key| *key == Shortcut::Single(TriggerKey::Shift)),
             Some(Wheel::Emote)
         );
     }
