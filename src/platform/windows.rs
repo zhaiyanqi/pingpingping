@@ -475,32 +475,15 @@ fn window_hwnd(window: &Window) -> Option<HWND> {
     }
 }
 
-pub(crate) fn use_system_close_button(window: &Window) {
-    if let Some(hwnd) = window_hwnd(window)
-        && unsafe { SetWindowSubclass(hwnd, Some(system_close_button_proc), 1, 0) } == 0
-    {
-        eprintln!("无法注册系统标题栏关闭按钮处理程序");
+pub(crate) fn toggle_maximized(window: &Window) {
+    if let Some(hwnd) = window_hwnd(window) {
+        let command = if window.is_maximized() {
+            SC_RESTORE
+        } else {
+            SC_MAXIMIZE
+        };
+        unsafe { PostMessageW(hwnd, WM_SYSCOMMAND, command as WPARAM, 0) };
     }
-}
-
-unsafe extern "system" fn system_close_button_proc(
-    hwnd: HWND,
-    message: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-    id: usize,
-    _: usize,
-) -> LRESULT {
-    match message {
-        WM_NCLBUTTONDOWN | WM_NCLBUTTONUP | WM_NCLBUTTONDBLCLK if wparam == HTCLOSE as usize => {
-            // Let Windows track the caption click through release. WM_CLOSE still goes to GPUI.
-            // 由 Windows 跟踪标题栏点击直到松开，WM_CLOSE 仍交给 GPUI 处理。
-            return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
-        }
-        WM_NCDESTROY => unsafe { RemoveWindowSubclass(hwnd, Some(system_close_button_proc), id) },
-        _ => 0,
-    };
-    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
 }
 
 pub(crate) struct PaletteMove {

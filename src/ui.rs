@@ -552,13 +552,24 @@ fn open_settings(cx: &mut App) {
     if focus_window(cx.global::<Desktop>().settings, cx) {
         return;
     }
+    create_settings_window(cfg!(target_os = "windows"), cx);
+}
+
+const SETTINGS_TITLE: &str = "PingPingPing · 设置";
+
+fn create_settings_window(client_titlebar: bool, cx: &mut App) {
+    let options = options(SETTINGS_TITLE, 700., 655., cx);
     if let Ok((handle, _)) = gpui_kit::open_window(
         WindowOptions {
+            titlebar: options.titlebar.map(|titlebar| TitlebarOptions {
+                appears_transparent: client_titlebar,
+                ..titlebar
+            }),
             window_min_size: Some(size(px(560.), px(400.))),
-            ..options("PingPingPing · 设置", 700., 655., cx)
+            ..options
         },
         cx,
-        |window, cx| cx.new(|cx| Settings::new(window, cx)),
+        |window, cx| cx.new(|cx| Settings::new(client_titlebar, window, cx)),
     ) {
         cx.global_mut::<Desktop>().settings = Some(handle);
         // On Windows, activating the app alone can leave focus on the tray menu's owner.
@@ -1733,6 +1744,7 @@ fn overlay_select_field<T: Copy + PartialEq + 'static>(
 
 struct Settings {
     model: Entity<Model>,
+    client_titlebar: bool,
     category: SettingsCategory,
     name: Entity<InputState>,
     ip: Entity<InputState>,
@@ -2251,10 +2263,8 @@ impl Settings {
             )
     }
 
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(client_titlebar: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         close_to_tray(window, cx);
-        #[cfg(target_os = "windows")]
-        platform::use_system_close_button(window);
         let model = cx.global::<Desktop>().model.clone();
         let Profile {
             name,
@@ -2353,6 +2363,7 @@ impl Settings {
         );
         Self {
             model,
+            client_titlebar,
             category: SettingsCategory::General,
             name,
             ip,
@@ -3070,8 +3081,75 @@ impl Settings {
     }
 }
 
+fn settings_titlebar(window: &Window, cx: &App) -> Div {
+    let theme = cx.theme();
+    let button = |id: &'static str, icon: IconName, label: &'static str| {
+        Button::new(id)
+            .ghost()
+            .rounded(gpui_kit::component::button::ButtonRounded::None)
+            .icon(icon)
+            .accessibility_label(label)
+            .tooltip(label)
+            .h_full()
+            .w_12()
+            // A rapid move from the caption can leave Win32 using the previous drag hit.
+            // 从标题文字快速移入按钮时，阻止 Win32 按上一次命中结果开始拖动。
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+    };
+    let (zoom_icon, zoom_label) = if window.is_maximized() {
+        (IconName::WindowRestore, "还原")
+    } else {
+        (IconName::WindowMaximize, "最大化")
+    };
+    div()
+        .flex()
+        .items_center()
+        .h(gpui_kit::component::TITLE_BAR_HEIGHT)
+        .flex_shrink_0()
+        .bg(theme.title_bar)
+        .text_sm()
+        .child(
+            div()
+                .flex_1()
+                .h_full()
+                .flex()
+                .items_center()
+                .pl_3()
+                .when(!window.is_window_active(), |title| {
+                    title.text_color(theme.muted_foreground)
+                })
+                .window_control_area(WindowControlArea::Drag)
+                .child(SETTINGS_TITLE),
+        )
+        .child(
+            button("settings-minimize", IconName::WindowMinimize, "最小化")
+                .on_click(|_, window, _| window.minimize_window()),
+        )
+        .child(
+            button("settings-maximize", zoom_icon, zoom_label)
+                .window_control_area(WindowControlArea::Max)
+                .on_click(|_, window, cx| {
+                    cx.stop_propagation();
+                    #[cfg(target_os = "windows")]
+                    platform::toggle_maximized(window);
+                    #[cfg(not(target_os = "windows"))]
+                    window.zoom_window();
+                }),
+        )
+        // Keep × in the client area so a click uses the same close path as the footer.
+        // × 位于客户区，点击时与底部按钮使用同一条关闭路径。
+        .child(
+            button("settings-titlebar-close", IconName::WindowClose, "关闭设置").on_click(
+                |_, window, cx| {
+                    cx.stop_propagation();
+                    close_window(window, cx);
+                },
+            ),
+        )
+}
+
 impl Render for Settings {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let sidebar = div()
             .flex()
@@ -3209,6 +3287,9 @@ impl Render for Settings {
             .flex_col()
             .bg(theme.background)
             .text_color(theme.foreground)
+            .when(self.client_titlebar && !window.is_fullscreen(), |root| {
+                root.child(settings_titlebar(window, cx))
+            })
             .child(content)
             .child(
                 div()
@@ -3303,7 +3384,9 @@ mod tests {
             cx.set_global(desktop);
             register_window_actions(cx);
             open_chat(cx);
-            open_settings(cx);
+            // Headless windows have no OS caption. Exercise the Windows caption on every host.
+            // 无头窗口没有系统标题栏，在所有测试主机上验证 Windows 设置标题栏。
+            super::create_settings_window(true, cx);
             let desktop = cx.global::<Desktop>();
             (desktop.chat.unwrap(), desktop.settings.unwrap(), data)
         })
@@ -3411,6 +3494,34 @@ mod tests {
         assert_eq!(cx.update(|cx| cx.active_window()), Some(chat));
         assert!(VisualTestContext::from_window(settings, cx).simulate_close());
         assert_eq!(cx.update(|cx| cx.active_window()), Some(chat));
+    }
+
+    #[gpui_kit::test]
+    fn settings_titlebar_close_uses_the_release_target_even_when_chat_is_active(
+        cx: &mut TestAppContext,
+    ) {
+        let (chat, settings, _) = settings_desktop(cx);
+        cx.update(open_chat);
+        cx.simulate_window_scale_factor_change(settings, 1.);
+        cx.update_window(settings, |_, window, cx| {
+            window.render_frame(cx);
+            window.drag_to("settings-titlebar-close", "settings-name", cx);
+        })
+        .unwrap();
+        assert_eq!(cx.windows().len(), 2);
+        cx.simulate_window_scale_factor_change(settings, 1.5);
+        cx.simulate_window_resize(settings, size(px(560.), px(400.)));
+        let mut view = VisualTestContext::from_window(settings, cx);
+        let target = view.update(|window, cx| {
+            window.render_frame(cx);
+            let close = window.find("settings-titlebar-close").bounds();
+            assert_eq!(close.right(), window.viewport_size().width);
+            assert_eq!(close.top(), px(0.));
+            assert_eq!(cx.active_window(), Some(chat));
+            close.center()
+        });
+        view.simulate_click(target, Default::default());
+        assert_eq!(cx.windows(), vec![chat]);
     }
 
     #[gpui_kit::test]
